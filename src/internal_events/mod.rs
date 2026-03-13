@@ -49,6 +49,12 @@ mod encoding_transcode;
 mod eventstoredb_metrics;
 #[cfg(feature = "sources-exec")]
 mod exec;
+#[cfg(any(
+    feature = "sources-file",
+    feature = "sources-kubernetes_logs",
+    feature = "sinks-file",
+))]
+mod file;
 #[cfg(any(feature = "sources-file_descriptor", feature = "sources-stdin"))]
 mod file_descriptor;
 #[cfg(feature = "transforms-filter")]
@@ -136,6 +142,8 @@ mod websocket;
     feature = "sinks-file",
 ))]
 mod file;
+#[cfg(all(windows, feature = "sources-windows_event_log"))]
+mod windows_event_log;
 mod windows;
 mod hash_replace;
 
@@ -271,6 +279,8 @@ pub(crate) use self::unix::*;
 pub(crate) use self::websocket::*;
 #[cfg(windows)]
 pub(crate) use self::windows::*;
+#[cfg(all(windows, feature = "sources-windows_event_log"))]
+pub(crate) use self::windows_event_log::*;
 pub use self::{
     adaptive_concurrency::*, batch::*, common::*, conditions::*, encoding_transcode::*,
     heartbeat::*, http::*, open::*, process::*, socket::*, tcp::*, template::*, udp::*,
