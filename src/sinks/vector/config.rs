@@ -189,8 +189,8 @@ async fn healthcheck(
 
     // Build the request manually so we can attach the same authorization
     // header that `Service::call` attaches to `push_events`. Without this,
-    // a source configured with `require_token = true` would refuse this
-    // healthcheck even though the sink has valid credentials.
+    // a source that requires a token would refuse this healthcheck even
+    // though the sink has valid credentials.
     let mut request = tonic::Request::new(proto::HealthCheckRequest {});
     if let Some(auth) = service.auth() {
         let bearer = auth.bearer_token().map_err(|message| {

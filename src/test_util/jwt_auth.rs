@@ -112,7 +112,6 @@ pub async fn build_auth(issuer: Option<&str>, audience: Option<Vec<&str>>) -> Au
         membership_claim: Some(MembershipClaimConfig::Identity("site_ids".to_string())),
         value_path: None,
         algorithms: None,
-        require_token: true,
     }
     .build()
     .await
