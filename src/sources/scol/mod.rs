@@ -19,7 +19,6 @@ use crate::config::{SourceConfig, SourceContext};
 #[typetag::serde(name = "scol")]
 impl SourceConfig for Config {
     async fn build(&self, cx: SourceContext) -> Result<Source> {
-        self.trigger.validate()?;
         let lns = cx.log_namespace(self.log_namespace);
         let chkptr = cx.checkpoint_accessor().await;
         let src = self
