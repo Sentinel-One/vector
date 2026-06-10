@@ -13,6 +13,7 @@ use vector_lib::buffers::topology::channel::BufferReceiverStream;
 use vector_lib::event::EventArray;
 
 use crate::{config::ComponentKey, utilization::Utilization};
+use vector_lib::config::SpanValuesOwned;
 
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum TaskOutput {
@@ -62,6 +63,8 @@ pub(crate) struct Task {
     typetag: String,
     observo_component_name: String,
     observo_component_version: String,
+    observo_integration_name: String,
+    observo_source_version: String,
     observo_last_update_tm: String,
 }
 
@@ -77,14 +80,18 @@ impl Task {
             typetag: typetag.into(),
             observo_component_name: String::new(),
             observo_component_version: String::new(),
+            observo_integration_name: String::new(),
+            observo_source_version: String::new(),
             observo_last_update_tm: String::new(),
         }
     }
 
-    pub fn with_observo_metadata(mut self, name: String, version: String, last_update_tm: String) -> Self {
-        self.observo_component_name = name;
-        self.observo_component_version = version;
-        self.observo_last_update_tm = last_update_tm;
+    pub fn with_observo_metadata(mut self, v: SpanValuesOwned) -> Self {
+        self.observo_component_name = v.component_name;
+        self.observo_component_version = v.component_version;
+        self.observo_integration_name = v.integration_name;
+        self.observo_source_version = v.source_version;
+        self.observo_last_update_tm = v.last_update_tm;
         self
     }
 
@@ -102,6 +109,14 @@ impl Task {
 
     pub fn observo_component_version(&self) -> &str {
         &self.observo_component_version
+    }
+
+    pub fn observo_integration_name(&self) -> &str {
+        &self.observo_integration_name
+    }
+
+    pub fn observo_source_version(&self) -> &str {
+        &self.observo_source_version
     }
 
     pub fn observo_last_update_tm(&self) -> &str {

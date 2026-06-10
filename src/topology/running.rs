@@ -860,6 +860,8 @@ impl RunningTopology {
             component_type = %task.typetag(),
             observo_component_name = task.observo_component_name(),
             observo_component_version = task.observo_component_version(),
+            observo_integration_name = task.observo_integration_name(),
+            observo_source_version = task.observo_source_version(),
             observo_last_update_tm = task.observo_last_update_tm(),
         );
 
@@ -904,6 +906,8 @@ impl RunningTopology {
             component_type = %task.typetag(),
             observo_component_name = task.observo_component_name(),
             observo_component_version = task.observo_component_version(),
+            observo_integration_name = task.observo_integration_name(),
+            observo_source_version = task.observo_source_version(),
             observo_last_update_tm = task.observo_last_update_tm(),
         );
 
@@ -948,6 +952,8 @@ impl RunningTopology {
             component_type = %task.typetag(),
             observo_component_name = task.observo_component_name(),
             observo_component_version = task.observo_component_version(),
+            observo_integration_name = task.observo_integration_name(),
+            observo_source_version = task.observo_source_version(),
             observo_last_update_tm = task.observo_last_update_tm(),
         );
 

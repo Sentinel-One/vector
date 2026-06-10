@@ -17,7 +17,9 @@ use crate::event::LogEvent;
 pub use global_options::GlobalOptions;
 pub use log_schema::{init_log_schema, log_schema, LogSchema};
 pub use observo_metadata::{
-    ObservoMetadata, OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION, OBSERVO_LAST_UPDATE_TM,
+    ObservoMetadata, SpanValues, SpanValuesOwned, OBSERVO_COMPONENT_NAME,
+    OBSERVO_COMPONENT_VERSION, OBSERVO_INTEGRATION_NAME, OBSERVO_LAST_UPDATE_TM,
+    OBSERVO_SOURCE_VERSION,
 };
 use lookup::{lookup_v2::ValuePath, path, PathPrefix};
 pub use output_id::OutputId;

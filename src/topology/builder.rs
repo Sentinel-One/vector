@@ -251,19 +251,21 @@ impl<'a> Builder<'a> {
             let typetag = source.inner.get_component_name();
             let source_outputs = source.inner.outputs(self.config.schema.log_namespace());
 
-            let (observo_name, observo_version, observo_last_update_tm) = source
+            let observo_owned = source
                 .observo_metadata
                 .as_ref()
-                .map(|m| m.span_values())
-                .unwrap_or(("", "", ""));
+                .map(|m| m.span_values_owned())
+                .unwrap_or_default();
             let span = error_span!(
                 "source",
                 component_kind = "source",
                 component_id = %key.id(),
                 component_type = %source.inner.get_component_name(),
-                observo_component_name = observo_name,
-                observo_component_version = observo_version,
-                observo_last_update_tm = observo_last_update_tm,
+                observo_component_name = observo_owned.component_name.as_str(),
+                observo_component_version = observo_owned.component_version.as_str(),
+                observo_integration_name = observo_owned.integration_name.as_str(),
+                observo_source_version = observo_owned.source_version.as_str(),
+                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
             );
             let _entered_span = span.enter();
 
@@ -355,7 +357,7 @@ impl<'a> Builder<'a> {
                 Ok(TaskOutput::Source)
             };
             let pump = Task::new(key.clone(), typetag, pump)
-                .with_observo_metadata(observo_name.to_string(), observo_version.to_string(), observo_last_update_tm.to_string());
+                .with_observo_metadata(observo_owned.clone());
 
             let pipeline = builder.build();
 
@@ -434,7 +436,7 @@ impl<'a> Builder<'a> {
                 }
             };
             let server = Task::new(key.clone(), typetag, server)
-                .with_observo_metadata(observo_name.to_string(), observo_version.to_string(), observo_last_update_tm.to_string());
+                .with_observo_metadata(observo_owned);
 
             self.outputs.extend(controls);
             self.tasks.insert(key.clone(), pump);
@@ -479,19 +481,21 @@ impl<'a> Builder<'a> {
                 // We may not have any definitions if all the inputs are from metrics sources.
                 .unwrap_or_else(Definition::any);
 
-            let (observo_name, observo_version, observo_last_update_tm) = transform
+            let observo_owned = transform
                 .observo_metadata
                 .as_ref()
-                .map(|m| m.span_values())
-                .unwrap_or(("", "", ""));
+                .map(|m| m.span_values_owned())
+                .unwrap_or_default();
             let span = error_span!(
                 "transform",
                 component_kind = "transform",
                 component_id = %key.id(),
                 component_type = %transform.inner.get_component_name(),
-                observo_component_name = observo_name,
-                observo_component_version = observo_version,
-                observo_last_update_tm = observo_last_update_tm,
+                observo_component_name = observo_owned.component_name.as_str(),
+                observo_component_version = observo_owned.component_version.as_str(),
+                observo_integration_name = observo_owned.integration_name.as_str(),
+                observo_source_version = observo_owned.source_version.as_str(),
+                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
             );
 
             // Create a map of the outputs to the list of possible definitions from those outputs.
@@ -552,8 +556,7 @@ impl<'a> Builder<'a> {
                 let _span = span.enter();
                 build_transform(transform, node, input_rx)
             };
-            let transform_task = transform_task
-                .with_observo_metadata(observo_name.to_string(), observo_version.to_string(), observo_last_update_tm.to_string());
+            let transform_task = transform_task.with_observo_metadata(observo_owned);
 
             self.outputs.extend(transform_outputs);
             self.tasks.insert(key.clone(), transform_task);
@@ -575,7 +578,7 @@ impl<'a> Builder<'a> {
             let typetag = sink.inner.get_component_name();
             let input_type = sink.inner.input().data_type();
 
-            let (observo_name, observo_version, observo_last_update_tm) = sink
+            let observo_owned = sink
                 .observo_metadata
                 .as_ref()
                 .map(|m| m.span_values_owned())
@@ -585,9 +588,11 @@ impl<'a> Builder<'a> {
                 component_kind = "sink",
                 component_id = %key.id(),
                 component_type = %sink.inner.get_component_name(),
-                observo_component_name = observo_name.as_str(),
-                observo_component_version = observo_version.as_str(),
-                observo_last_update_tm = observo_last_update_tm.as_str(),
+                observo_component_name = observo_owned.component_name.as_str(),
+                observo_component_version = observo_owned.component_version.as_str(),
+                observo_integration_name = observo_owned.integration_name.as_str(),
+                observo_source_version = observo_owned.source_version.as_str(),
+                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
             );
             let _entered_span = span.enter();
 
@@ -690,7 +695,7 @@ impl<'a> Builder<'a> {
             };
 
             let task = Task::new(key.clone(), typetag, sink)
-                .with_observo_metadata(observo_name.clone(), observo_version.clone(), observo_last_update_tm.clone());
+                .with_observo_metadata(observo_owned.clone());
 
             let component_key = key.clone();
             let healthcheck_task = async move {
@@ -703,9 +708,11 @@ impl<'a> Builder<'a> {
                                 component_kind = "sink",
                                 component_type = typetag,
                                 component_id = %component_key.id(),
-                                observo_component_name = observo_name.as_str(),
-                                observo_component_version = observo_version.as_str(),
-                                observo_last_update_tm = observo_last_update_tm.as_str(),
+                                observo_component_name = observo_owned.component_name.as_str(),
+                                observo_component_version = observo_owned.component_version.as_str(),
+                                observo_integration_name = observo_owned.integration_name.as_str(),
+                                observo_source_version = observo_owned.source_version.as_str(),
+                                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
                             );
                             let _active = span.enter();
                             match result {

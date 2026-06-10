@@ -36,10 +36,11 @@ pub mod config {
     pub use vector_core::config::{
         clone_input_definitions, init_log_schema, init_telemetry, log_schema, proxy, telemetry,
         AcknowledgementsConfig, DataType, GlobalOptions, Input, LegacyKey, LogNamespace, LogSchema,
-        ObservoMetadata, OutputId, SourceAcknowledgementsConfig, SourceOutput, Tags, Telemetry,
-        TransformOutput, TimePrecision, TimestampFormat, TimestampResolutionError,
-        MEMORY_BUFFER_DEFAULT_MAX_EVENTS, OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION,
-        OBSERVO_LAST_UPDATE_TM,
+        ObservoMetadata, OutputId, SourceAcknowledgementsConfig, SourceOutput, SpanValues,
+        SpanValuesOwned, Tags, Telemetry, TransformOutput, TimePrecision, TimestampFormat,
+        TimestampResolutionError, MEMORY_BUFFER_DEFAULT_MAX_EVENTS, OBSERVO_COMPONENT_NAME,
+        OBSERVO_COMPONENT_VERSION, OBSERVO_INTEGRATION_NAME, OBSERVO_LAST_UPDATE_TM,
+        OBSERVO_SOURCE_VERSION,
     };
 }
 

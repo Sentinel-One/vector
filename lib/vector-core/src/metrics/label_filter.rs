@@ -1,7 +1,10 @@
 use metrics::{KeyName, Label};
 use metrics_tracing_context::LabelFilter;
 
-use crate::config::{OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION, OBSERVO_LAST_UPDATE_TM};
+use crate::config::{
+    OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION, OBSERVO_INTEGRATION_NAME,
+    OBSERVO_LAST_UPDATE_TM, OBSERVO_SOURCE_VERSION,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct VectorLabelFilter;
@@ -29,6 +32,8 @@ impl LabelFilter for VectorLabelFilter {
             // Observo labels: only include when a value is actually set
             || ((label_key == OBSERVO_COMPONENT_NAME
                 || label_key == OBSERVO_COMPONENT_VERSION
+                || label_key == OBSERVO_INTEGRATION_NAME
+                || label_key == OBSERVO_SOURCE_VERSION
                 || label_key == OBSERVO_LAST_UPDATE_TM)
                 && !label.value().is_empty())
     }
@@ -87,6 +92,30 @@ mod tests {
     fn excludes_observo_version_when_empty() {
         let k = key("some_metric");
         assert!(!filter().should_include_label(&k, &label(OBSERVO_COMPONENT_VERSION, "")));
+    }
+
+    #[test]
+    fn includes_observo_integration_name_when_non_empty() {
+        let k = key("some_metric");
+        assert!(filter().should_include_label(&k, &label(OBSERVO_INTEGRATION_NAME, "snyk-mssp")));
+    }
+
+    #[test]
+    fn excludes_observo_integration_name_when_empty() {
+        let k = key("some_metric");
+        assert!(!filter().should_include_label(&k, &label(OBSERVO_INTEGRATION_NAME, "")));
+    }
+
+    #[test]
+    fn includes_observo_source_version_when_non_empty() {
+        let k = key("some_metric");
+        assert!(filter().should_include_label(&k, &label(OBSERVO_SOURCE_VERSION, "1.0.0")));
+    }
+
+    #[test]
+    fn excludes_observo_source_version_when_empty() {
+        let k = key("some_metric");
+        assert!(!filter().should_include_label(&k, &label(OBSERVO_SOURCE_VERSION, "")));
     }
 
     #[test]
