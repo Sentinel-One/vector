@@ -279,6 +279,7 @@ mod tests {
         let meta = source.observo_metadata.as_ref().expect("observo_metadata should be set");
         assert_eq!(meta.observo_component_name.as_deref(), Some("snyk"));
         assert_eq!(meta.observo_component_version.as_deref(), Some("2"));
+        assert!(meta.observo_last_update_tm.is_none());
     }
 
     #[cfg(feature = "sources-demo_logs")]

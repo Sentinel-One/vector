@@ -62,6 +62,7 @@ pub(crate) struct Task {
     typetag: String,
     observo_component_name: String,
     observo_component_version: String,
+    observo_last_update_tm: String,
 }
 
 impl Task {
@@ -76,12 +77,14 @@ impl Task {
             typetag: typetag.into(),
             observo_component_name: String::new(),
             observo_component_version: String::new(),
+            observo_last_update_tm: String::new(),
         }
     }
 
-    pub fn with_observo_metadata(mut self, name: String, version: String) -> Self {
+    pub fn with_observo_metadata(mut self, name: String, version: String, last_update_tm: String) -> Self {
         self.observo_component_name = name;
         self.observo_component_version = version;
+        self.observo_last_update_tm = last_update_tm;
         self
     }
 
@@ -99,6 +102,10 @@ impl Task {
 
     pub fn observo_component_version(&self) -> &str {
         &self.observo_component_version
+    }
+
+    pub fn observo_last_update_tm(&self) -> &str {
+        &self.observo_last_update_tm
     }
 }
 

@@ -39,6 +39,7 @@ pub mod config {
         ObservoMetadata, OutputId, SourceAcknowledgementsConfig, SourceOutput, Tags, Telemetry,
         TransformOutput, TimePrecision, TimestampFormat, TimestampResolutionError,
         MEMORY_BUFFER_DEFAULT_MAX_EVENTS, OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION,
+        OBSERVO_LAST_UPDATE_TM,
     };
 }
 

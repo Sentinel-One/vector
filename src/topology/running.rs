@@ -860,6 +860,7 @@ impl RunningTopology {
             component_type = %task.typetag(),
             observo_component_name = task.observo_component_name(),
             observo_component_version = task.observo_component_version(),
+            observo_last_update_tm = task.observo_last_update_tm(),
         );
 
         let task_span = span.or_current();
@@ -903,6 +904,7 @@ impl RunningTopology {
             component_type = %task.typetag(),
             observo_component_name = task.observo_component_name(),
             observo_component_version = task.observo_component_version(),
+            observo_last_update_tm = task.observo_last_update_tm(),
         );
 
         let task_span = span.or_current();
@@ -946,6 +948,7 @@ impl RunningTopology {
             component_type = %task.typetag(),
             observo_component_name = task.observo_component_name(),
             observo_component_version = task.observo_component_version(),
+            observo_last_update_tm = task.observo_last_update_tm(),
         );
 
         let task_span = span.or_current();
