@@ -853,17 +853,7 @@ impl RunningTopology {
 
     fn spawn_sink(&mut self, key: &ComponentKey, new_pieces: &mut builder::TopologyPieces) {
         let task = new_pieces.tasks.remove(key).unwrap();
-        let span = error_span!(
-            "sink",
-            component_kind = "sink",
-            component_id = %task.id(),
-            component_type = %task.typetag(),
-            observo_component_name = task.observo_component_name(),
-            observo_component_version = task.observo_component_version(),
-            observo_integration_name = task.observo_integration_name(),
-            observo_source_version = task.observo_source_version(),
-            observo_last_update_tm = task.observo_last_update_tm(),
-        );
+        let span = component_span!("sink", "sink", task.id(), task.typetag(), task.observo());
 
         let task_span = span.or_current();
         #[cfg(feature = "allocation-tracing")]
@@ -899,16 +889,8 @@ impl RunningTopology {
 
     fn spawn_transform(&mut self, key: &ComponentKey, new_pieces: &mut builder::TopologyPieces) {
         let task = new_pieces.tasks.remove(key).unwrap();
-        let span = error_span!(
-            "transform",
-            component_kind = "transform",
-            component_id = %task.id(),
-            component_type = %task.typetag(),
-            observo_component_name = task.observo_component_name(),
-            observo_component_version = task.observo_component_version(),
-            observo_integration_name = task.observo_integration_name(),
-            observo_source_version = task.observo_source_version(),
-            observo_last_update_tm = task.observo_last_update_tm(),
+        let span = component_span!(
+            "transform", "transform", task.id(), task.typetag(), task.observo()
         );
 
         let task_span = span.or_current();
@@ -945,16 +927,8 @@ impl RunningTopology {
 
     fn spawn_source(&mut self, key: &ComponentKey, new_pieces: &mut builder::TopologyPieces) {
         let task = new_pieces.tasks.remove(key).unwrap();
-        let span = error_span!(
-            "source",
-            component_kind = "source",
-            component_id = %task.id(),
-            component_type = %task.typetag(),
-            observo_component_name = task.observo_component_name(),
-            observo_component_version = task.observo_component_version(),
-            observo_integration_name = task.observo_integration_name(),
-            observo_source_version = task.observo_source_version(),
-            observo_last_update_tm = task.observo_last_update_tm(),
+        let span = component_span!(
+            "source", "source", task.id(), task.typetag(), task.observo()
         );
 
         let task_span = span.or_current();

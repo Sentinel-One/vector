@@ -1,6 +1,17 @@
 #![allow(missing_docs)]
 //! Topology contains all topology based types.
 //!
+//! # Adding a new Observo metadata field
+//!
+//! 1. Add the constant and struct field to `lib/vector-core/src/config/observo_metadata.rs`
+//!    (constant, `ObservoMetadata`, `SpanValues`, `SpanValuesOwned`, `OBSERVO_LABEL_KEYS`,
+//!    both conversion methods, and tests).
+//! 2. Re-export the new constant from `lib/vector-core/src/config/mod.rs` and
+//!    `lib/vector-lib/src/lib.rs` (two one-line additions).
+//! 3. Add the new field to the `component_span!` macro below — one line.
+//!
+//! No other files need to change.
+//!
 //! Topology is broken up into two main sections. The first
 //! section contains all the main topology types include `Topology`
 //! and the ability to start, stop and reload a config. The second
@@ -8,6 +19,26 @@
 //! each type of component.
 
 pub(super) use vector_lib::fanout;
+
+/// Creates a tracing `error_span!` for a component with all standard and Observo fields.
+///
+/// Arguments: span_name, component_kind, component_id expr, component_type expr,
+/// observo (&SpanValuesOwned).
+macro_rules! component_span {
+    ($span_name:literal, $kind:literal, $id:expr, $type:expr, $obs:expr) => {
+        error_span!(
+            $span_name,
+            component_kind = $kind,
+            component_id = %$id,
+            component_type = %$type,
+            observo_component_name = $obs.component_name.as_str(),
+            observo_component_version = $obs.component_version.as_str(),
+            observo_integration_name = $obs.integration_name.as_str(),
+            observo_source_version = $obs.source_version.as_str(),
+            observo_last_update_tm = $obs.last_update_tm.as_str(),
+        )
+    };
+}
 pub mod schema;
 
 pub mod builder;

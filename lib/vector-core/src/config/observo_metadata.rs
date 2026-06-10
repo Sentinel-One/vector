@@ -15,6 +15,15 @@ pub const OBSERVO_SOURCE_VERSION: &str = "observo_source_version";
 /// Label key for the timestamp of the last user update to this component's config.
 pub const OBSERVO_LAST_UPDATE_TM: &str = "observo_last_update_tm";
 
+/// All Observo label keys in one place — iterate this to register/check them as a group.
+pub const OBSERVO_LABEL_KEYS: &[&str] = &[
+    OBSERVO_COMPONENT_NAME,
+    OBSERVO_COMPONENT_VERSION,
+    OBSERVO_INTEGRATION_NAME,
+    OBSERVO_SOURCE_VERSION,
+    OBSERVO_LAST_UPDATE_TM,
+];
+
 /// Flat view of all Observo span/label values with borrowed lifetimes.
 /// Returned by [`ObservoMetadata::span_values`]; all fields fall back to `""`.
 pub struct SpanValues<'a> {

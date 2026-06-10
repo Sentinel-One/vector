@@ -256,16 +256,9 @@ impl<'a> Builder<'a> {
                 .as_ref()
                 .map(|m| m.span_values_owned())
                 .unwrap_or_default();
-            let span = error_span!(
-                "source",
-                component_kind = "source",
-                component_id = %key.id(),
-                component_type = %source.inner.get_component_name(),
-                observo_component_name = observo_owned.component_name.as_str(),
-                observo_component_version = observo_owned.component_version.as_str(),
-                observo_integration_name = observo_owned.integration_name.as_str(),
-                observo_source_version = observo_owned.source_version.as_str(),
-                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
+            let span = component_span!(
+                "source", "source",
+                key.id(), source.inner.get_component_name(), &observo_owned
             );
             let _entered_span = span.enter();
 
@@ -486,16 +479,9 @@ impl<'a> Builder<'a> {
                 .as_ref()
                 .map(|m| m.span_values_owned())
                 .unwrap_or_default();
-            let span = error_span!(
-                "transform",
-                component_kind = "transform",
-                component_id = %key.id(),
-                component_type = %transform.inner.get_component_name(),
-                observo_component_name = observo_owned.component_name.as_str(),
-                observo_component_version = observo_owned.component_version.as_str(),
-                observo_integration_name = observo_owned.integration_name.as_str(),
-                observo_source_version = observo_owned.source_version.as_str(),
-                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
+            let span = component_span!(
+                "transform", "transform",
+                key.id(), transform.inner.get_component_name(), &observo_owned
             );
 
             // Create a map of the outputs to the list of possible definitions from those outputs.
@@ -583,16 +569,9 @@ impl<'a> Builder<'a> {
                 .as_ref()
                 .map(|m| m.span_values_owned())
                 .unwrap_or_default();
-            let span = error_span!(
-                "sink",
-                component_kind = "sink",
-                component_id = %key.id(),
-                component_type = %sink.inner.get_component_name(),
-                observo_component_name = observo_owned.component_name.as_str(),
-                observo_component_version = observo_owned.component_version.as_str(),
-                observo_integration_name = observo_owned.integration_name.as_str(),
-                observo_source_version = observo_owned.source_version.as_str(),
-                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
+            let span = component_span!(
+                "sink", "sink",
+                key.id(), sink.inner.get_component_name(), &observo_owned
             );
             let _entered_span = span.enter();
 
@@ -703,16 +682,9 @@ impl<'a> Builder<'a> {
                     let duration = Duration::from_secs(10);
                     timeout(duration, healthcheck)
                         .map(|result| {
-                            let span = error_span!(
-                                "sink",
-                                component_kind = "sink",
-                                component_type = typetag,
-                                component_id = %component_key.id(),
-                                observo_component_name = observo_owned.component_name.as_str(),
-                                observo_component_version = observo_owned.component_version.as_str(),
-                                observo_integration_name = observo_owned.integration_name.as_str(),
-                                observo_source_version = observo_owned.source_version.as_str(),
-                                observo_last_update_tm = observo_owned.last_update_tm.as_str(),
+                            let span = component_span!(
+                                "sink", "sink",
+                                component_key.id(), typetag, &observo_owned
                             );
                             let _active = span.enter();
                             match result {

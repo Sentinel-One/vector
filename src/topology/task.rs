@@ -61,11 +61,7 @@ pub(crate) struct Task {
     inner: BoxFuture<'static, TaskResult>,
     key: ComponentKey,
     typetag: String,
-    observo_component_name: String,
-    observo_component_version: String,
-    observo_integration_name: String,
-    observo_source_version: String,
-    observo_last_update_tm: String,
+    observo: SpanValuesOwned,
 }
 
 impl Task {
@@ -78,20 +74,12 @@ impl Task {
             inner: inner.boxed(),
             key,
             typetag: typetag.into(),
-            observo_component_name: String::new(),
-            observo_component_version: String::new(),
-            observo_integration_name: String::new(),
-            observo_source_version: String::new(),
-            observo_last_update_tm: String::new(),
+            observo: SpanValuesOwned::default(),
         }
     }
 
     pub fn with_observo_metadata(mut self, v: SpanValuesOwned) -> Self {
-        self.observo_component_name = v.component_name;
-        self.observo_component_version = v.component_version;
-        self.observo_integration_name = v.integration_name;
-        self.observo_source_version = v.source_version;
-        self.observo_last_update_tm = v.last_update_tm;
+        self.observo = v;
         self
     }
 
@@ -103,24 +91,8 @@ impl Task {
         &self.typetag
     }
 
-    pub fn observo_component_name(&self) -> &str {
-        &self.observo_component_name
-    }
-
-    pub fn observo_component_version(&self) -> &str {
-        &self.observo_component_version
-    }
-
-    pub fn observo_integration_name(&self) -> &str {
-        &self.observo_integration_name
-    }
-
-    pub fn observo_source_version(&self) -> &str {
-        &self.observo_source_version
-    }
-
-    pub fn observo_last_update_tm(&self) -> &str {
-        &self.observo_last_update_tm
+    pub fn observo(&self) -> &SpanValuesOwned {
+        &self.observo
     }
 }
 
