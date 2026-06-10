@@ -40,3 +40,73 @@ impl ObservoMetadata {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn full() -> ObservoMetadata {
+        ObservoMetadata {
+            observo_component_name: Some("snyk".to_string()),
+            observo_component_version: Some("2".to_string()),
+        }
+    }
+
+    fn empty() -> ObservoMetadata {
+        ObservoMetadata::default()
+    }
+
+    #[test]
+    fn span_values_when_set() {
+        let meta = full();
+        let (name, version) = meta.span_values();
+        assert_eq!(name, "snyk");
+        assert_eq!(version, "2");
+    }
+
+    #[test]
+    fn span_values_when_none_returns_empty_str() {
+        let meta = empty();
+        let (name, version) = meta.span_values();
+        assert_eq!(name, "");
+        assert_eq!(version, "");
+    }
+
+    #[test]
+    fn span_values_owned_when_set() {
+        let (name, version) = full().span_values_owned();
+        assert_eq!(name, "snyk");
+        assert_eq!(version, "2");
+    }
+
+    #[test]
+    fn span_values_owned_when_none_returns_empty_string() {
+        let (name, version) = empty().span_values_owned();
+        assert_eq!(name, "");
+        assert_eq!(version, "");
+    }
+
+    #[test]
+    fn serde_round_trip_with_values() {
+        let original = full();
+        let yaml = serde_yaml::to_string(&original).unwrap();
+        let roundtripped: ObservoMetadata = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(roundtripped.observo_component_name, original.observo_component_name);
+        assert_eq!(roundtripped.observo_component_version, original.observo_component_version);
+    }
+
+    #[test]
+    fn serde_deserialize_partial_fields() {
+        let yaml = "observo_component_name: crowdstrike\n";
+        let meta: ObservoMetadata = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(meta.observo_component_name.as_deref(), Some("crowdstrike"));
+        assert!(meta.observo_component_version.is_none());
+    }
+
+    #[test]
+    fn serde_serialize_skips_none_fields() {
+        let yaml = serde_yaml::to_string(&empty()).unwrap();
+        assert!(!yaml.contains("observo_component_name"));
+        assert!(!yaml.contains("observo_component_version"));
+    }
+}

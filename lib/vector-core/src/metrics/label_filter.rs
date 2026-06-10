@@ -31,3 +31,79 @@ impl LabelFilter for VectorLabelFilter {
                 && !label.value().is_empty())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filter() -> VectorLabelFilter {
+        VectorLabelFilter
+    }
+
+    fn key(name: &'static str) -> KeyName {
+        KeyName::from(name)
+    }
+
+    fn label(k: &'static str, v: &'static str) -> Label {
+        Label::new(k, v)
+    }
+
+    #[test]
+    fn includes_standard_global_labels() {
+        let k = key("some_metric");
+        assert!(filter().should_include_label(&k, &label("component_id", "my_source")));
+        assert!(filter().should_include_label(&k, &label("component_type", "aws_s3")));
+        assert!(filter().should_include_label(&k, &label("component_kind", "source")));
+        assert!(filter().should_include_label(&k, &label("buffer_type", "memory")));
+    }
+
+    #[test]
+    fn excludes_unknown_label() {
+        let k = key("some_metric");
+        assert!(!filter().should_include_label(&k, &label("random_field", "value")));
+    }
+
+    #[test]
+    fn includes_observo_name_when_non_empty() {
+        let k = key("some_metric");
+        assert!(filter().should_include_label(&k, &label(OBSERVO_COMPONENT_NAME, "snyk")));
+    }
+
+    #[test]
+    fn includes_observo_version_when_non_empty() {
+        let k = key("some_metric");
+        assert!(filter().should_include_label(&k, &label(OBSERVO_COMPONENT_VERSION, "2")));
+    }
+
+    #[test]
+    fn excludes_observo_name_when_empty() {
+        let k = key("some_metric");
+        assert!(!filter().should_include_label(&k, &label(OBSERVO_COMPONENT_NAME, "")));
+    }
+
+    #[test]
+    fn excludes_observo_version_when_empty() {
+        let k = key("some_metric");
+        assert!(!filter().should_include_label(&k, &label(OBSERVO_COMPONENT_VERSION, "")));
+    }
+
+    #[test]
+    fn includes_http_server_method_and_path() {
+        let k = key("http_server_requests_total");
+        assert!(filter().should_include_label(&k, &label("method", "GET")));
+        assert!(filter().should_include_label(&k, &label("path", "/healthz")));
+    }
+
+    #[test]
+    fn excludes_http_server_other_labels() {
+        let k = key("http_server_requests_total");
+        assert!(!filter().should_include_label(&k, &label("random_field", "value")));
+    }
+
+    #[test]
+    fn includes_grpc_server_method_and_service() {
+        let k = key("grpc_server_handled_total");
+        assert!(filter().should_include_label(&k, &label("grpc_method", "SomeRpc")));
+        assert!(filter().should_include_label(&k, &label("grpc_service", "MyService")));
+    }
+}

@@ -254,3 +254,49 @@ impl SourceContext {
             .map(|store| store.accessor(self.key.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "sources-demo_logs")]
+    #[test]
+    fn source_outer_parses_observo_metadata() {
+        use crate::config::{ComponentKey, ConfigBuilder};
+
+        let config: ConfigBuilder = toml::from_str(
+            r#"
+            [sources.my_source]
+            type = "demo_logs"
+            interval = 1
+            format = "json"
+            [sources.my_source.observo_metadata]
+            observo_component_name = "snyk"
+            observo_component_version = "2"
+            "#,
+        )
+        .unwrap();
+
+        let source = config.sources.get(&ComponentKey::from("my_source")).unwrap();
+        let meta = source.observo_metadata.as_ref().expect("observo_metadata should be set");
+        assert_eq!(meta.observo_component_name.as_deref(), Some("snyk"));
+        assert_eq!(meta.observo_component_version.as_deref(), Some("2"));
+    }
+
+    #[cfg(feature = "sources-demo_logs")]
+    #[test]
+    fn source_outer_observo_metadata_absent_when_not_configured() {
+        use crate::config::{ComponentKey, ConfigBuilder};
+
+        let config: ConfigBuilder = toml::from_str(
+            r#"
+            [sources.my_source]
+            type = "demo_logs"
+            interval = 1
+            format = "json"
+            "#,
+        )
+        .unwrap();
+
+        let source = config.sources.get(&ComponentKey::from("my_source")).unwrap();
+        assert!(source.observo_metadata.is_none());
+    }
+}

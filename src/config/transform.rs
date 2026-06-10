@@ -283,3 +283,49 @@ pub fn get_transform_output_ids<T: TransformConfig + ?Sized>(
             port: output.port,
         })
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "transforms-remap")]
+    #[test]
+    fn transform_outer_parses_observo_metadata() {
+        use crate::config::{ComponentKey, ConfigBuilder};
+
+        let config: ConfigBuilder = toml::from_str(
+            r#"
+            [transforms.my_transform]
+            type = "remap"
+            inputs = ["source"]
+            source = "."
+            [transforms.my_transform.observo_metadata]
+            observo_component_name = "crowdstrike"
+            observo_component_version = "3"
+            "#,
+        )
+        .unwrap();
+
+        let transform = config.transforms.get(&ComponentKey::from("my_transform")).unwrap();
+        let meta = transform.observo_metadata.as_ref().expect("observo_metadata should be set");
+        assert_eq!(meta.observo_component_name.as_deref(), Some("crowdstrike"));
+        assert_eq!(meta.observo_component_version.as_deref(), Some("3"));
+    }
+
+    #[cfg(feature = "transforms-remap")]
+    #[test]
+    fn transform_outer_observo_metadata_absent_when_not_configured() {
+        use crate::config::{ComponentKey, ConfigBuilder};
+
+        let config: ConfigBuilder = toml::from_str(
+            r#"
+            [transforms.my_transform]
+            type = "remap"
+            inputs = ["source"]
+            source = "."
+            "#,
+        )
+        .unwrap();
+
+        let transform = config.transforms.get(&ComponentKey::from("my_transform")).unwrap();
+        assert!(transform.observo_metadata.is_none());
+    }
+}

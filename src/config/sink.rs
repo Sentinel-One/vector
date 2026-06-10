@@ -286,3 +286,51 @@ impl SinkContext {
         &self.proxy
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "sinks-console")]
+    #[test]
+    fn sink_outer_parses_observo_metadata() {
+        use crate::config::{ComponentKey, ConfigBuilder};
+
+        let config: ConfigBuilder = toml::from_str(
+            r#"
+            [sinks.my_sink]
+            type = "console"
+            inputs = ["source"]
+            [sinks.my_sink.encoding]
+            codec = "json"
+            [sinks.my_sink.observo_metadata]
+            observo_component_name = "snyk"
+            observo_component_version = "2"
+            "#,
+        )
+        .unwrap();
+
+        let sink = config.sinks.get(&ComponentKey::from("my_sink")).unwrap();
+        let meta = sink.observo_metadata.as_ref().expect("observo_metadata should be set");
+        assert_eq!(meta.observo_component_name.as_deref(), Some("snyk"));
+        assert_eq!(meta.observo_component_version.as_deref(), Some("2"));
+    }
+
+    #[cfg(feature = "sinks-console")]
+    #[test]
+    fn sink_outer_observo_metadata_absent_when_not_configured() {
+        use crate::config::{ComponentKey, ConfigBuilder};
+
+        let config: ConfigBuilder = toml::from_str(
+            r#"
+            [sinks.my_sink]
+            type = "console"
+            inputs = ["source"]
+            [sinks.my_sink.encoding]
+            codec = "json"
+            "#,
+        )
+        .unwrap();
+
+        let sink = config.sinks.get(&ComponentKey::from("my_sink")).unwrap();
+        assert!(sink.observo_metadata.is_none());
+    }
+}
