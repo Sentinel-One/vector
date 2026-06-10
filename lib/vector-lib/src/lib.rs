@@ -36,9 +36,9 @@ pub mod config {
     pub use vector_core::config::{
         clone_input_definitions, init_log_schema, init_telemetry, log_schema, proxy, telemetry,
         AcknowledgementsConfig, DataType, GlobalOptions, Input, LegacyKey, LogNamespace, LogSchema,
-        OutputId, SourceAcknowledgementsConfig, SourceOutput, Tags, Telemetry, TransformOutput,
-        TimePrecision, TimestampFormat, TimestampResolutionError,
-        MEMORY_BUFFER_DEFAULT_MAX_EVENTS,
+        ObservoMetadata, OutputId, SourceAcknowledgementsConfig, SourceOutput, Tags, Telemetry,
+        TransformOutput, TimePrecision, TimestampFormat, TimestampResolutionError,
+        MEMORY_BUFFER_DEFAULT_MAX_EVENTS, OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION,
     };
 }
 

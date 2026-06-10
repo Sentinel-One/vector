@@ -11,7 +11,7 @@ use vector_lib::configurable::{
     configurable_component, Configurable, GenerateError, Metadata, NamedComponent,
 };
 use vector_lib::{
-    config::{AcknowledgementsConfig, GlobalOptions, Input},
+    config::{AcknowledgementsConfig, GlobalOptions, Input, ObservoMetadata},
     id::Inputs,
     sink::VectorSink,
 };
@@ -80,6 +80,11 @@ where
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     proxy: ProxyConfig,
 
+    /// Observo-specific metadata emitted in logs and as Prometheus labels.
+    /// Well-known keys: `observo_component_name`, `observo_component_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observo_metadata: Option<ObservoMetadata>,
+
     #[serde(flatten)]
     #[configurable(metadata(docs::hidden))]
     pub inner: BoxedSink,
@@ -102,6 +107,7 @@ where
             inner: inner.into(),
             proxy: Default::default(),
             graph: Default::default(),
+            observo_metadata: None,
         }
     }
 
@@ -159,6 +165,7 @@ where
             healthcheck_uri: self.healthcheck_uri,
             proxy: self.proxy,
             graph: self.graph,
+            observo_metadata: self.observo_metadata,
         }
     }
 }

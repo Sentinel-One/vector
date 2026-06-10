@@ -11,7 +11,7 @@ use vector_lib::configurable::{
     Configurable, GenerateError, Metadata, NamedComponent,
 };
 use vector_lib::{
-    config::{GlobalOptions, Input, LogNamespace, TransformOutput},
+    config::{GlobalOptions, Input, LogNamespace, ObservoMetadata, TransformOutput},
     id::Inputs,
     schema,
     transform::Transform,
@@ -64,6 +64,11 @@ where
     #[configurable(derived)]
     pub inputs: Inputs<T>,
 
+    /// Observo-specific metadata emitted in logs and as Prometheus labels.
+    /// Well-known keys: `observo_component_name`, `observo_component_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observo_metadata: Option<ObservoMetadata>,
+
     #[configurable(metadata(docs::hidden))]
     #[serde(flatten)]
     pub inner: BoxedTransform,
@@ -84,6 +89,7 @@ where
             inputs,
             inner,
             graph: Default::default(),
+            observo_metadata: None,
         }
     }
 
@@ -104,6 +110,7 @@ where
             inputs: Inputs::from_iter(inputs),
             inner: self.inner,
             graph: self.graph,
+            observo_metadata: self.observo_metadata,
         }
     }
 }

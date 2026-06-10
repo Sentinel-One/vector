@@ -858,6 +858,8 @@ impl RunningTopology {
             component_kind = "sink",
             component_id = %task.id(),
             component_type = %task.typetag(),
+            observo_component_name = task.observo_component_name(),
+            observo_component_version = task.observo_component_version(),
         );
 
         let task_span = span.or_current();
@@ -899,6 +901,8 @@ impl RunningTopology {
             component_kind = "transform",
             component_id = %task.id(),
             component_type = %task.typetag(),
+            observo_component_name = task.observo_component_name(),
+            observo_component_version = task.observo_component_version(),
         );
 
         let task_span = span.or_current();
@@ -940,6 +944,8 @@ impl RunningTopology {
             component_kind = "source",
             component_id = %task.id(),
             component_type = %task.typetag(),
+            observo_component_name = task.observo_component_name(),
+            observo_component_version = task.observo_component_version(),
         );
 
         let task_span = span.or_current();

@@ -1,6 +1,8 @@
 use metrics::{KeyName, Label};
 use metrics_tracing_context::LabelFilter;
 
+use crate::config::{OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION};
+
 #[derive(Debug, Clone)]
 pub(crate) struct VectorLabelFilter;
 
@@ -24,5 +26,8 @@ impl LabelFilter for VectorLabelFilter {
             || label_key == "component_type"
             || label_key == "component_kind"
             || label_key == "buffer_type"
+            // Observo labels: only include when a value is actually set
+            || ((label_key == OBSERVO_COMPONENT_NAME || label_key == OBSERVO_COMPONENT_VERSION)
+                && !label.value().is_empty())
     }
 }

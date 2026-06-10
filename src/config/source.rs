@@ -11,8 +11,8 @@ use vector_config_macros::configurable_component;
 use vector_lib::chkpts::{Accessor, CheckpointStore};
 use vector_lib::{
     config::{
-        AcknowledgementsConfig, GlobalOptions, LogNamespace, SourceAcknowledgementsConfig,
-        SourceOutput,
+        AcknowledgementsConfig, GlobalOptions, LogNamespace, ObservoMetadata,
+        SourceAcknowledgementsConfig, SourceOutput,
     },
     source::Source,
 };
@@ -62,6 +62,11 @@ pub struct SourceOuter {
     #[serde(default, skip)]
     pub sink_acknowledgements: bool,
 
+    /// Observo-specific metadata emitted in logs and as Prometheus labels.
+    /// Well-known keys: `observo_component_name`, `observo_component_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observo_metadata: Option<ObservoMetadata>,
+
     #[configurable(metadata(docs::hidden))]
     #[serde(flatten)]
     pub(crate) inner: BoxedSource,
@@ -73,6 +78,7 @@ impl SourceOuter {
             proxy: Default::default(),
             graph: Default::default(),
             sink_acknowledgements: false,
+            observo_metadata: None,
             inner: inner.into(),
         }
     }

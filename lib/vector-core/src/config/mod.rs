@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 
 mod global_options;
 mod log_schema;
+pub mod observo_metadata;
 pub mod output_id;
 pub mod proxy;
 mod telemetry;
@@ -15,6 +16,7 @@ mod timestamp;
 use crate::event::LogEvent;
 pub use global_options::GlobalOptions;
 pub use log_schema::{init_log_schema, log_schema, LogSchema};
+pub use observo_metadata::{ObservoMetadata, OBSERVO_COMPONENT_NAME, OBSERVO_COMPONENT_VERSION};
 use lookup::{lookup_v2::ValuePath, path, PathPrefix};
 pub use output_id::OutputId;
 use serde::{Deserialize, Serialize};

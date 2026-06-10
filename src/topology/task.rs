@@ -60,6 +60,8 @@ pub(crate) struct Task {
     inner: BoxFuture<'static, TaskResult>,
     key: ComponentKey,
     typetag: String,
+    observo_component_name: String,
+    observo_component_version: String,
 }
 
 impl Task {
@@ -72,7 +74,15 @@ impl Task {
             inner: inner.boxed(),
             key,
             typetag: typetag.into(),
+            observo_component_name: String::new(),
+            observo_component_version: String::new(),
         }
+    }
+
+    pub fn with_observo_metadata(mut self, name: String, version: String) -> Self {
+        self.observo_component_name = name;
+        self.observo_component_version = version;
+        self
     }
 
     pub fn id(&self) -> &str {
@@ -81,6 +91,14 @@ impl Task {
 
     pub fn typetag(&self) -> &str {
         &self.typetag
+    }
+
+    pub fn observo_component_name(&self) -> &str {
+        &self.observo_component_name
+    }
+
+    pub fn observo_component_version(&self) -> &str {
+        &self.observo_component_version
     }
 }
 
