@@ -9,6 +9,7 @@ message EventArray {
     MetricArray metrics = 2;
     TraceArray traces = 3;
   }
+  google.protobuf.Timestamp enq_tm = 4;
 }
 
 message LogArray {
