@@ -140,13 +140,9 @@ registered_event! {
 
 registered_event! {
     BufferQueueDelay {
-        component_id: String,
         stage: usize,
     } => {
-        queue_delay: Histogram = histogram!(
-            "topology_queue_delay_seconds",
-            "component_id" => self.component_id.clone(),
-            "stage" => self.stage.to_string()),
+        queue_delay: Histogram = histogram!("topology_queue_delay_seconds", "stage" => self.stage.to_string()),
     }
 
     fn emit(&self, duration: Duration) {

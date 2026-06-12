@@ -21,7 +21,7 @@ use vector_buffers::{
         builder::TopologyBuilder,
         channel::{BufferReceiver, BufferSender},
     },
-    BufferType, Bufferable, EventCount, WhenFull,
+    BufferType, EventCount, TimedBufferable, WhenFull,
 };
 use vector_common::byte_size_of::ByteSizeOf;
 use vector_common::finalization::{
@@ -244,7 +244,7 @@ fn generate_record_cache(min: usize, max: usize) -> Vec<VariableMessage> {
 
 async fn generate_buffer<T>(buffer_type: &str) -> (BufferSender<T>, BufferReceiver<T>)
 where
-    T: Bufferable + Clone + Finalizable,
+    T: TimedBufferable + Finalizable,
 {
     let data_dir = PathBuf::from("/tmp/vector");
     let id = format!("{}-buffer-perf-testing", buffer_type);

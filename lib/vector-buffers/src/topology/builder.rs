@@ -2,7 +2,7 @@ use std::{error::Error, num::NonZeroUsize, sync::Arc};
 
 use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
-use tracing::Span;
+use tracing::{error_span, Span};
 use vector_common::{config::ComponentKey, internal_event::register};
 
 use super::channel::{ReceiverAdapter, SenderAdapter};
@@ -175,13 +175,12 @@ where
                 .await
                 .context(FailedToBuildStageSnafu { stage_idx })?;
 
-            let queue_delay = register(BufferQueueDelay {
-                component_id: component_id.clone(),
-                stage: stage_idx,
-            });
-            let send_duration = {
+            let (send_duration, queue_delay) = {
                 let _enter = span.enter();
-                register(BufferSendDuration { stage: stage_idx })
+                (
+                    register(BufferSendDuration { stage: stage_idx }),
+                    register(BufferQueueDelay { stage: stage_idx }),
+                )
             };
 
             let (mut sender, mut receiver) = match current_stage.take() {
@@ -245,7 +244,7 @@ where
         id: impl Into<ComponentKey>,
         receiver_span: &Span,
     ) -> (BufferSender<T>, BufferReceiver<T>) {
-        let component_id = id.into().into_id();
+        let component_key = id.into();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let usage_handle = BufferUsageHandle::noop();
 
@@ -259,15 +258,22 @@ where
             WhenFull::Overflow => WhenFull::Block,
             m => m,
         };
-        let send_duration = {
+        let buffer_span = {
             let _enter = receiver_span.enter();
-            register(BufferSendDuration { stage: 0 })
+            error_span!(
+                "standalone_memory",
+                component_id = %component_key.id(),
+                buffer_type = "memory",
+            )
+        };
+        let (send_duration, queue_delay) = {
+            let _enter = buffer_span.enter();
+            (
+                register(BufferSendDuration { stage: 0 }),
+                register(BufferQueueDelay { stage: 0 }),
+            )
         };
         let sender = BufferSender::new(sender, mode, Arc::clone(&clock), send_duration);
-        let queue_delay = register(BufferQueueDelay {
-            component_id,
-            stage: 0,
-        });
         let receiver = BufferReceiver::new(receiver, queue_delay, clock);
 
         (sender, receiver)
@@ -303,11 +309,8 @@ where
             WhenFull::Overflow => WhenFull::Block,
             m => m,
         };
-        let queue_delay = register(BufferQueueDelay {
-            component_id: String::from("<test>"),
-            stage: 0,
-        });
         let send_duration = register(BufferSendDuration { stage: 0 });
+        let queue_delay = register(BufferQueueDelay { stage: 0 });
         let mut sender = BufferSender::new(sender, mode, Arc::clone(&clock), send_duration);
         let mut receiver = BufferReceiver::new(receiver, queue_delay, clock);
 
