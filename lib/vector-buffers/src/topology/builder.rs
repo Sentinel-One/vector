@@ -8,7 +8,7 @@ use vector_common::{config::ComponentKey, internal_event::register};
 use super::channel::{ReceiverAdapter, SenderAdapter};
 use crate::{
     buffer_usage_data::{BufferUsage, BufferUsageHandle},
-    internal_events::BufferQueueDelay,
+    internal_events::{BufferQueueDelay, BufferSendDuration},
     topology::channel::{BufferReceiver, BufferSender},
     variants::MemoryBuffer,
     Clock, SystemClock, TimedBufferable, WhenFull,
@@ -179,14 +179,23 @@ where
                 component_id: component_id.clone(),
                 stage: stage_idx,
             });
+            let send_duration = {
+                let _enter = span.enter();
+                register(BufferSendDuration { stage: stage_idx })
+            };
 
             let (mut sender, mut receiver) = match current_stage.take() {
                 None => (
-                    BufferSender::new(sender, stage.when_full, Arc::clone(&clock)),
+                    BufferSender::new(sender, stage.when_full, Arc::clone(&clock), send_duration),
                     BufferReceiver::new(receiver, queue_delay, Arc::clone(&clock)),
                 ),
                 Some((current_sender, current_receiver)) => (
-                    BufferSender::with_overflow(sender, current_sender, Arc::clone(&clock)),
+                    BufferSender::with_overflow(
+                        sender,
+                        current_sender,
+                        Arc::clone(&clock),
+                        send_duration,
+                    ),
                     BufferReceiver::with_overflow(
                         receiver,
                         current_receiver,
@@ -196,7 +205,6 @@ where
                 ),
             };
 
-            sender.with_send_duration_instrumentation(stage_idx, &span);
             if !provides_instrumentation {
                 sender.with_usage_instrumentation(usage_handle.clone());
                 receiver.with_usage_instrumentation(usage_handle);
@@ -251,8 +259,11 @@ where
             WhenFull::Overflow => WhenFull::Block,
             m => m,
         };
-        let mut sender = BufferSender::new(sender, mode, Arc::clone(&clock));
-        sender.with_send_duration_instrumentation(0, receiver_span);
+        let send_duration = {
+            let _enter = receiver_span.enter();
+            register(BufferSendDuration { stage: 0 })
+        };
+        let sender = BufferSender::new(sender, mode, Arc::clone(&clock), send_duration);
         let queue_delay = register(BufferQueueDelay {
             component_id,
             stage: 0,
@@ -296,7 +307,8 @@ where
             component_id: String::from("<test>"),
             stage: 0,
         });
-        let mut sender = BufferSender::new(sender, mode, Arc::clone(&clock));
+        let send_duration = register(BufferSendDuration { stage: 0 });
+        let mut sender = BufferSender::new(sender, mode, Arc::clone(&clock), send_duration);
         let mut receiver = BufferReceiver::new(receiver, queue_delay, clock);
 
         sender.with_usage_instrumentation(usage_handle.clone());

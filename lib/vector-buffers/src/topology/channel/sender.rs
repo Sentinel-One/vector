@@ -3,10 +3,9 @@ use std::{sync::Arc, time::Instant};
 use async_recursion::async_recursion;
 use derivative::Derivative;
 use tokio::sync::Mutex;
-use tracing::Span;
 use vector_common::{
     byte_size_of::ByteSizeOf,
-    internal_event::{register, InternalEventHandle, Registered},
+    internal_event::{InternalEventHandle, Registered},
 };
 
 use super::limited_queue::LimitedSender;
@@ -160,7 +159,7 @@ where
     when_full: WhenFull,
     instrumentation: Option<BufferUsageHandle>,
     #[derivative(Debug = "ignore")]
-    send_duration: Option<Registered<BufferSendDuration>>,
+    send_duration: Registered<BufferSendDuration>,
     #[derivative(Debug = "ignore")]
     clock: Arc<dyn Clock>,
 }
@@ -170,13 +169,18 @@ where
     T: TimedBufferable,
 {
     /// Creates a new [`BufferSender`] wrapping the given channel sender.
-    pub fn new(base: SenderAdapter<T>, when_full: WhenFull, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(
+        base: SenderAdapter<T>,
+        when_full: WhenFull,
+        clock: Arc<dyn Clock>,
+        send_duration: Registered<BufferSendDuration>,
+    ) -> Self {
         Self {
             base,
             overflow: None,
             when_full,
             instrumentation: None,
-            send_duration: None,
+            send_duration,
             clock,
         }
     }
@@ -186,13 +190,14 @@ where
         base: SenderAdapter<T>,
         overflow: BufferSender<T>,
         clock: Arc<dyn Clock>,
+        send_duration: Registered<BufferSendDuration>,
     ) -> Self {
         Self {
             base,
             overflow: Some(Box::new(overflow)),
             when_full: WhenFull::Overflow,
             instrumentation: None,
-            send_duration: None,
+            send_duration,
             clock,
         }
     }
@@ -210,12 +215,6 @@ where
     /// Configures this sender to instrument the items passing through it.
     pub fn with_usage_instrumentation(&mut self, handle: BufferUsageHandle) {
         self.instrumentation = Some(handle);
-    }
-
-    /// Configures this sender to instrument the send duration.
-    pub fn with_send_duration_instrumentation(&mut self, stage: usize, span: &Span) {
-        let _enter = span.enter();
-        self.send_duration = Some(register(BufferSendDuration { stage }));
     }
 }
 
@@ -271,10 +270,8 @@ where
         };
 
         if sent_to_base || was_dropped {
-            if let (Some(send_duration), Some(send_reference)) =
-                (self.send_duration.as_ref(), send_reference)
-            {
-                send_duration.emit(send_reference.elapsed());
+            if let Some(send_reference) = send_reference {
+                self.send_duration.emit(send_reference.elapsed());
             }
         }
 
