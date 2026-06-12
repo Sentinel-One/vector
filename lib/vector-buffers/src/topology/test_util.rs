@@ -9,7 +9,7 @@ use crate::{
     buffer_usage_data::BufferUsageHandle,
     encoding::FixedEncodable,
     topology::channel::{BufferReceiver, BufferSender},
-    Bufferable, EventCount, WhenFull,
+    EventCount, TimedBufferable, WhenFull,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -132,14 +132,14 @@ pub(crate) async fn build_buffer(
 }
 
 /// Gets the current capacity of the underlying base channel of the given sender.
-fn get_base_sender_capacity<T: Bufferable>(sender: &BufferSender<T>) -> Option<usize> {
+fn get_base_sender_capacity<T: TimedBufferable>(sender: &BufferSender<T>) -> Option<usize> {
     sender.get_base_ref().capacity()
 }
 
 /// Gets the current capacity of the underlying overflow channel of the given sender..
 ///
 /// As overflow is optional, the return value will be `None` is overflow is not configured.
-fn get_overflow_sender_capacity<T: Bufferable>(sender: &BufferSender<T>) -> Option<usize> {
+fn get_overflow_sender_capacity<T: TimedBufferable>(sender: &BufferSender<T>) -> Option<usize> {
     sender
         .get_overflow_ref()
         .and_then(|s| s.get_base_ref().capacity())
@@ -154,7 +154,7 @@ pub fn assert_current_send_capacity<T>(
     base_expected: Option<usize>,
     overflow_expected: Option<usize>,
 ) where
-    T: Bufferable,
+    T: TimedBufferable,
 {
     assert_eq!(get_base_sender_capacity(sender), base_expected);
     assert_eq!(get_overflow_sender_capacity(sender), overflow_expected);

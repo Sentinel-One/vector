@@ -17,7 +17,7 @@ use crate::{
         channel::{BufferReceiver, BufferSender},
     },
     variants::{DiskV2Buffer, MemoryBuffer},
-    Bufferable, WhenFull,
+    WhenFull,
 };
 
 #[derive(Debug, Snafu)]
@@ -274,7 +274,7 @@ impl BufferType {
         id: String,
     ) -> Result<(), BufferBuildError>
     where
-        T: Bufferable + Clone + Finalizable,
+        T: crate::TimedBufferable + Finalizable,
     {
         match *self {
             BufferType::Memory {
@@ -366,20 +366,21 @@ impl BufferConfig {
     pub async fn build<T>(
         &self,
         data_dir: Option<PathBuf>,
-        buffer_id: String,
+        id: impl Into<vector_common::config::ComponentKey>,
         span: Span,
     ) -> Result<(BufferSender<T>, BufferReceiver<T>), BufferBuildError>
     where
-        T: Bufferable + Clone + Finalizable,
+        T: crate::TimedBufferable + Finalizable,
     {
+        let component_key = id.into();
         let mut builder = TopologyBuilder::default();
 
         for stage in self.stages() {
-            stage.add_to_builder(&mut builder, data_dir.clone(), buffer_id.clone())?;
+            stage.add_to_builder(&mut builder, data_dir.clone(), component_key.id().to_string())?;
         }
 
         builder
-            .build(buffer_id, span)
+            .build(component_key, span)
             .await
             .context(FailedToBuildTopologySnafu)
     }

@@ -32,7 +32,7 @@ pub mod test;
 mod timed;
 pub mod topology;
 
-pub use timed::{Clock, SystemClock, Timed, TimedEncodable};
+pub use timed::{Clock, SystemClock, Timed, TimedBufferable, TimedEncodable};
 
 pub(crate) mod variants;
 

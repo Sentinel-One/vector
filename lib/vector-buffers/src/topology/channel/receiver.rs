@@ -1,49 +1,64 @@
 use std::{
     mem,
     pin::Pin,
+    sync::Arc,
     task::{ready, Context, Poll},
 };
 
 use async_recursion::async_recursion;
+use derivative::Derivative;
 use futures::Stream;
 use tokio::select;
 use tokio_util::sync::ReusableBoxFuture;
-use vector_common::internal_event::emit;
+use vector_common::{
+    byte_size_of::ByteSizeOf,
+    internal_event::{emit, InternalEventHandle, Registered},
+};
 
 use super::limited_queue::LimitedReceiver;
 use crate::{
     buffer_usage_data::BufferUsageHandle,
+    internal_events::BufferQueueDelay,
     variants::disk_v2::{self, ProductionFilesystem},
-    Bufferable,
+    Clock, EventCount, Timed, TimedBufferable,
 };
 
 /// Adapter for papering over various receiver backends.
 #[derive(Debug)]
-pub enum ReceiverAdapter<T: Bufferable> {
+pub enum ReceiverAdapter<T>
+where
+    T: TimedBufferable,
+{
     /// The in-memory channel buffer.
-    InMemory(LimitedReceiver<T>),
+    InMemory(LimitedReceiver<Timed<T>>),
 
     /// The disk v2 buffer.
-    DiskV2(disk_v2::BufferReader<T, ProductionFilesystem>),
+    DiskV2(disk_v2::BufferReader<Timed<T>, ProductionFilesystem>),
 }
 
-impl<T: Bufferable> From<LimitedReceiver<T>> for ReceiverAdapter<T> {
-    fn from(v: LimitedReceiver<T>) -> Self {
+impl<T> From<LimitedReceiver<Timed<T>>> for ReceiverAdapter<T>
+where
+    T: TimedBufferable,
+{
+    fn from(v: LimitedReceiver<Timed<T>>) -> Self {
         Self::InMemory(v)
     }
 }
 
-impl<T: Bufferable> From<disk_v2::BufferReader<T, ProductionFilesystem>> for ReceiverAdapter<T> {
-    fn from(v: disk_v2::BufferReader<T, ProductionFilesystem>) -> Self {
+impl<T> From<disk_v2::BufferReader<Timed<T>, ProductionFilesystem>> for ReceiverAdapter<T>
+where
+    T: TimedBufferable,
+{
+    fn from(v: disk_v2::BufferReader<Timed<T>, ProductionFilesystem>) -> Self {
         Self::DiskV2(v)
     }
 }
 
 impl<T> ReceiverAdapter<T>
 where
-    T: Bufferable,
+    T: TimedBufferable,
 {
-    pub(crate) async fn next(&mut self) -> Option<T> {
+    pub(crate) async fn next(&mut self) -> Option<Timed<T>> {
         match self {
             ReceiverAdapter::InMemory(rx) => rx.next().await,
             ReceiverAdapter::DiskV2(reader) => loop {
@@ -72,29 +87,53 @@ where
 /// for querying the overflow buffer as well.  The ordering of events when operating in "overflow"
 /// is undefined, as the receiver will try to manage polling both its own buffer, as well as the
 /// overflow buffer, in order to fairly balance throughput.
-#[derive(Debug)]
-pub struct BufferReceiver<T: Bufferable> {
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct BufferReceiver<T>
+where
+    T: TimedBufferable,
+{
     base: ReceiverAdapter<T>,
     overflow: Option<Box<BufferReceiver<T>>>,
     instrumentation: Option<BufferUsageHandle>,
+    #[derivative(Debug = "ignore")]
+    queue_delay: Registered<BufferQueueDelay>,
+    #[derivative(Debug = "ignore")]
+    clock: Arc<dyn Clock>,
 }
 
-impl<T: Bufferable> BufferReceiver<T> {
+impl<T> BufferReceiver<T>
+where
+    T: TimedBufferable,
+{
     /// Creates a new [`BufferReceiver`] wrapping the given channel receiver.
-    pub fn new(base: ReceiverAdapter<T>) -> Self {
+    pub fn new(
+        base: ReceiverAdapter<T>,
+        queue_delay: Registered<BufferQueueDelay>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             base,
             overflow: None,
             instrumentation: None,
+            queue_delay,
+            clock,
         }
     }
 
     /// Creates a new [`BufferReceiver`] wrapping the given channel receiver and overflow receiver.
-    pub fn with_overflow(base: ReceiverAdapter<T>, overflow: BufferReceiver<T>) -> Self {
+    pub fn with_overflow(
+        base: ReceiverAdapter<T>,
+        overflow: BufferReceiver<T>,
+        queue_delay: Registered<BufferQueueDelay>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             base,
             overflow: Some(Box::new(overflow)),
             instrumentation: None,
+            queue_delay,
+            clock,
         }
     }
 
@@ -124,32 +163,31 @@ impl<T: Bufferable> BufferReceiver<T> {
         // attached to the base receiver.
         let overflow = self.overflow.as_mut().map(Pin::new);
 
-        let (item, from_base) = match overflow {
-            None => match self.base.next().await {
-                Some(item) => (item, true),
-                None => return None,
-            },
+        match overflow {
+            None => self.base.next().await.map(|timed| self.with_telemetry(timed)),
             Some(mut overflow) => {
                 select! {
-                    Some(item) = overflow.next() => (item, false),
-                    Some(item) = self.base.next() => (item, true),
-                    else => return None,
+                    Some(timed) = self.base.next() => Some(self.with_telemetry(timed)),
+                    Some(item) = overflow.next() => Some(item),
+                    else => None,
                 }
             }
-        };
+        }
+    }
+
+    fn with_telemetry(&self, item: Timed<T>) -> T {
+        self.queue_delay.emit(item.elapsed(&*self.clock));
 
         // If instrumentation is enabled, and we got the item from the base receiver, then and only
         // then do we track sending the event out.
         if let Some(handle) = self.instrumentation.as_ref() {
-            if from_base {
-                handle.increment_sent_event_count_and_byte_size(
-                    item.event_count() as u64,
-                    item.size_of() as u64,
-                );
-            }
+            handle.increment_sent_event_count_and_byte_size(
+                item.event_count() as u64,
+                item.size_of() as u64,
+            );
         }
 
-        Some(item)
+        item.into_inner()
     }
 
     pub fn into_stream(self) -> BufferReceiverStream<T> {
@@ -157,18 +195,27 @@ impl<T: Bufferable> BufferReceiver<T> {
     }
 }
 
-enum StreamState<T: Bufferable> {
+enum StreamState<T>
+where
+    T: TimedBufferable,
+{
     Idle(BufferReceiver<T>),
     Polling,
     Closed,
 }
 
-pub struct BufferReceiverStream<T: Bufferable> {
+pub struct BufferReceiverStream<T>
+where
+    T: TimedBufferable,
+{
     state: StreamState<T>,
     recv_fut: ReusableBoxFuture<'static, (Option<T>, BufferReceiver<T>)>,
 }
 
-impl<T: Bufferable> BufferReceiverStream<T> {
+impl<T> BufferReceiverStream<T>
+where
+    T: TimedBufferable,
+{
     pub fn new(receiver: BufferReceiver<T>) -> Self {
         Self {
             state: StreamState::Idle(receiver),
@@ -177,7 +224,10 @@ impl<T: Bufferable> BufferReceiverStream<T> {
     }
 }
 
-impl<T: Bufferable> Stream for BufferReceiverStream<T> {
+impl<T> Stream for BufferReceiverStream<T>
+where
+    T: TimedBufferable,
+{
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -205,9 +255,12 @@ impl<T: Bufferable> Stream for BufferReceiverStream<T> {
     }
 }
 
-async fn make_recv_future<T: Bufferable>(
+async fn make_recv_future<T>(
     receiver: Option<BufferReceiver<T>>,
-) -> (Option<T>, BufferReceiver<T>) {
+) -> (Option<T>, BufferReceiver<T>)
+where
+    T: TimedBufferable,
+{
     match receiver {
         None => panic!("invalid to poll future in uninitialized state"),
         Some(mut receiver) => {

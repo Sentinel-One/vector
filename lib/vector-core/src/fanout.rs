@@ -487,6 +487,7 @@ mod tests {
         TopologyBuilder::standalone_memory(
             NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
             WhenFull::Block,
+            "fanout_test_buffer",
             &Span::current(),
         )
         .await

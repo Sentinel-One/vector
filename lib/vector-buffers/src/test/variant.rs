@@ -14,7 +14,7 @@ use crate::{
         channel::{BufferReceiver, BufferSender},
     },
     variants::{DiskV2Buffer, MemoryBuffer},
-    Bufferable, WhenFull,
+    TimedBufferable, WhenFull,
 };
 
 #[cfg(test)]
@@ -45,7 +45,7 @@ pub enum Variant {
 impl Variant {
     pub async fn create_sender_receiver<T>(&self) -> (BufferSender<T>, BufferReceiver<T>)
     where
-        T: Bufferable + Clone + Finalizable,
+        T: TimedBufferable + Finalizable,
     {
         let mut builder = TopologyBuilder::default();
         match self {

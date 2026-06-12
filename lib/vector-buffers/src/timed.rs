@@ -8,7 +8,10 @@ use vector_common::{
     finalization::{AddBatchNotifier, BatchNotifier, EventFinalizers, Finalizable},
 };
 
-use crate::{encoding::Encodable, EventCount};
+use crate::{
+    encoding::{Encodable, FixedEncodable},
+    EventCount,
+};
 
 /// Source of wall-clock time. Real implementations return `SystemTime::now()`; tests can supply
 /// a controllable mock so that elapsed-time assertions are deterministic.
@@ -100,6 +103,26 @@ pub trait TimedEncodable: Encodable {
         buffer: B,
     ) -> Result<(Self, Option<SystemTime>), Self::DecodeError>;
 }
+
+impl<T: FixedEncodable> TimedEncodable for T {
+    fn encode_with_enq_tm<B: BufMut>(
+        self,
+        _enq_tm: Option<SystemTime>,
+        buffer: &mut B,
+    ) -> Result<(), Self::EncodeError> {
+        <Self as Encodable>::encode(self, buffer)
+    }
+
+    fn decode_with_enq_tm<B: Buf + Clone>(
+        metadata: Self::Metadata,
+        buffer: B,
+    ) -> Result<(Self, Option<SystemTime>), Self::DecodeError> {
+        <Self as Encodable>::decode(metadata, buffer).map(|v| (v, None))
+    }
+}
+
+pub trait TimedBufferable: TimedEncodable + crate::InMemoryBufferable + Clone {}
+impl<T> TimedBufferable for T where T: TimedEncodable + crate::InMemoryBufferable + Clone {}
 
 impl<T: TimedEncodable> Encodable for Timed<T> {
     type Metadata = T::Metadata;

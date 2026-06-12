@@ -4,43 +4,55 @@ use async_recursion::async_recursion;
 use derivative::Derivative;
 use tokio::sync::Mutex;
 use tracing::Span;
-use vector_common::internal_event::{register, InternalEventHandle, Registered};
+use vector_common::{
+    byte_size_of::ByteSizeOf,
+    internal_event::{register, InternalEventHandle, Registered},
+};
 
 use super::limited_queue::LimitedSender;
 use crate::{
     buffer_usage_data::BufferUsageHandle,
     internal_events::BufferSendDuration,
     variants::disk_v2::{self, ProductionFilesystem},
-    Bufferable, WhenFull,
+    Clock, EventCount, Timed, TimedBufferable, WhenFull,
 };
 
 /// Adapter for papering over various sender backends.
 #[derive(Clone, Debug)]
-pub enum SenderAdapter<T: Bufferable> {
+pub enum SenderAdapter<T>
+where
+    T: TimedBufferable,
+{
     /// The in-memory channel buffer.
-    InMemory(LimitedSender<T>),
+    InMemory(LimitedSender<Timed<T>>),
 
     /// The disk v2 buffer.
-    DiskV2(Arc<Mutex<disk_v2::BufferWriter<T, ProductionFilesystem>>>),
+    DiskV2(Arc<Mutex<disk_v2::BufferWriter<Timed<T>, ProductionFilesystem>>>),
 }
 
-impl<T: Bufferable> From<LimitedSender<T>> for SenderAdapter<T> {
-    fn from(v: LimitedSender<T>) -> Self {
+impl<T> From<LimitedSender<Timed<T>>> for SenderAdapter<T>
+where
+    T: TimedBufferable,
+{
+    fn from(v: LimitedSender<Timed<T>>) -> Self {
         Self::InMemory(v)
     }
 }
 
-impl<T: Bufferable> From<disk_v2::BufferWriter<T, ProductionFilesystem>> for SenderAdapter<T> {
-    fn from(v: disk_v2::BufferWriter<T, ProductionFilesystem>) -> Self {
+impl<T> From<disk_v2::BufferWriter<Timed<T>, ProductionFilesystem>> for SenderAdapter<T>
+where
+    T: TimedBufferable,
+{
+    fn from(v: disk_v2::BufferWriter<Timed<T>, ProductionFilesystem>) -> Self {
         Self::DiskV2(Arc::new(Mutex::new(v)))
     }
 }
 
 impl<T> SenderAdapter<T>
 where
-    T: Bufferable,
+    T: TimedBufferable,
 {
-    pub(crate) async fn send(&mut self, item: T) -> crate::Result<()> {
+    pub(crate) async fn send(&mut self, item: Timed<T>) -> crate::Result<()> {
         match self {
             Self::InMemory(tx) => tx.send(item).await.map_err(Into::into),
             Self::DiskV2(writer) => {
@@ -60,7 +72,7 @@ where
         }
     }
 
-    pub(crate) async fn try_send(&mut self, item: T) -> crate::Result<Option<T>> {
+    pub(crate) async fn try_send(&mut self, item: Timed<T>) -> crate::Result<Option<Timed<T>>> {
         match self {
             Self::InMemory(tx) => tx
                 .try_send(item)
@@ -130,35 +142,49 @@ where
 /// `#[async_recursion]` stuff.
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
-pub struct BufferSender<T: Bufferable> {
+pub struct BufferSender<T>
+where
+    T: TimedBufferable,
+{
     base: SenderAdapter<T>,
     overflow: Option<Box<BufferSender<T>>>,
     when_full: WhenFull,
     instrumentation: Option<BufferUsageHandle>,
     #[derivative(Debug = "ignore")]
     send_duration: Option<Registered<BufferSendDuration>>,
+    #[derivative(Debug = "ignore")]
+    clock: Arc<dyn Clock>,
 }
 
-impl<T: Bufferable> BufferSender<T> {
+impl<T> BufferSender<T>
+where
+    T: TimedBufferable,
+{
     /// Creates a new [`BufferSender`] wrapping the given channel sender.
-    pub fn new(base: SenderAdapter<T>, when_full: WhenFull) -> Self {
+    pub fn new(base: SenderAdapter<T>, when_full: WhenFull, clock: Arc<dyn Clock>) -> Self {
         Self {
             base,
             overflow: None,
             when_full,
             instrumentation: None,
             send_duration: None,
+            clock,
         }
     }
 
     /// Creates a new [`BufferSender`] wrapping the given channel sender and overflow sender.
-    pub fn with_overflow(base: SenderAdapter<T>, overflow: BufferSender<T>) -> Self {
+    pub fn with_overflow(
+        base: SenderAdapter<T>,
+        overflow: BufferSender<T>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             base,
             overflow: Some(Box::new(overflow)),
             when_full: WhenFull::Overflow,
             instrumentation: None,
             send_duration: None,
+            clock,
         }
     }
 
@@ -184,7 +210,10 @@ impl<T: Bufferable> BufferSender<T> {
     }
 }
 
-impl<T: Bufferable> BufferSender<T> {
+impl<T> BufferSender<T>
+where
+    T: TimedBufferable,
+{
     #[cfg(test)]
     pub(crate) fn get_base_ref(&self) -> &SenderAdapter<T> {
         &self.base
@@ -195,8 +224,17 @@ impl<T: Bufferable> BufferSender<T> {
         self.overflow.as_ref().map(AsRef::as_ref)
     }
 
-    #[async_recursion]
     pub async fn send(&mut self, item: T, send_reference: Option<Instant>) -> crate::Result<()> {
+        let stamped = Timed::stamped(item, &*self.clock);
+        self.send_stamped(stamped, send_reference).await
+    }
+
+    #[async_recursion]
+    async fn send_stamped(
+        &mut self,
+        item: Timed<T>,
+        send_reference: Option<Instant>,
+    ) -> crate::Result<()> {
         let item_sizing = self
             .instrumentation
             .as_ref()
@@ -217,7 +255,7 @@ impl<T: Bufferable> BufferSender<T> {
                     self.overflow
                         .as_mut()
                         .unwrap_or_else(|| unreachable!("overflow must exist"))
-                        .send(item, send_reference)
+                        .send_stamped(item, send_reference)
                         .await?;
                 }
             }
