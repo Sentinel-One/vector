@@ -372,6 +372,27 @@ impl BufferConfig {
     where
         T: crate::TimedBufferable + Finalizable,
     {
+        self.build_with_clock(data_dir, id, span, std::sync::Arc::new(crate::SystemClock))
+            .await
+    }
+
+    /// Like [`build`](Self::build) but accepts an explicit clock, primarily for tests that want
+    /// deterministic queue-delay measurements.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`build`](Self::build).
+    #[allow(clippy::needless_pass_by_value)]
+    pub async fn build_with_clock<T>(
+        &self,
+        data_dir: Option<PathBuf>,
+        id: impl Into<vector_common::config::ComponentKey>,
+        span: Span,
+        clock: std::sync::Arc<dyn crate::Clock>,
+    ) -> Result<(BufferSender<T>, BufferReceiver<T>), BufferBuildError>
+    where
+        T: crate::TimedBufferable + Finalizable,
+    {
         let component_key = id.into();
         let mut builder = TopologyBuilder::default();
 
@@ -380,7 +401,7 @@ impl BufferConfig {
         }
 
         builder
-            .build(component_key, span)
+            .build_with_clock(component_key, span, clock)
             .await
             .context(FailedToBuildTopologySnafu)
     }

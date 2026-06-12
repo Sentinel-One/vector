@@ -123,8 +123,23 @@ where
         id: impl Into<ComponentKey>,
         span: Span,
     ) -> Result<(BufferSender<T>, BufferReceiver<T>), TopologyError> {
+        self.build_with_clock(id, span, Arc::new(SystemClock))
+            .await
+    }
+
+    /// Like [`build`](Self::build) but accepts an explicit clock, primarily for tests that want
+    /// deterministic queue-delay measurements.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`build`](Self::build).
+    pub async fn build_with_clock(
+        self,
+        id: impl Into<ComponentKey>,
+        span: Span,
+        clock: Arc<dyn Clock>,
+    ) -> Result<(BufferSender<T>, BufferReceiver<T>), TopologyError> {
         let component_id = id.into().into_id();
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         // We pop stages off in reverse order to build from the inside out.
         let mut buffer_usage = BufferUsage::from_span(span.clone());

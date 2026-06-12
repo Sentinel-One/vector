@@ -110,6 +110,15 @@ where
         }
     }
 
+    pub(crate) async fn close(&mut self) {
+        match self {
+            Self::InMemory(_) => {}
+            Self::DiskV2(writer) => {
+                writer.lock().await.close();
+            }
+        }
+    }
+
     pub fn capacity(&self) -> Option<usize> {
         match self {
             Self::InMemory(tx) => Some(tx.available_capacity()),
@@ -299,5 +308,13 @@ where
         }
 
         Ok(())
+    }
+
+    #[async_recursion]
+    pub async fn close(&mut self) {
+        self.base.close().await;
+        if let Some(overflow) = self.overflow.as_mut() {
+            overflow.close().await;
+        }
     }
 }
