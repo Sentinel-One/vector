@@ -32,6 +32,12 @@ use vector_lib::config::OutputId;
 
 mod backpressure;
 mod compliance;
+#[cfg(all(
+    feature = "sources-demo_logs",
+    feature = "transforms-remap",
+    feature = "sinks-blackhole"
+))]
+mod queue_delay;
 #[cfg(all(feature = "sinks-socket", feature = "sources-socket"))]
 mod crash;
 mod doesnt_reload;
