@@ -1381,6 +1381,7 @@ mod tests {
             auto_extract_timestamp: None,
             endpoint_target: Default::default(),
             timestamp_configuration: None,
+            rejection_report: Default::default(),
         }
         .build(SinkContext::default())
         .await
