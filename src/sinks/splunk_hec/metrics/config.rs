@@ -209,12 +209,10 @@ impl HecMetricsSinkConfig {
             ));
 
         let context = Arc::new(HecRejectionContext {
-            telemetry: Telemetry {
-                rejected: metrics::counter!(
-                    "hec_rejected",
-                    "endpoint" => self.endpoint.clone(),
-                ),
-            },
+            rejected: metrics::counter!(
+                "hec_rejected",
+                "endpoint" => self.endpoint.clone(),
+            ),
         });
 
         let service = HecService::new(

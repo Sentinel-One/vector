@@ -31,23 +31,23 @@ use crate::{
     },
 };
 
-// #OBSERVO_STYLE_TELEMETRY# — see ElasticsearchService for rationale.
-#[derive(Clone)]
-pub struct Telemetry {
+pub struct HecRejectionContext {
     pub rejected: Counter,
 }
 
-pub struct HecRejectionContext {
-    pub telemetry: Telemetry,
-}
-
 impl RejectionContext for HecRejectionContext {
-    fn error_message(&self, status: u16, _body: &Bytes) -> String {
-        format!("Request rejected (status: {status}).")
+    fn error_message(&self, status: u16, body: &Bytes) -> String {
+        let splunk_text = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_owned));
+        match splunk_text {
+            Some(text) => format!("Request rejected (status: {status}): {text}."),
+            None => format!("Request rejected (status: {status})."),
+        }
     }
 
     fn record_rejection(&self, _status: u16, _body: &Bytes) {
-        self.telemetry.rejected.increment(1);
+        self.rejected.increment(1);
     }
 }
 
@@ -382,8 +382,7 @@ mod tests {
                 },
                 build_http_batch_service,
                 request::HecRequest,
-                service::{HecAckResponseBody, HecService, HttpRequestBuilder, Token},
-                service::{HecAckResponseBody, HecRejectionContext, HecService, HttpRequestBuilder, Telemetry},
+                service::{HecAckResponseBody, HecRejectionContext, HecService, HttpRequestBuilder,Token, Telemetry},
                 EndpointTarget,
             },
             util::{metadata::RequestMetadataBuilder, Compression, RejectionReport},
@@ -427,9 +426,7 @@ mod tests {
 
     fn test_context() -> Arc<HecRejectionContext> {
         Arc::new(HecRejectionContext {
-            telemetry: Telemetry {
-                rejected: metrics::counter!("hec_rejected_test"),
-            },
+            rejected: metrics::counter!("hec_rejected_test"),
         })
     }
 
