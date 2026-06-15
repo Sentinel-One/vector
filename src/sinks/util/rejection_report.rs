@@ -119,8 +119,6 @@ mod tests {
 
     use super::*;
 
-    // --- RejectionReport enum behaviour ---
-
     #[test]
     fn default_is_stats() {
         assert_eq!(RejectionReport::default(), RejectionReport::Stats);
@@ -146,15 +144,12 @@ mod tests {
                 .unwrap_or_else(|_| panic!("failed to parse {input}"));
             assert_eq!(&parsed, expected, "input={input}");
         }
-        // Serialize → Deserialize round-trip
         for variant in [RejectionReport::Stats, RejectionReport::Response, RejectionReport::RequestResponse] {
             let json = serde_json::to_string(&variant).unwrap();
             let back: RejectionReport = serde_json::from_str(&json).unwrap();
             assert_eq!(back, variant);
         }
     }
-
-    // --- emit_rejection_error via mock context ---
 
     struct MockContext {
         call_count: Arc<AtomicU64>,
@@ -208,7 +203,6 @@ mod tests {
         let (ctx, _) = make_ctx();
         let response_body = Bytes::from("response body");
         let request_body = Bytes::from("request payload");
-        // Should complete without panicking; decompressor pass-through for Compression::None.
         emit_rejection_error(
             &ctx,
             400,

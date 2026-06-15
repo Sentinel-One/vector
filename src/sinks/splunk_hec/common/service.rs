@@ -909,8 +909,6 @@ mod tests {
         assert_eq!(EventStatus::Delivered, response.event_status);
     }
 
-    // --- Rejection / error status tests ---
-
     fn no_ack_config() -> HecClientAcknowledgementsConfig {
         HecClientAcknowledgementsConfig {
             indexer_acknowledgements_enabled: false,
@@ -952,9 +950,6 @@ mod tests {
         assert_eq!(EventStatus::Errored, response.event_status);
     }
 
-    // A 5xx with RequestResponse mode should still return Errored.
-    // Internally the mode is downgraded to Response (no request body in 5xx log)
-    // but the event status is unaffected.
     #[tokio::test]
     async fn hec_service_5xx_with_request_response_mode_still_errored() {
         let mock_server = MockServer::start().await;
@@ -972,7 +967,6 @@ mod tests {
         assert_eq!(EventStatus::Errored, response.event_status);
     }
 
-    // A 4xx with RequestResponse mode returns Rejected (not affected by the mode).
     #[tokio::test]
     async fn hec_service_4xx_with_request_response_mode_returns_rejected() {
         let mock_server = MockServer::start().await;
