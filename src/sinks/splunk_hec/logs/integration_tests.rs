@@ -134,7 +134,9 @@ async fn config(
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
-        path: None
+        path: None,
+        batch_headers: Default::default(),
+        rejection_report: Default::default(),
     }
 }
 
