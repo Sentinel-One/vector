@@ -15,11 +15,11 @@ use crate::{
         splunk_hec::common::{
             acknowledgements::HecClientAcknowledgementsConfig,
             build_healthcheck, build_http_batch_service, config_host_key, create_client,
-            service::{HecService, HttpRequestBuilder, Token},
+            service::{HecRejectionContext, HecService, HttpRequestBuilder, Telemetry, Token},
             EndpointTarget, SplunkHecDefaultBatchSettings,
         },
         util::{
-            http::HttpRetryLogic, BatchConfig, Compression, ServiceBuilderExt,
+            http::HttpRetryLogic, BatchConfig, Compression, RejectionReport, ServiceBuilderExt,
         },
         Healthcheck,
     },
@@ -124,6 +124,10 @@ pub struct HecMetricsSinkConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub path: Option<String>,
+
+    /// Controls how much detail is logged when Splunk HEC rejects a batch.
+    #[serde(default)]
+    pub rejection_report: RejectionReport,
 }
 
 impl GenerateConfig for HecMetricsSinkConfig {
@@ -142,6 +146,7 @@ impl GenerateConfig for HecMetricsSinkConfig {
             tls: None,
             acknowledgements: Default::default(),
             path: None,
+            rejection_report: RejectionReport::default(),
         })
         .unwrap()
     }
@@ -203,11 +208,23 @@ impl HecMetricsSinkConfig {
                 self.path.clone()
             ));
 
+        let context = Arc::new(HecRejectionContext {
+            telemetry: Telemetry {
+                rejected: metrics::counter!(
+                    "hec_rejected",
+                    "endpoint" => self.endpoint.clone(),
+                ),
+            },
+        });
+
         let service = HecService::new(
             http_service,
             ack_client,
             http_request_builder,
             self.acknowledgements.clone(),
+            self.rejection_report.clone(),
+            self.compression,
+            context,
         );
 
         let batch_settings = self.batch.into_batcher_settings()?;

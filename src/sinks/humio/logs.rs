@@ -221,6 +221,7 @@ impl HumioLogsConfig {
                 preserve_timestamp_key: false,
             }),
             batch_headers: BatchHeaders::default(),
+            rejection_report: Default::default(),
         }
     }
 }

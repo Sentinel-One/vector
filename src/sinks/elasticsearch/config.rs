@@ -16,7 +16,7 @@ use crate::{
         elasticsearch::{
             health::ElasticsearchHealthLogic,
             retry::ElasticsearchRetryLogic,
-            service::{ElasticsearchService, HttpRequestBuilder, Telemetry},
+            service::{ElasticsearchRejectionContext, ElasticsearchService, HttpRequestBuilder, Telemetry},
             sink::ElasticsearchSink,
             ElasticsearchApiVersion, ElasticsearchAuthConfig, ElasticsearchCommon,
             ElasticsearchCommonMode, ElasticsearchMode, RejectionReport, VersionType,
@@ -573,6 +573,7 @@ impl SinkConfig for ElasticsearchConfig {
                         "end_pt" => endpt_str,
                     ),
                 };
+                let context = std::sync::Arc::new(ElasticsearchRejectionContext { telemetry });
 
                 let http_request_builder = HttpRequestBuilder::new(&common, self);
                 let service = ElasticsearchService::new(
@@ -580,7 +581,7 @@ impl SinkConfig for ElasticsearchConfig {
                     http_request_builder,
                     self.rejection_report.clone(),
                     self.compression.clone(),
-                    telemetry);
+                    context);
 
                 (endpoint, service)
             })

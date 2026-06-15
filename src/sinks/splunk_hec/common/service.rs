@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use http::{HeaderName, Request, HeaderValue};
 use indexmap::IndexMap;
+use metrics::Counter;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -25,16 +26,43 @@ use crate::{
     internal_events::{SplunkIndexerAcknowledgementUnavailableError, SplunkResponseParseError},
     sinks::{
         splunk_hec::common::{build_uri, request::HecRequest, response::HecResponse},
-        util::{sink::Response, Compression},
+        util::{emit_rejection_error, sink::Response, Compression, RejectionContext, RejectionReport},
         UriParseSnafu,
     },
 };
+
+// #OBSERVO_STYLE_TELEMETRY# — see ElasticsearchService for rationale.
+#[derive(Clone)]
+pub struct Telemetry {
+    pub rejected: Counter,
+}
+
+pub struct HecRejectionContext {
+    pub telemetry: Telemetry,
+}
+
+impl RejectionContext for HecRejectionContext {
+    fn log_category(&self) -> &'static str {
+        "hec_rej_rpt"
+    }
+
+    fn error_message(&self, status: u16, _body: &Bytes) -> String {
+        format!("Request rejected (status: {status}).")
+    }
+
+    fn record_rejection(&self, _status: u16, _body: &Bytes) {
+        self.telemetry.rejected.increment(1);
+    }
+}
 
 pub struct HecService<S> {
     pub inner: S,
     ack_finalizer_tx: Option<mpsc::Sender<(u64, oneshot::Sender<EventStatus>)>>,
     ack_slots: PollSemaphore,
     current_ack_slot: Option<OwnedSemaphorePermit>,
+    rej_rpt: RejectionReport,
+    compression: Compression,
+    context: Arc<HecRejectionContext>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -55,6 +83,9 @@ where
         ack_client: Option<HttpClient>,
         http_request_builder: Arc<HttpRequestBuilder>,
         indexer_acknowledgements: HecClientAcknowledgementsConfig,
+        rej_rpt: RejectionReport,
+        compression: Compression,
+        context: Arc<HecRejectionContext>,
     ) -> Self {
         let max_pending_acks = indexer_acknowledgements.max_pending_acks.get();
         let tx = if let Some(ack_client) = ack_client {
@@ -76,6 +107,9 @@ where
             ack_finalizer_tx: tx,
             ack_slots,
             current_ack_slot: None,
+            rej_rpt,
+            compression,
+            context,
         }
     }
 }
@@ -112,6 +146,14 @@ where
     fn call(&mut self, mut req: HecRequest) -> Self::Future {
         let ack_finalizer_tx = self.ack_finalizer_tx.clone();
         let ack_slot = self.current_ack_slot.take();
+        let rej_rpt = self.rej_rpt.clone();
+        let compression = self.compression;
+        let context = Arc::clone(&self.context);
+        let req_for_rpt = if rej_rpt.needs_request() {
+            Some((req.body.clone(), compression))
+        } else {
+            None
+        };
 
         let metadata = std::mem::take(req.metadata_mut());
         let events_count = metadata.event_count();
@@ -154,8 +196,15 @@ where
                     EventStatus::Delivered
                 }
             } else if response.is_transient() {
+                let mode = if rej_rpt == RejectionReport::RequestResponse {
+                    RejectionReport::Response
+                } else {
+                    rej_rpt
+                };
+                emit_rejection_error(&*context, response.status_code(), response.body(), None, mode);
                 EventStatus::Errored
             } else {
+                emit_rejection_error(&*context, response.status_code(), response.body(), req_for_rpt, rej_rpt);
                 EventStatus::Rejected
             };
 
@@ -170,11 +219,16 @@ where
 
 pub trait ResponseExt {
     fn body(&self) -> &Bytes;
+    fn status_code(&self) -> u16;
 }
 
 impl ResponseExt for http::Response<Bytes> {
     fn body(&self) -> &Bytes {
         self.body()
+    }
+
+    fn status_code(&self) -> u16 {
+        self.status().as_u16()
     }
 }
 
@@ -333,14 +387,23 @@ mod tests {
                 build_http_batch_service,
                 request::HecRequest,
                 service::{HecAckResponseBody, HecService, HttpRequestBuilder, Token},
+                service::{HecAckResponseBody, HecRejectionContext, HecService, HttpRequestBuilder, Telemetry},
                 EndpointTarget,
             },
-            util::{metadata::RequestMetadataBuilder, Compression},
+            util::{metadata::RequestMetadataBuilder, Compression, RejectionReport},
         },
     };
 
     const TOKEN: &str = "token";
     static ACK_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_context() -> Arc<HecRejectionContext> {
+        Arc::new(HecRejectionContext {
+            telemetry: Telemetry {
+                rejected: metrics::counter!("hec_rejected_test"),
+            },
+        })
+    }
 
     fn get_hec_service(
         endpoint: String,
@@ -367,6 +430,9 @@ mod tests {
             Some(client),
             http_request_builder,
             acknowledgements_config,
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         )
     }
 
@@ -689,6 +755,9 @@ mod tests {
             Some(client),
             http_request_builder,
             acknowledgements_config,
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         );
 
         let request = get_hec_request();
@@ -736,6 +805,9 @@ mod tests {
                 indexer_acknowledgements_enabled: false,
                 ..Default::default()
             },
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         );
 
         let request = get_hec_request();
@@ -795,6 +867,9 @@ mod tests {
                 indexer_acknowledgements_enabled: false,
                 ..Default::default()
             },
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         );
 
         let request = get_hec_request();

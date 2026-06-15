@@ -10,9 +10,12 @@ use crate::{
     sinks::{
         prelude::*,
         splunk_hec::common::{
-            EndpointTarget, SplunkHecDefaultBatchSettings, acknowledgements::HecClientAcknowledgementsConfig, build_healthcheck, build_http_batch_service, create_client, service::{HecService, HttpRequestBuilder, Token}
+            acknowledgements::HecClientAcknowledgementsConfig,
+            build_healthcheck, build_http_batch_service, create_client,
+            service::{HecRejectionContext, HecService, HttpRequestBuilder, Telemetry, Token},
+            EndpointTarget, SplunkHecDefaultBatchSettings,
         },
-        util::http::HttpRetryLogic,
+        util::{http::HttpRetryLogic, RejectionReport},
     },
 };
 use crate::sinks::util::http::{validate_headers, RequestConfig};
@@ -192,6 +195,10 @@ pub struct HecLogsSinkConfig {
     #[configurable(derived)]
     #[serde(default = "default_timestamp_configuration")]
     pub timestamp_configuration: Option<TimestampConfiguration>,
+
+    /// Controls how much detail is logged when Splunk HEC rejects a batch.
+    #[serde(default)]
+    pub rejection_report: RejectionReport,
 }
 
 
@@ -264,6 +271,7 @@ impl GenerateConfig for HecLogsSinkConfig {
             auto_extract_timestamp: None,
             endpoint_target: EndpointTarget::Event,
             timestamp_configuration: None,
+            rejection_report: RejectionReport::default(),
         })
         .unwrap()
     }
@@ -347,11 +355,23 @@ impl HecLogsSinkConfig {
                 self.path.clone()
             ));
 
+        let context = Arc::new(HecRejectionContext {
+            telemetry: Telemetry {
+                rejected: metrics::counter!(
+                    "hec_rejected",
+                    "endpoint" => self.endpoint.clone(),
+                ),
+            },
+        });
+
         let service = HecService::new(
             http_service,
             ack_client,
             http_request_builder,
             self.acknowledgements.clone(),
+            self.rejection_report.clone(),
+            self.compression,
+            context,
         );
 
         let batch_settings = self.batch.into_batcher_settings()?;
@@ -549,6 +569,7 @@ mod tests {
                 auto_extract_timestamp: None,
                 endpoint_target: EndpointTarget::Raw,
                 timestamp_configuration: None,
+                rejection_report: RejectionReport::default(),
             };
 
             let endpoint = format!("{endpoint}/services/collector/raw");
