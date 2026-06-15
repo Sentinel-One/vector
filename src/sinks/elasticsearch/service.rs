@@ -82,10 +82,6 @@ pub struct ElasticsearchRejectionContext {
 }
 
 impl RejectionContext for ElasticsearchRejectionContext {
-    fn log_category(&self) -> &'static str {
-        "es_rej_rpt"
-    }
-
     fn error_code(&self, status: u16) -> String {
         format!("http_response_{status}")
     }

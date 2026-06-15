@@ -35,14 +35,9 @@ impl RejectionReport {
 
 /// Sink-specific behaviour plugged into `emit_rejection_error`.
 ///
-/// Each sink implements this to provide its own counters, response parsing,
-/// and log category. The generic `emit_rejection_error` handles the three
-/// `RejectionReport` mode branches.
+/// Each sink implements this to provide its own counters and response parsing.
+/// The generic `emit_rejection_error` handles the three `RejectionReport` mode branches.
 pub trait RejectionContext: Send + Sync {
-    /// Short category label emitted as a structured log field
-    /// (e.g. `"es_rej_rpt"`, `"hec_rej_rpt"`).
-    fn log_category(&self) -> &'static str;
-
     /// Human-readable error code string (default: `"http_response_<N>"`).
     fn error_code(&self, status: u16) -> String {
         format!("http_response_{status}")
@@ -70,7 +65,6 @@ pub fn emit_rejection_error<C: RejectionContext>(
     context.record_rejection(status, response_body);
     let error_code = context.error_code(status);
     let message = context.error_message(status, response_body);
-    let category = context.log_category();
     let response_body_str = String::from_utf8_lossy(response_body);
 
     match (mode, request) {
@@ -81,7 +75,6 @@ pub fn emit_rejection_error<C: RejectionContext>(
                 Err(err) => format!("- decompression failed({comp}): '{err}' -").into(),
             };
             error!(
-                category = category,
                 message = message,
                 error_code = error_code,
                 response_status = status,
@@ -91,7 +84,6 @@ pub fn emit_rejection_error<C: RejectionContext>(
         }
         (RejectionReport::Stats, _) => {
             error!(
-                category = category,
                 message = message,
                 error_code = error_code,
             );
@@ -100,7 +92,6 @@ pub fn emit_rejection_error<C: RejectionContext>(
             // Covers `Response` mode and `RequestResponse` without a body
             // (e.g. 5xx where the request payload is suppressed).
             error!(
-                category = category,
                 message = message,
                 error_code = error_code,
                 response_status = status,
@@ -156,10 +147,6 @@ mod tests {
     }
 
     impl RejectionContext for MockContext {
-        fn log_category(&self) -> &'static str {
-            "test_cat"
-        }
-
         fn error_message(&self, status: u16, _body: &Bytes) -> String {
             format!("test error {status}")
         }

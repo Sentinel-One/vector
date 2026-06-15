@@ -42,10 +42,6 @@ pub struct HecRejectionContext {
 }
 
 impl RejectionContext for HecRejectionContext {
-    fn log_category(&self) -> &'static str {
-        "hec_rej_rpt"
-    }
-
     fn error_message(&self, status: u16, _body: &Bytes) -> String {
         format!("Request rejected (status: {status}).")
     }
