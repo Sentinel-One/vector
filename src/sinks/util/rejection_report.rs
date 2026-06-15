@@ -109,3 +109,119 @@ pub fn emit_rejection_error<C: RejectionContext>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    // --- RejectionReport enum behaviour ---
+
+    #[test]
+    fn default_is_stats() {
+        assert_eq!(RejectionReport::default(), RejectionReport::Stats);
+    }
+
+    #[test]
+    fn needs_request_is_true_only_for_request_response() {
+        assert!(!RejectionReport::Stats.needs_request());
+        assert!(!RejectionReport::Response.needs_request());
+        assert!(RejectionReport::RequestResponse.needs_request());
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let cases: &[(&str, RejectionReport)] = &[
+            (r#""stats""#, RejectionReport::Stats),
+            (r#""normal""#, RejectionReport::Stats),    // alias
+            (r#""response""#, RejectionReport::Response),
+            (r#""request_response""#, RejectionReport::RequestResponse),
+        ];
+        for (input, expected) in cases {
+            let parsed: RejectionReport = serde_json::from_str(input)
+                .unwrap_or_else(|_| panic!("failed to parse {input}"));
+            assert_eq!(&parsed, expected, "input={input}");
+        }
+        // Serialize → Deserialize round-trip
+        for variant in [RejectionReport::Stats, RejectionReport::Response, RejectionReport::RequestResponse] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: RejectionReport = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    // --- emit_rejection_error via mock context ---
+
+    struct MockContext {
+        call_count: Arc<AtomicU64>,
+    }
+
+    impl RejectionContext for MockContext {
+        fn log_category(&self) -> &'static str {
+            "test_cat"
+        }
+
+        fn error_message(&self, status: u16, _body: &Bytes) -> String {
+            format!("test error {status}")
+        }
+
+        fn record_rejection(&self, _status: u16, _body: &Bytes) {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn make_ctx() -> (MockContext, Arc<AtomicU64>) {
+        let count = Arc::new(AtomicU64::new(0));
+        let ctx = MockContext { call_count: Arc::clone(&count) };
+        (ctx, count)
+    }
+
+    #[test]
+    fn record_rejection_called_once_per_invocation_for_every_mode() {
+        let body = Bytes::from("error body");
+
+        let (ctx, count) = make_ctx();
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Stats);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        let (ctx, count) = make_ctx();
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Response);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        let (ctx, count) = make_ctx();
+        // RequestResponse without a request body falls back to response-only logging.
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::RequestResponse);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        let (ctx, count) = make_ctx();
+        let req = Bytes::from("request body");
+        emit_rejection_error(&ctx, 400, &body, Some((req, Compression::None)), RejectionReport::RequestResponse);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn request_response_mode_decompresses_uncompressed_body_without_panic() {
+        let (ctx, _) = make_ctx();
+        let response_body = Bytes::from("response body");
+        let request_body = Bytes::from("request payload");
+        // Should complete without panicking; decompressor pass-through for Compression::None.
+        emit_rejection_error(
+            &ctx,
+            400,
+            &response_body,
+            Some((request_body, Compression::None)),
+            RejectionReport::RequestResponse,
+        );
+    }
+
+    #[test]
+    fn error_code_default_impl_formats_status() {
+        let (ctx, _) = make_ctx();
+        assert_eq!(ctx.error_code(400), "http_response_400");
+        assert_eq!(ctx.error_code(503), "http_response_503");
+    }
+}

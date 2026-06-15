@@ -394,6 +394,38 @@ mod tests {
         },
     };
 
+    fn get_hec_service_with_rejection_report(
+        endpoint: String,
+        rej_rpt: RejectionReport,
+        acknowledgements_config: HecClientAcknowledgementsConfig,
+    ) -> HecService<BoxService<HecRequest, http::Response<Bytes>, crate::Error>> {
+        let app_info = crate::app_info();
+        let client = HttpClient::new(None, &ProxyConfig::default(), &app_info).unwrap();
+        let http_request_builder = Arc::new(HttpRequestBuilder::new(
+            endpoint,
+            EndpointTarget::default(),
+            String::from(TOKEN),
+            Compression::default(),
+            IndexMap::default(),
+        ));
+        let http_service = build_http_batch_service(
+            client.clone(),
+            Arc::clone(&http_request_builder),
+            EndpointTarget::Event,
+            false,
+            None,
+        );
+        HecService::new(
+            BoxService::new(http_service),
+            None,
+            http_request_builder,
+            acknowledgements_config,
+            rej_rpt,
+            Compression::default(),
+            test_context(),
+        )
+    }
+
     const TOKEN: &str = "token";
     static ACK_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -875,6 +907,87 @@ mod tests {
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(EventStatus::Delivered, response.event_status);
+    }
+
+    // --- Rejection / error status tests ---
+
+    fn no_ack_config() -> HecClientAcknowledgementsConfig {
+        HecClientAcknowledgementsConfig {
+            indexer_acknowledgements_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn hec_service_4xx_returns_rejected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(r#"{"text":"Invalid token","code":4}"#))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::Stats,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Rejected, response.event_status);
+    }
+
+    #[tokio::test]
+    async fn hec_service_5xx_returns_errored() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::Stats,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Errored, response.event_status);
+    }
+
+    // A 5xx with RequestResponse mode should still return Errored.
+    // Internally the mode is downgraded to Response (no request body in 5xx log)
+    // but the event status is unaffected.
+    #[tokio::test]
+    async fn hec_service_5xx_with_request_response_mode_still_errored() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::RequestResponse,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Errored, response.event_status);
+    }
+
+    // A 4xx with RequestResponse mode returns Rejected (not affected by the mode).
+    #[tokio::test]
+    async fn hec_service_4xx_with_request_response_mode_returns_rejected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(r#"{"text":"Forbidden","code":6}"#))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::RequestResponse,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Rejected, response.event_status);
     }
 }
 
