@@ -35,11 +35,16 @@ pub struct HecRejectionContext {
     pub rejected: Counter,
 }
 
+#[derive(serde::Deserialize)]
+struct SplunkErrorBody {
+    text: Option<String>,
+}
+
 impl RejectionContext for HecRejectionContext {
     fn error_message(&self, status: u16, body: &Bytes) -> String {
-        let splunk_text = serde_json::from_slice::<serde_json::Value>(body)
+        let splunk_text = serde_json::from_slice::<SplunkErrorBody>(body)
             .ok()
-            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_owned));
+            .and_then(|b| b.text);
         match splunk_text {
             Some(text) => format!("Request rejected (status: {status}): {text}."),
             None => format!("Request rejected (status: {status})."),
@@ -197,10 +202,10 @@ where
                 } else {
                     rej_rpt
                 };
-                emit_rejection_error(&*context, response.status_code(), response.body(), None, mode);
+                emit_rejection_error(context.as_ref(), response.status_code(), response.body(), None, mode);
                 EventStatus::Errored
             } else {
-                emit_rejection_error(&*context, response.status_code(), response.body(), req_for_rpt, rej_rpt);
+                emit_rejection_error(context.as_ref(), response.status_code(), response.body(), req_for_rpt, rej_rpt);
                 EventStatus::Rejected
             };
 
@@ -385,7 +390,7 @@ mod tests {
                 service::{HecAckResponseBody, HecRejectionContext, HecService, HttpRequestBuilder,Token, Telemetry},
                 EndpointTarget,
             },
-            util::{metadata::RequestMetadataBuilder, Compression, RejectionReport},
+            util::{metadata::RequestMetadataBuilder, Compression, RejectionContext, RejectionReport},
         },
     };
 
@@ -428,6 +433,24 @@ mod tests {
         Arc::new(HecRejectionContext {
             rejected: metrics::counter!("hec_rejected_test"),
         })
+    }
+
+    #[test]
+    fn error_message_extracts_splunk_text_field() {
+        let ctx = HecRejectionContext { rejected: metrics::counter!("_test") };
+        assert_eq!(
+            ctx.error_message(400, &Bytes::from(r#"{"text":"Invalid token","code":4}"#)),
+            "Request rejected (status: 400): Invalid token."
+        );
+    }
+
+    #[test]
+    fn error_message_falls_back_to_status_when_no_text_field() {
+        let ctx = HecRejectionContext { rejected: metrics::counter!("_test") };
+        assert_eq!(
+            ctx.error_message(503, &Bytes::from("Service Unavailable")),
+            "Request rejected (status: 503)."
+        );
     }
 
     fn get_hec_service(
