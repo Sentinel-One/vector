@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use regex::Regex;
@@ -171,7 +171,7 @@ struct RuleAction {
 
 #[derive(Clone, Debug)]
 pub struct HistSumm {
-    exact: HashMap<String, Arc<RuleAction>>,
+    exact: BTreeMap<String, Arc<RuleAction>>,
     patterns: Vec<(Regex, Arc<RuleAction>)>,
     admit_unmatched: bool,
 }
@@ -183,7 +183,7 @@ impl HistSumm {
             .iter()
             .enumerate()
             .try_fold(
-                (HashMap::new(), Vec::new()),
+                (BTreeMap::new(), Vec::new()),
                 |(exact, patterns), (policy_idx, policy)| {
                     Self::absorb_policy(exact, patterns, policy_idx, policy)
                 },
@@ -197,11 +197,11 @@ impl HistSumm {
     }
 
     fn absorb_policy(
-        exact: HashMap<String, Arc<RuleAction>>,
+        exact: BTreeMap<String, Arc<RuleAction>>,
         mut patterns: Vec<(Regex, Arc<RuleAction>)>,
         policy_idx: usize,
         policy: &Policy,
-    ) -> Result<(HashMap<String, Arc<RuleAction>>, Vec<(Regex, Arc<RuleAction>)>), BuildError>
+    ) -> Result<(BTreeMap<String, Arc<RuleAction>>, Vec<(Regex, Arc<RuleAction>)>), BuildError>
     {
         Self::validate_quantiles(policy_idx, &policy.quantiles)?;
         let action = Arc::new(RuleAction {
@@ -249,11 +249,11 @@ impl HistSumm {
     }
 
     fn merge_exact(
-        exact: HashMap<String, Arc<RuleAction>>,
+        exact: BTreeMap<String, Arc<RuleAction>>,
         policy_idx: usize,
         names: &[String],
         action: &Arc<RuleAction>,
-    ) -> Result<HashMap<String, Arc<RuleAction>>, BuildError> {
+    ) -> Result<BTreeMap<String, Arc<RuleAction>>, BuildError> {
         names.iter().try_fold(exact, |mut acc, name| {
             if acc.contains_key(name) {
                 Err(BuildError::DuplicateExactName {
