@@ -73,7 +73,7 @@ impl GaugeFn for AtomicF64 {
 }
 
 #[derive(Debug)]
-pub(super) struct Histogram {
+pub struct Histogram {
     buckets: Box<[(f64, AtomicU32); 20]>,
     count: AtomicU64,
     sum: AtomicF64,
@@ -84,7 +84,7 @@ impl Histogram {
     const MIN_BUCKET_EXP: f64 = -6.0;
     const BUCKETS: usize = 20;
 
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         // Box to avoid having this large array inline to the structure, blowing
         // out cache coherence.
         //
@@ -153,7 +153,7 @@ impl Histogram {
             .collect()
     }
 
-    pub(super) fn make_metric(&self) -> MetricValue {
+    pub fn make_metric(&self) -> MetricValue {
         MetricValue::AggregatedHistogram {
             buckets: self.buckets(),
             count: self.count(),

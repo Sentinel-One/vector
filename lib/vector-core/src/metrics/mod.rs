@@ -13,6 +13,7 @@ use metrics_util::layers::Layer;
 use snafu::Snafu;
 
 pub use self::ddsketch::{AgentDDSketch, BinMap, Config};
+pub use self::storage::Histogram;
 use self::{label_filter::VectorLabelFilter, recorder::Registry, recorder::VectorRecorder};
 use crate::event::{Metric, MetricValue};
 

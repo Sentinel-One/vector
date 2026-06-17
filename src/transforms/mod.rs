@@ -15,6 +15,8 @@ pub mod aws_ec2_metadata;
 mod exclusive_route;
 #[cfg(feature = "transforms-filter")]
 pub mod filter;
+#[cfg(feature = "transforms-hist_summ")]
+pub mod hist_summ;
 #[cfg(feature = "transforms-log_to_metric")]
 pub mod log_to_metric;
 #[cfg(feature = "transforms-lua")]
