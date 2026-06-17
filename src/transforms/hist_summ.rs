@@ -1044,13 +1044,20 @@ mod tests {
 
     #[tokio::test]
     async fn topology_converts_matched_histogram() {
+        // Two policies fan in: one exact-name, one regex. Each emits a summary with a
+        // distinct quantile count so we can tell which policy fired. A third histogram
+        // matches neither and (with admit_unmatched = false) must be dropped.
         let config = toml::from_str::<HistSummConfig>(indoc!(
             r#"
             admit_unmatched = false
 
             [[policies]]
-            target = { names = ["matched"] }
-            quantiles = [0.5, 0.99]
+            target = { names = ["http_request_duration_seconds"] }
+            quantiles = [0.5]
+
+            [[policies]]
+            target = { pattern = "^db_.*_seconds$" }
+            quantiles = [0.9, 0.99]
             "#,
         ))
         .unwrap();
@@ -1059,14 +1066,39 @@ mod tests {
             let (tx, rx) = mpsc::channel(1);
             let (topology, mut out) = create_topology(ReceiverStream::new(rx), config).await;
 
-            let hist: Event = make_hist("matched", &[0.6; 100]).into();
-            tx.send(hist).await.unwrap();
-
+            // Exact-name policy fires.
+            let exact_hist: Event =
+                make_hist("http_request_duration_seconds", &[0.6; 100]).into();
+            tx.send(exact_hist).await.unwrap();
             let received = out.recv().await.unwrap();
-            assert!(matches!(
-                received.as_metric().value(),
-                MetricValue::AggregatedSummary { .. }
-            ));
+            let metric = received.as_metric();
+            assert_eq!(metric.name(), "http_request_duration_seconds");
+            match metric.value() {
+                MetricValue::AggregatedSummary { quantiles, .. } => {
+                    assert_eq!(quantiles.len(), 1);
+                    assert_eq!(quantiles[0].quantile, 0.5);
+                }
+                other => panic!("expected AggregatedSummary, got {other:?}"),
+            }
+
+            // Regex policy fires.
+            let pattern_hist: Event = make_hist("db_query_duration_seconds", &[0.6; 100]).into();
+            tx.send(pattern_hist).await.unwrap();
+            let received = out.recv().await.unwrap();
+            let metric = received.as_metric();
+            assert_eq!(metric.name(), "db_query_duration_seconds");
+            match metric.value() {
+                MetricValue::AggregatedSummary { quantiles, .. } => {
+                    assert_eq!(quantiles.len(), 2);
+                    assert_eq!(quantiles[0].quantile, 0.9);
+                    assert_eq!(quantiles[1].quantile, 0.99);
+                }
+                other => panic!("expected AggregatedSummary, got {other:?}"),
+            }
+
+            // No policy matches, admit_unmatched = false -> dropped, no output.
+            let unmatched_hist: Event = make_hist("memcache_hit_rate", &[0.6; 100]).into();
+            tx.send(unmatched_hist).await.unwrap();
 
             drop(tx);
             topology.stop().await;
