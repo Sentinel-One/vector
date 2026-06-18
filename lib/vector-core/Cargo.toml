@@ -93,10 +93,12 @@ base64 = "0.22.1"
 chrono-tz.workspace = true
 criterion = { version = "0.5.1", features = ["html_reports"] }
 env-test-util = "1.0.1"
+metrics-util = { workspace = true, features = ["debugging"] }
 quickcheck = "1"
 quickcheck_macros = "1"
 proptest = "1.5"
 similar-asserts = "1.6.0"
+tempfile = "3.15.0"
 tokio-test = "0.4.4"
 toml.workspace = true
 ndarray = "0.16.1"

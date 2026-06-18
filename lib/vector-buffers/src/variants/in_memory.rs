@@ -8,7 +8,7 @@ use crate::{
         builder::IntoBuffer,
         channel::{limited, ReceiverAdapter, SenderAdapter},
     },
-    Bufferable,
+    TimedBufferable,
 };
 
 pub struct MemoryBuffer {
@@ -24,7 +24,7 @@ impl MemoryBuffer {
 #[async_trait]
 impl<T> IntoBuffer<T> for MemoryBuffer
 where
-    T: Bufferable,
+    T: TimedBufferable,
 {
     async fn into_buffer_parts(
         self: Box<Self>,

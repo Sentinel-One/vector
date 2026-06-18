@@ -17,7 +17,7 @@ use crate::{
         channel::{BufferReceiver, BufferSender},
     },
     variants::{DiskV2Buffer, MemoryBuffer},
-    Bufferable, WhenFull,
+    WhenFull,
 };
 
 #[derive(Debug, Snafu)]
@@ -274,7 +274,7 @@ impl BufferType {
         id: String,
     ) -> Result<(), BufferBuildError>
     where
-        T: Bufferable + Clone + Finalizable,
+        T: crate::TimedBufferable + Finalizable,
     {
         match *self {
             BufferType::Memory {
@@ -366,20 +366,42 @@ impl BufferConfig {
     pub async fn build<T>(
         &self,
         data_dir: Option<PathBuf>,
-        buffer_id: String,
+        id: impl Into<vector_common::config::ComponentKey>,
         span: Span,
     ) -> Result<(BufferSender<T>, BufferReceiver<T>), BufferBuildError>
     where
-        T: Bufferable + Clone + Finalizable,
+        T: crate::TimedBufferable + Finalizable,
     {
+        self.build_with_clock(data_dir, id, span, std::sync::Arc::new(crate::SystemClock))
+            .await
+    }
+
+    /// Like [`build`](Self::build) but accepts an explicit clock, primarily for tests that want
+    /// deterministic queue-delay measurements.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`build`](Self::build).
+    #[allow(clippy::needless_pass_by_value)]
+    pub async fn build_with_clock<T>(
+        &self,
+        data_dir: Option<PathBuf>,
+        id: impl Into<vector_common::config::ComponentKey>,
+        span: Span,
+        clock: std::sync::Arc<dyn crate::Clock>,
+    ) -> Result<(BufferSender<T>, BufferReceiver<T>), BufferBuildError>
+    where
+        T: crate::TimedBufferable + Finalizable,
+    {
+        let component_key = id.into();
         let mut builder = TopologyBuilder::default();
 
         for stage in self.stages() {
-            stage.add_to_builder(&mut builder, data_dir.clone(), buffer_id.clone())?;
+            stage.add_to_builder(&mut builder, data_dir.clone(), component_key.id().to_string())?;
         }
 
         builder
-            .build(buffer_id, span)
+            .build_with_clock(component_key, span, clock)
             .await
             .context(FailedToBuildTopologySnafu)
     }

@@ -523,9 +523,13 @@ impl<'a> Builder<'a> {
                 Ok(transform) => transform,
             };
 
-            let (input_tx, input_rx) =
-                TopologyBuilder::standalone_memory(TOPOLOGY_BUFFER_SIZE, WhenFull::Block, &span)
-                    .await;
+            let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
+                TOPOLOGY_BUFFER_SIZE,
+                WhenFull::Block,
+                key.clone(),
+                &span,
+            )
+            .await;
 
             self.inputs
                 .insert(key.clone(), (input_tx, node.inputs.clone()));
@@ -587,7 +591,7 @@ impl<'a> Builder<'a> {
                     .buffer
                     .build(
                         self.config.global.data_dir.clone(),
-                        key.to_string(),
+                        key.clone(),
                         buffer_span,
                     )
                     .await;

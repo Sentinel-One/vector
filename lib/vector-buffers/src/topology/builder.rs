@@ -1,20 +1,25 @@
-use std::{error::Error, num::NonZeroUsize};
+use std::{error::Error, num::NonZeroUsize, sync::Arc};
 
 use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
-use tracing::Span;
+use tracing::{error_span, Span};
+use vector_common::{config::ComponentKey, internal_event::register};
 
 use super::channel::{ReceiverAdapter, SenderAdapter};
 use crate::{
     buffer_usage_data::{BufferUsage, BufferUsageHandle},
+    internal_events::{BufferQueueDelay, BufferSendDuration},
     topology::channel::{BufferReceiver, BufferSender},
     variants::MemoryBuffer,
-    Bufferable, WhenFull,
+    Clock, SystemClock, TimedBufferable, WhenFull,
 };
 
 /// Value that can be used as a stage in a buffer topology.
 #[async_trait]
-pub trait IntoBuffer<T: Bufferable>: Send {
+pub trait IntoBuffer<T>: Send
+where
+    T: TimedBufferable,
+{
     /// Gets whether or not this buffer stage provides its own instrumentation, or if it should be
     /// instrumented from the outside.
     ///
@@ -57,17 +62,26 @@ pub enum TopologyError {
     StackedAcks,
 }
 
-struct TopologyStage<T: Bufferable> {
+struct TopologyStage<T>
+where
+    T: TimedBufferable,
+{
     untransformed: Box<dyn IntoBuffer<T>>,
     when_full: WhenFull,
 }
 
 /// Builder for constructing buffer topologies.
-pub struct TopologyBuilder<T: Bufferable> {
+pub struct TopologyBuilder<T>
+where
+    T: TimedBufferable,
+{
     stages: Vec<TopologyStage<T>>,
 }
 
-impl<T: Bufferable> TopologyBuilder<T> {
+impl<T> TopologyBuilder<T>
+where
+    T: TimedBufferable,
+{
     /// Adds a new stage to the buffer topology.
     ///
     /// The "when full" behavior can be optionally configured here.  If no behavior is specified,
@@ -106,9 +120,27 @@ impl<T: Bufferable> TopologyBuilder<T> {
     /// explaining the issue.
     pub async fn build(
         self,
-        buffer_id: String,
+        id: impl Into<ComponentKey>,
         span: Span,
     ) -> Result<(BufferSender<T>, BufferReceiver<T>), TopologyError> {
+        self.build_with_clock(id, span, Arc::new(SystemClock))
+            .await
+    }
+
+    /// Like [`build`](Self::build) but accepts an explicit clock, primarily for tests that want
+    /// deterministic queue-delay measurements.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`build`](Self::build).
+    pub async fn build_with_clock(
+        self,
+        id: impl Into<ComponentKey>,
+        span: Span,
+        clock: Arc<dyn Clock>,
+    ) -> Result<(BufferSender<T>, BufferReceiver<T>), TopologyError> {
+        let component_id = id.into().into_id();
+
         // We pop stages off in reverse order to build from the inside out.
         let mut buffer_usage = BufferUsage::from_span(span.clone());
         let mut current_stage = None;
@@ -143,18 +175,35 @@ impl<T: Bufferable> TopologyBuilder<T> {
                 .await
                 .context(FailedToBuildStageSnafu { stage_idx })?;
 
+            let (send_duration, queue_delay) = {
+                let _enter = span.enter();
+                (
+                    register(BufferSendDuration { stage: stage_idx }),
+                    register(BufferQueueDelay { stage: stage_idx }),
+                )
+            };
+
             let (mut sender, mut receiver) = match current_stage.take() {
                 None => (
-                    BufferSender::new(sender, stage.when_full),
-                    BufferReceiver::new(receiver),
+                    BufferSender::new(sender, stage.when_full, Arc::clone(&clock), send_duration),
+                    BufferReceiver::new(receiver, queue_delay, Arc::clone(&clock)),
                 ),
                 Some((current_sender, current_receiver)) => (
-                    BufferSender::with_overflow(sender, current_sender),
-                    BufferReceiver::with_overflow(receiver, current_receiver),
+                    BufferSender::with_overflow(
+                        sender,
+                        current_sender,
+                        Arc::clone(&clock),
+                        send_duration,
+                    ),
+                    BufferReceiver::with_overflow(
+                        receiver,
+                        current_receiver,
+                        queue_delay,
+                        Arc::clone(&clock),
+                    ),
                 ),
             };
 
-            sender.with_send_duration_instrumentation(stage_idx, &span);
             if !provides_instrumentation {
                 sender.with_usage_instrumentation(usage_handle.clone());
                 receiver.with_usage_instrumentation(usage_handle);
@@ -168,13 +217,16 @@ impl<T: Bufferable> TopologyBuilder<T> {
         // Install the buffer usage handler since we successfully created the buffer topology.  This
         // spawns it in the background and periodically emits aggregated metrics about each of the
         // buffer stages.
-        buffer_usage.install(buffer_id.as_str());
+        buffer_usage.install(component_id.as_str());
 
         Ok((sender, receiver))
     }
 }
 
-impl<T: Bufferable> TopologyBuilder<T> {
+impl<T> TopologyBuilder<T>
+where
+    T: TimedBufferable,
+{
     /// Creates a memory-only buffer topology.
     ///
     /// The overflow mode (i.e. `WhenFull`) can be configured to either block or drop the newest
@@ -189,8 +241,11 @@ impl<T: Bufferable> TopologyBuilder<T> {
     pub async fn standalone_memory(
         max_events: NonZeroUsize,
         when_full: WhenFull,
+        id: impl Into<ComponentKey>,
         receiver_span: &Span,
     ) -> (BufferSender<T>, BufferReceiver<T>) {
+        let component_key = id.into();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let usage_handle = BufferUsageHandle::noop();
 
         let memory_buffer = Box::new(MemoryBuffer::new(max_events));
@@ -203,9 +258,23 @@ impl<T: Bufferable> TopologyBuilder<T> {
             WhenFull::Overflow => WhenFull::Block,
             m => m,
         };
-        let mut sender = BufferSender::new(sender, mode);
-        sender.with_send_duration_instrumentation(0, receiver_span);
-        let receiver = BufferReceiver::new(receiver);
+        let buffer_span = {
+            let _enter = receiver_span.enter();
+            error_span!(
+                "standalone_memory",
+                component_id = %component_key.id(),
+                buffer_type = "memory",
+            )
+        };
+        let (send_duration, queue_delay) = {
+            let _enter = buffer_span.enter();
+            (
+                register(BufferSendDuration { stage: 0 }),
+                register(BufferQueueDelay { stage: 0 }),
+            )
+        };
+        let sender = BufferSender::new(sender, mode, Arc::clone(&clock), send_duration);
+        let receiver = BufferReceiver::new(receiver, queue_delay, clock);
 
         (sender, receiver)
     }
@@ -229,6 +298,7 @@ impl<T: Bufferable> TopologyBuilder<T> {
         when_full: WhenFull,
         usage_handle: BufferUsageHandle,
     ) -> (BufferSender<T>, BufferReceiver<T>) {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let memory_buffer = Box::new(MemoryBuffer::new(max_events));
         let (sender, receiver) = memory_buffer
             .into_buffer_parts(usage_handle.clone())
@@ -239,8 +309,10 @@ impl<T: Bufferable> TopologyBuilder<T> {
             WhenFull::Overflow => WhenFull::Block,
             m => m,
         };
-        let mut sender = BufferSender::new(sender, mode);
-        let mut receiver = BufferReceiver::new(receiver);
+        let send_duration = register(BufferSendDuration { stage: 0 });
+        let queue_delay = register(BufferQueueDelay { stage: 0 });
+        let mut sender = BufferSender::new(sender, mode, Arc::clone(&clock), send_duration);
+        let mut receiver = BufferReceiver::new(receiver, queue_delay, clock);
 
         sender.with_usage_instrumentation(usage_handle.clone());
         receiver.with_usage_instrumentation(usage_handle);
@@ -249,7 +321,10 @@ impl<T: Bufferable> TopologyBuilder<T> {
     }
 }
 
-impl<T: Bufferable> Default for TopologyBuilder<T> {
+impl<T> Default for TopologyBuilder<T>
+where
+    T: TimedBufferable,
+{
     fn default() -> Self {
         Self { stages: Vec::new() }
     }

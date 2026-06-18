@@ -731,6 +731,7 @@ transforms-logs = [
 transforms-metrics = [
   "transforms-aggregate",
   "transforms-filter",
+  "transforms-hist_summ",
   "transforms-log_to_metric",
   "transforms-lua",
   "transforms-metric_to_log",
@@ -741,6 +742,7 @@ transforms-metrics = [
 
 transforms-aggregate = []
 transforms-aws_ec2_metadata = ["dep:arc-swap"]
+transforms-hist_summ = []
 transforms-dedupe = ["transforms-impl-dedupe"]
 transforms-filter = []
 transforms-log_to_metric = []

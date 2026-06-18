@@ -137,3 +137,15 @@ registered_event! {
         self.send_duration.record(duration);
     }
 }
+
+registered_event! {
+    BufferQueueDelay {
+        stage: usize,
+    } => {
+        queue_delay: Histogram = histogram!("topology_queue_delay_seconds", "stage" => self.stage.to_string()),
+    }
+
+    fn emit(&self, duration: Duration) {
+        self.queue_delay.record(duration);
+    }
+}

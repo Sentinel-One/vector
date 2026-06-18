@@ -316,7 +316,7 @@ impl DiskV2Buffer {
 #[async_trait]
 impl<T> IntoBuffer<T> for DiskV2Buffer
 where
-    T: Bufferable + Clone + Finalizable,
+    T: crate::TimedBufferable + Finalizable,
 {
     fn provides_instrumentation(&self) -> bool {
         true
@@ -326,7 +326,7 @@ where
         self: Box<Self>,
         usage_handle: BufferUsageHandle,
     ) -> Result<(SenderAdapter<T>, ReceiverAdapter<T>), Box<dyn Error + Send + Sync>> {
-        let (writer, reader) = build_disk_v2_buffer(
+        let (writer, reader) = build_disk_v2_buffer::<crate::Timed<T>>(
             usage_handle,
             &self.data_dir,
             self.id.as_str(),

@@ -45,7 +45,10 @@ impl From<array::EventArray> for EventArray {
             array::EventArray::Metrics(array) => event_array::Events::from_metrics(array),
             array::EventArray::Traces(array) => event_array::Events::from_traces(array),
         });
-        Self { events }
+        Self {
+            events,
+            enq_tm: None,
+        }
     }
 }
 

@@ -1,8 +1,13 @@
+use std::time::{Duration, SystemTime};
+
 use bytes::{Buf, BufMut};
 use enumflags2::{bitflags, BitFlags, FromBitsError};
 use prost::Message;
 use snafu::Snafu;
-use vector_buffers::encoding::{AsMetadata, Encodable};
+use vector_buffers::{
+    encoding::{AsMetadata, Encodable},
+    TimedEncodable,
+};
 
 use super::{proto, Event, EventArray};
 
@@ -115,5 +120,153 @@ impl Encodable for EventArray {
         } else {
             Err(DecodeError::UnsupportedEncodingMetadata)
         }
+    }
+}
+
+impl EventArray {
+    fn enq_tm_to_proto(t: SystemTime) -> prost_types::Timestamp {
+        let dur = t
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        prost_types::Timestamp {
+            seconds: dur.as_secs() as i64,
+            nanos: dur.subsec_nanos() as i32,
+        }
+    }
+
+    fn enq_tm_from_proto(t: prost_types::Timestamp) -> Option<SystemTime> {
+        if t.seconds < 0 || t.nanos < 0 {
+            return None;
+        }
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(t.seconds as u64, t.nanos as u32))
+    }
+}
+
+impl TimedEncodable for EventArray {
+    fn encode_with_enq_tm<B>(
+        self,
+        enq_tm: Option<SystemTime>,
+        buffer: &mut B,
+    ) -> Result<(), Self::EncodeError>
+    where
+        B: BufMut,
+    {
+        let mut p = proto::EventArray::from(self);
+        p.enq_tm = enq_tm.map(Self::enq_tm_to_proto);
+        p.encode(buffer).map_err(|_| EncodeError::BufferTooSmall)
+    }
+
+    fn decode_with_enq_tm<B>(
+        metadata: Self::Metadata,
+        buffer: B,
+    ) -> Result<(Self, Option<SystemTime>), Self::DecodeError>
+    where
+        B: Buf + Clone,
+    {
+        if !metadata.contains(EventEncodableMetadataFlags::DiskBufferV1CompatibilityMode) {
+            return Err(DecodeError::UnsupportedEncodingMetadata);
+        }
+        match proto::EventArray::decode(buffer.clone()) {
+            Ok(mut p) => {
+                let enq_tm = p.enq_tm.take().and_then(Self::enq_tm_from_proto);
+                Ok((EventArray::from(p), enq_tm))
+            }
+            Err(_) => {
+                let pe = proto::EventWrapper::decode(buffer)
+                    .map_err(|_| DecodeError::InvalidProtobufPayload)?;
+                Ok((EventArray::from(Event::from(pe)), None))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use vector_buffers::Timed;
+
+    use super::*;
+    use crate::event::{LogEvent, Metric, MetricKind, MetricValue};
+
+    fn sample_logs() -> EventArray {
+        let mut l = LogEvent::default();
+        l.insert("message", "hello");
+        EventArray::Logs(vec![l])
+    }
+
+    fn sample_metrics() -> EventArray {
+        let m = Metric::new(
+            "n",
+            MetricKind::Incremental,
+            MetricValue::Counter { value: 1.0 },
+        );
+        EventArray::Metrics(vec![m])
+    }
+
+    fn encode<E: Encodable>(item: E) -> BytesMut {
+        let mut buf = BytesMut::new();
+        item.encode(&mut buf).expect("encode");
+        buf
+    }
+
+    fn metadata() -> EventEncodableMetadata {
+        EventEncodableMetadataFlags::DiskBufferV1CompatibilityMode.into()
+    }
+
+    #[test]
+    fn timed_roundtrip_with_timestamp() {
+        let t = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_700_000_000)
+            + Duration::from_nanos(123_456_789);
+        let original = Timed {
+            inner: sample_logs(),
+            enq_tm: Some(t),
+        };
+
+        let bytes = encode(original.clone());
+        let decoded =
+            Timed::<EventArray>::decode(metadata(), bytes.freeze()).expect("decode");
+
+        assert_eq!(decoded.enq_tm, Some(t));
+        assert_eq!(decoded.inner, original.inner);
+    }
+
+    #[test]
+    fn timed_roundtrip_without_timestamp() {
+        let original = Timed {
+            inner: sample_metrics(),
+            enq_tm: None,
+        };
+
+        let bytes = encode(original.clone());
+        let decoded =
+            Timed::<EventArray>::decode(metadata(), bytes.freeze()).expect("decode");
+
+        assert_eq!(decoded.enq_tm, None);
+        assert_eq!(decoded.inner, original.inner);
+    }
+
+    #[test]
+    fn old_reader_ignores_new_timestamp_field() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let timed = Timed {
+            inner: sample_logs(),
+            enq_tm: Some(t),
+        };
+        let bytes = encode(timed.clone());
+
+        let decoded = EventArray::decode(metadata(), bytes.freeze()).expect("decode");
+        assert_eq!(decoded, timed.inner);
+    }
+
+    #[test]
+    fn timed_decodes_legacy_bytes_with_none() {
+        let ea = sample_logs();
+        let bytes = encode(ea.clone());
+
+        let decoded =
+            Timed::<EventArray>::decode(metadata(), bytes.freeze()).expect("decode");
+        assert_eq!(decoded.enq_tm, None);
+        assert_eq!(decoded.inner, ea);
     }
 }

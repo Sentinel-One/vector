@@ -12791,6 +12791,7 @@ dependencies = [
  "snafu 0.7.5",
  "snap",
  "socket2 0.5.8",
+ "tempfile",
  "tokio",
  "tokio-openssl",
  "tokio-stream",

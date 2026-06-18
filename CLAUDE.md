@@ -145,6 +145,7 @@ Observo introduces one deliberate global singleton in `src/topology/builder.rs` 
 - **Display over Debug**: Prefer `%error` over `?error` in tracing macros
 - **Error handling**: Use `snafu` crate for structured errors. Never panic in regular code paths.
 - **Rust version**: Toolchain 1.83, MSRV 1.81
+- **Metrics on hot paths**: For any metric type (counter, gauge, histogram) on hot paths (per-event transforms, stream processing), pre-fetch the handle once at component construction — add a `metrics::Counter` / `metrics::Gauge` / `metrics::Histogram` field to the struct, initialize it with `counter!("name")` / `gauge!("name")` / `histogram!("name")` in `new()`, and call the operation (`.increment(1)`, `.set(v)`, `.record(v)`) directly on the stored handle. The macros do a registry lookup (~30–70 ns) on every call; a stored handle is just an atomic operation (~3–7 ns). Use the macro-per-call / `emit!` pattern only for cold paths (error branches, flush callbacks, low-frequency events). Reference: `src/transforms/hist_summ.rs` (stored handle) vs `src/internal_events/aggregate.rs` (per-call macro). Metric names need no component-type prefix because `TracingContextLayer` + `VectorLabelFilter` inject `component_type` automatically from the tracing span — verify that `build()` runs within the component span (it does for all topology-managed components via `builder.rs:515`).
 
 ## Testing Notes (Observo-specific)
 

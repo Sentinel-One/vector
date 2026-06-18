@@ -29,7 +29,10 @@ mod internal_events;
 
 #[cfg(test)]
 pub mod test;
+mod timed;
 pub mod topology;
+
+pub use timed::{Clock, SystemClock, Timed, TimedBufferable, TimedEncodable};
 
 pub(crate) mod variants;
 
