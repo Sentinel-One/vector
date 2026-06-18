@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use metrics::{counter, Counter};
 use regex::Regex;
 use snafu::Snafu;
 use vector_lib::config::LogNamespace;
@@ -174,6 +175,8 @@ pub struct HistSumm {
     exact: BTreeMap<String, Arc<RuleAction>>,
     patterns: Vec<(Regex, Arc<RuleAction>)>,
     admit_unmatched: bool,
+    dropped_no_samples: Counter,
+    dropped_no_policy: Counter,
 }
 
 impl HistSumm {
@@ -192,6 +195,8 @@ impl HistSumm {
                 exact,
                 patterns,
                 admit_unmatched: config.admit_unmatched,
+                dropped_no_samples: counter!("dropped_no_samples"),
+                dropped_no_policy: counter!("dropped_no_policy"),
             })
             .map_err(Into::into)
     }
@@ -303,7 +308,10 @@ impl FunctionTransform for HistSumm {
                         };
                         let val = if count == 0 {
                             match act.zero {
-                                ZeroBehavior::Drop => None,
+                                ZeroBehavior::Drop => {
+                                    self.dropped_no_samples.increment(1);
+                                    None
+                                }
                                 ZeroBehavior::Zero => Some(0.0),
                                 ZeroBehavior::Nan => Some(f64::NAN),
                             }.map(|v| zero_summary(&act.quantiles, v))
@@ -320,7 +328,10 @@ impl FunctionTransform for HistSumm {
                         })
                     },
                     (None, true) => Some(mk_metric(ser, data, meta)),
-                    _ => None
+                    _ => {
+                        self.dropped_no_policy.increment(1);
+                        None
+                    }
                 }
             },
             other => Some(other),
@@ -402,6 +413,7 @@ fn last_finite_upper(buckets: &[Bucket]) -> Option<f64> {
 mod tests {
     use indoc::indoc;
     use metrics::HistogramFn;
+    use vector_lib::metrics::{self as metrics_lib, Controller};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use vector_lib::event::{Metric, MetricKind};
@@ -438,6 +450,21 @@ mod tests {
             MetricValue::AggregatedSummary { quantiles, .. } => quantiles,
             other => panic!("expected AggregatedSummary, got {other:?}"),
         }
+    }
+
+    fn read_counter(controller: &Controller, name: &str) -> f64 {
+        controller
+            .capture_metrics()
+            .into_iter()
+            .find(|m| m.name() == name)
+            .and_then(|m| {
+                if let MetricValue::Counter { value } = m.value() {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0)
     }
 
     fn build_err(toml_str: &str) -> String {
@@ -836,6 +863,10 @@ mod tests {
 
     #[test]
     fn zero_behavior_drop_emits_nothing() {
+        metrics_lib::init_test();
+        let controller = Controller::get().unwrap();
+        let before = read_counter(&controller, "dropped_no_samples");
+
         let hist = make_hist("lat", &[]);
         let cfg = config_with(
             vec![Policy {
@@ -847,6 +878,7 @@ mod tests {
         );
         let out = run_transform(cfg, vec![hist.into()]);
         assert!(out.is_empty(), "expected no events, got {}", out.len());
+        assert_eq!(read_counter(&controller, "dropped_no_samples") - before, 1.0);
     }
 
     #[test]
@@ -958,10 +990,15 @@ mod tests {
 
     #[test]
     fn unmatched_not_admitted_is_dropped() {
+        metrics_lib::init_test();
+        let controller = Controller::get().unwrap();
+        let before = read_counter(&controller, "dropped_no_policy");
+
         let cfg = config_with(vec![policy(exact(&["other"]), vec![0.5])], false);
         let hist = make_hist("lat", &[0.6; 5]);
         let out = run_transform(cfg, vec![hist.into()]);
         assert!(out.is_empty());
+        assert_eq!(read_counter(&controller, "dropped_no_policy") - before, 1.0);
     }
 
     #[test]
