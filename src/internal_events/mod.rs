@@ -63,6 +63,8 @@ mod heartbeat;
 #[cfg(feature = "sources-host_metrics")]
 mod host_metrics;
 mod http;
+#[cfg(feature = "sources-vector")]
+mod jwt_auth;
 pub use vector_lib::http::internal_events as http_client;
 #[cfg(feature = "sources-utils-http-client")]
 mod http_client_source;
@@ -205,6 +207,8 @@ pub(crate) use self::gcp_pubsub::*;
 pub(crate) use self::grpc::*;
 #[cfg(feature = "sources-host_metrics")]
 pub(crate) use self::host_metrics::*;
+#[cfg(feature = "sources-vector")]
+pub(crate) use self::jwt_auth::*;
 #[cfg(feature = "sources-utils-http-client")]
 pub(crate) use self::http_client_source::*;
 #[cfg(feature = "sinks-influxdb")]
