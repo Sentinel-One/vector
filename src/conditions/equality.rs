@@ -819,4 +819,23 @@ mod tests {
         "#});
         assert!(result.is_err(), "deny_unknown_fields should reject `extra`");
     }
+
+    #[test]
+    fn deserialize_quoted_segment_path_yaml() {
+        // Path with a quoted segment containing a hyphen (`"name-x"`)
+        // followed by a regular segment (`.y`). Exercises VRL's
+        // quoted-segment syntax through YAML deserialization of the
+        // property field.
+        let conf: EqConjConfig = serde_yaml::from_str(indoc! {r#"
+            conjunct:
+              - property: '."name-x".y'
+                value: "John"
+        "#}).unwrap();
+        assert_eq!(conf, EqConjConfig {
+            conjunct: vec![EqConfig {
+                property: r#"."name-x".y"#.into(),
+                value: Constant::String("John".into()),
+            }],
+        });
+    }
 }
