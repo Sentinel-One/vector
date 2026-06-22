@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use indexmap::IndexMap;
 use vector_lib::config::{clone_input_definitions, LogNamespace};
 use vector_lib::configurable::configurable_component;
 use vector_lib::transform::SyncTransform;
 
 use crate::{
-    conditions::{AnyCondition, Condition, ConditionConfig, VrlConfig},
+    conditions::{equality::EqIndex, AnyCondition, Condition, ConditionConfig, VrlConfig},
     config::{
         DataType, GenerateConfig, Input, OutputId, TransformConfig, TransformContext,
         TransformOutput,
@@ -18,18 +20,27 @@ pub(crate) const UNMATCHED_ROUTE: &str = "_unmatched";
 
 #[derive(Clone)]
 pub struct Route {
+    eq_index: Option<Arc<EqIndex<String>>>,
     conditions: Vec<(String, Condition)>,
     reroute_unmatched: bool,
 }
 
 impl Route {
     pub fn new(config: &RouteConfig, context: &TransformContext) -> crate::Result<Self> {
-        let mut conditions = Vec::with_capacity(config.route.len());
-        for (output_name, condition) in config.route.iter() {
-            let condition = condition.build(&context.enrichment_tables)?;
-            conditions.push((output_name.clone(), condition));
-        }
+        let (indexable, conditions) = config.route.iter().try_fold(
+            (Vec::new(), Vec::new()),
+            |(mut idx, mut cond), (name, any_cond)| -> crate::Result<_> {
+                match any_cond.build(&context.enrichment_tables)? {
+                    Condition::Equality(eq) if eq.is_indexable() => idx.push((name.clone(), eq)),
+                    other => cond.push((name.clone(), other)),
+                }
+                Ok((idx, cond))
+            },
+        )?;
+
+        let eq_index = (!indexable.is_empty()).then(|| Arc::new(EqIndex::build(indexable)));
         Ok(Self {
+            eq_index,
             conditions,
             reroute_unmatched: config.reroute_unmatched,
         })
@@ -38,16 +49,28 @@ impl Route {
 
 impl SyncTransform for Route {
     fn transform(&mut self, event: Event, output: &mut vector_lib::transform::TransformOutputsBuf) {
-        let mut check_failed: usize = 0;
-        for (output_name, condition) in &self.conditions {
-            let (result, event) = condition.check(event.clone());
-            if result {
-                output.push(Some(output_name), event);
-            } else {
-                check_failed += 1;
+        let (event, idx_hits) = match self.eq_index.as_ref() {
+            Some(idx) => {
+                let (values, event) = idx.project(event);
+                let hits = idx
+                    .matches(&values)
+                    .inspect(|name| output.push(Some(name), event.clone()))
+                    .count();
+                (event, hits)
             }
-        }
-        if self.reroute_unmatched && check_failed == self.conditions.len() {
+            None => (event, 0),
+        };
+
+        let slow_hits = self
+            .conditions
+            .iter()
+            .filter_map(|(name, cond)| {
+                let (matched, ev) = cond.check(event.clone());
+                matched.then(|| output.push(Some(name), ev))
+            })
+            .count();
+
+        if self.reroute_unmatched && idx_hits + slow_hits == 0 {
             output.push(Some(UNMATCHED_ROUTE), event);
         }
     }
@@ -184,6 +207,7 @@ mod test {
     use super::*;
     use crate::{
         config::{build_unit_tests, ConfigBuilder},
+        event::{Metric, MetricKind, MetricValue, TraceEvent},
         test_util::components::{init_test, COMPONENT_MULTIPLE_OUTPUTS_TESTS},
     };
 
@@ -383,6 +407,420 @@ mod test {
             let events: Vec<_> = outputs.drain_named(output_name).collect();
             assert_eq!(events.len(), 0);
         }
+    }
+
+    // ---------- equality-condition tests ----------
+
+    fn run(config: RouteConfig, event: Event, output_names: &[&str]) -> HashMap<String, Vec<Event>> {
+        let mut transform = Route::new(&config, &Default::default()).unwrap();
+        let mut outputs = TransformOutputsBuf::new_with_capacity(
+            output_names
+                .iter()
+                .map(|name| {
+                    TransformOutput::new(DataType::all_bits(), HashMap::new())
+                        .with_port(name.to_string())
+                })
+                .collect(),
+            1,
+        );
+        transform.transform(event, &mut outputs);
+        output_names
+            .iter()
+            .map(|n| (n.to_string(), outputs.drain_named(n).collect::<Vec<_>>()))
+            .collect()
+    }
+
+    fn log_event(json: serde_json::Value) -> Event {
+        Event::from_json_value(json, LogNamespace::Legacy).unwrap()
+    }
+
+    #[test]
+    fn route_equality_all_match() {
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".a", value = 1 }]
+
+            route.second.type = "equality"
+            route.second.conjunct = [{ property = ".b", value = "yes" }]
+
+            route.third.type = "equality"
+            route.third.conjunct = [{ property = ".c", value = true }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1, "b": "yes", "c": true}));
+        let out = run(config, event.clone(), &["first", "second", "third", UNMATCHED_ROUTE]);
+        for name in &["first", "second", "third"] {
+            assert_eq!(out[*name], vec![event.clone()], "expected match on {name}");
+        }
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_one_match() {
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".a", value = 1 }]
+
+            route.second.type = "equality"
+            route.second.conjunct = [{ property = ".b", value = "no-such" }]
+
+            route.third.type = "equality"
+            route.third.conjunct = [{ property = ".c", value = false }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1, "b": "yes", "c": true}));
+        let out = run(config, event.clone(), &["first", "second", "third", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out["second"].is_empty());
+        assert!(out["third"].is_empty());
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_none_match() {
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".a", value = 999 }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1}));
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert!(out["first"].is_empty());
+        assert_eq!(out[UNMATCHED_ROUTE], vec![event]);
+    }
+
+    #[test]
+    fn route_equality_no_unmatched_output() {
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            reroute_unmatched = false
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".a", value = 999 }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1}));
+        let out = run(config, event, &["first", UNMATCHED_ROUTE]);
+        assert!(out["first"].is_empty());
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_shared_di_form_distinct_values() {
+        // Both routes use the same path subset (.a, .b) but expect different
+        // values — exercises the shared di-form / distinct eq_idx entries case.
+        let config = serde_yaml::from_str::<RouteConfig>(indoc! {r#"
+            route:
+              first:
+                type: equality
+                conjunct:
+                  - { property: .a, value: 1 }
+                  - { property: .b, value: "x" }
+              second:
+                type: equality
+                conjunct:
+                  - { property: .a, value: 2 }
+                  - { property: .b, value: "y" }
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1, "b": "x"}));
+        let out = run(config, event.clone(), &["first", "second", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out["second"].is_empty());
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_shared_key() {
+        // Two routes with identical clauses → both outputs receive on one event.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".a", value = 1 }]
+
+            route.second.type = "equality"
+            route.second.conjunct = [{ property = ".a", value = 1 }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1}));
+        let out = run(config, event.clone(), &["first", "second", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event.clone()]);
+        assert_eq!(out["second"], vec![event]);
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_mixed_equality_and_vrl() {
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.via_eq.type = "equality"
+            route.via_eq.conjunct = [{ property = ".a", value = 1 }]
+
+            route.via_vrl.type = "vrl"
+            route.via_vrl.source = ".b == \"yes\""
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1, "b": "yes"}));
+        let out = run(config, event.clone(), &["via_eq", "via_vrl", UNMATCHED_ROUTE]);
+        assert_eq!(out["via_eq"], vec![event.clone()]);
+        assert_eq!(out["via_vrl"], vec![event]);
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_null_for_missing_path() {
+        let config = serde_yaml::from_str::<RouteConfig>(indoc! {r#"
+            route:
+              first:
+                type: equality
+                conjunct:
+                  - { property: .missing, value: null }
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"other": 1}));
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_partial_match_with_missing_path() {
+        // Two-clause conjunct; `.a` is present and matches but `.b` is
+        // missing from the event. Missing-path projects to `DVal::Null`,
+        // which must not match the configured `DVal::Bytes("y")` clause.
+        // Route must not fire — event lands in `_unmatched`.
+        let config = serde_yaml::from_str::<RouteConfig>(indoc! {r#"
+            route:
+              first:
+                type: equality
+                conjunct:
+                  - { property: .a, value: "x" }
+                  - { property: .b, value: "y" }
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": "x"}));
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert!(out["first"].is_empty());
+        assert_eq!(out[UNMATCHED_ROUTE], vec![event]);
+    }
+
+    #[test]
+    fn route_equality_timestamp_matches_bytes() {
+        // Configured value is RFC 3339; event carries the same string under
+        // .when as Value::Bytes. Must match via the index's cross-product key.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".when", value = "2024-01-01T00:00:00Z" }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"when": "2024-01-01T00:00:00Z"}));
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_same_value_distinct_fields() {
+        // Both routes share an `.x = "same"` clause and distinguish on a
+        // second clause whose expected value is identical but lives on a
+        // different path (`.a` vs `.b`). Guards against an index that
+        // accidentally keys on value alone — the value `"v"` is not
+        // unique to either route, the (path, value) tuple is.
+        let config = serde_yaml::from_str::<RouteConfig>(indoc! {r#"
+            route:
+              alpha:
+                type: equality
+                conjunct:
+                  - { property: .x, value: "same" }
+                  - { property: .a, value: "v" }
+              beta:
+                type: equality
+                conjunct:
+                  - { property: .x, value: "same" }
+                  - { property: .b, value: "v" }
+        "#}).unwrap();
+
+        // .a holds "v" → alpha matches, beta does not.
+        let event_a = log_event(serde_json::json!({"x": "same", "a": "v", "b": "other"}));
+        let out_a = run(config.clone(), event_a.clone(), &["alpha", "beta", UNMATCHED_ROUTE]);
+        assert_eq!(out_a["alpha"], vec![event_a]);
+        assert!(out_a["beta"].is_empty());
+        assert!(out_a[UNMATCHED_ROUTE].is_empty());
+
+        // .b holds "v" → beta matches, alpha does not.
+        let event_b = log_event(serde_json::json!({"x": "same", "a": "other", "b": "v"}));
+        let out_b = run(config, event_b.clone(), &["alpha", "beta", UNMATCHED_ROUTE]);
+        assert!(out_b["alpha"].is_empty());
+        assert_eq!(out_b["beta"], vec![event_b]);
+        assert!(out_b[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_float() {
+        // Two routes split on the same float-bearing path so the fast-path
+        // index has to compare floats exactly. The matching event hits one
+        // route; the other route and `_unmatched` stay empty.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".rate", value = 1.5 }]
+
+            route.second.type = "equality"
+            route.second.conjunct = [{ property = ".rate", value = 2.5 }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"rate": 1.5}));
+        let out = run(config, event.clone(), &["first", "second", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out["second"].is_empty());
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_float_nan_uses_slow_path() {
+        // A NaN clause is excluded from the index and routed via the slow
+        // path. NaN ≠ anything, so the event must end up at _unmatched.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".x", value = nan }]
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"x": 1.0}));
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert!(out["first"].is_empty());
+        assert_eq!(out[UNMATCHED_ROUTE], vec![event]);
+    }
+
+    #[test]
+    fn route_equality_partial_match_wrong_value() {
+        // Two 2-clause routes whose clauses cross-mix: the event satisfies
+        // one clause of each route but neither route fully — both must
+        // skip; event lands in `_unmatched`.
+        let config = serde_yaml::from_str::<RouteConfig>(indoc! {r#"
+            route:
+              alpha:
+                type: equality
+                conjunct:
+                  - { property: .a, value: 1 }
+                  - { property: .b, value: "x" }
+              beta:
+                type: equality
+                conjunct:
+                  - { property: .a, value: 2 }
+                  - { property: .b, value: "y" }
+        "#}).unwrap();
+        let event = log_event(serde_json::json!({"a": 1, "b": "y"}));
+        let out = run(config, event.clone(), &["alpha", "beta", UNMATCHED_ROUTE]);
+        assert!(out["alpha"].is_empty());
+        assert!(out["beta"].is_empty());
+        assert_eq!(out[UNMATCHED_ROUTE], vec![event]);
+    }
+
+    #[test]
+    fn route_equality_disjoint_di_forms() {
+        // Two 2-clause routes with non-overlapping path subsets: alpha on
+        // [.a,.b] and beta on [.c,.d]. Exercises multiple distinct
+        // di_forms in one config; only the route whose paths line up
+        // should fire.
+        let config = serde_yaml::from_str::<RouteConfig>(indoc! {r#"
+            route:
+              alpha:
+                type: equality
+                conjunct:
+                  - { property: .a, value: 1 }
+                  - { property: .b, value: 2 }
+              beta:
+                type: equality
+                conjunct:
+                  - { property: .c, value: 3 }
+                  - { property: .d, value: 4 }
+        "#}).unwrap();
+
+        let event_a = log_event(serde_json::json!({"a": 1, "b": 2, "c": 99, "d": 99}));
+        let out_a = run(config.clone(), event_a.clone(), &["alpha", "beta", UNMATCHED_ROUTE]);
+        assert_eq!(out_a["alpha"], vec![event_a]);
+        assert!(out_a["beta"].is_empty());
+        assert!(out_a[UNMATCHED_ROUTE].is_empty());
+
+        let event_b = log_event(serde_json::json!({"a": 99, "b": 99, "c": 3, "d": 4}));
+        let out_b = run(config, event_b.clone(), &["alpha", "beta", UNMATCHED_ROUTE]);
+        assert!(out_b["alpha"].is_empty());
+        assert_eq!(out_b["beta"], vec![event_b]);
+        assert!(out_b[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_metadata_path() {
+        // Configured clause uses the metadata prefix `%`; event has the
+        // matching value under `%mark`. Verifies the index forwards
+        // metadata-prefix paths through `VrlTarget::target_get` correctly.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = "%mark", value = "ok" }]
+        "#}).unwrap();
+
+        let mut log = crate::event::LogEvent::default();
+        log.insert(vector_lib::lookup::metadata_path!("mark"), "ok");
+        let event = Event::Log(log);
+
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_timestamp_matches_value_timestamp() {
+        // Configured clause is RFC 3339 string; event carries the parsed
+        // instant as a true `Value::Timestamp`. Match goes through the
+        // index's Timestamp-form expanded key (not the Bytes fallback).
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [{ property = ".when", value = "2024-01-01T00:00:00Z" }]
+        "#}).unwrap();
+
+        let dt = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut log = crate::event::LogEvent::default();
+        log.insert("when", dt);
+        let event = Event::Log(log);
+
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_equality_invalid_metric_path() {
+        // Metrics restrict which paths `target_get` accepts (`.name`,
+        // `.kind`, `.namespace`, `.tags`, `.timestamp`, etc.) — anything
+        // else returns `Err`, which the index projects to
+        // `DVal::Unmatchable`. Any di_form touching that position
+        // short-circuits, so a route that pairs a valid clause with an
+        // invalid one must not fire on a Metric event.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [
+                { property = ".name", value = "my_metric" },
+                { property = ".message", value = "anything" },
+            ]
+        "#}).unwrap();
+
+        let metric = Event::Metric(Metric::new(
+            "my_metric",
+            MetricKind::Incremental,
+            MetricValue::Counter { value: 1.0 },
+        ));
+        let out = run(config, metric.clone(), &["first", UNMATCHED_ROUTE]);
+        assert!(out["first"].is_empty());
+        assert_eq!(out[UNMATCHED_ROUTE], vec![metric]);
+    }
+
+    #[test]
+    fn route_equality_trace_mixed_data_and_metadata() {
+        // Trace event with one clause on a data path (`.kind`) and one on
+        // a metadata path (`%tag`). Both must match for the route to fire
+        // — exercises the index against `Event::Trace` and a di_form
+        // spanning both `PathPrefix::Event` and `PathPrefix::Metadata`.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [
+                { property = ".kind", value = "server" },
+                { property = "%tag", value = "ok" },
+            ]
+        "#}).unwrap();
+
+        let mut log = crate::event::LogEvent::default();
+        log.insert("kind", "server");
+        log.insert(vector_lib::lookup::metadata_path!("tag"), "ok");
+        let event = Event::Trace(TraceEvent::from(log));
+
+        let out = run(config, event.clone(), &["first", UNMATCHED_ROUTE]);
+        assert_eq!(out["first"], vec![event]);
+        assert!(out[UNMATCHED_ROUTE].is_empty());
     }
 
     #[tokio::test]
