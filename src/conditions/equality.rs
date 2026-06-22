@@ -582,6 +582,19 @@ mod tests {
     }
 
     #[test]
+    fn check_contradictory_clauses_never_match() {
+        // Same path bound to two different values — no event value can
+        // satisfy both clauses simultaneously.
+        let eq = build(vec![
+            (".a", Constant::String("foo".into())),
+            (".a", Constant::String("bar".into())),
+        ]);
+        assert!(!eq.check(log_event!["a" => "foo"]).0);
+        assert!(!eq.check(log_event!["a" => "bar"]).0);
+        assert!(!eq.check(log_event!["a" => "baz"]).0);
+    }
+
+    #[test]
     fn check_preserves_event() {
         let eq = build(vec![(".foo", Constant::Integer(42))]);
         let mut log = LogEvent::default();

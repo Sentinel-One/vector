@@ -675,6 +675,29 @@ mod test {
     }
 
     #[test]
+    fn route_equality_contradictory_clauses_never_match() {
+        // Single route, same path bound to two different values. The
+        // virtual key built from any event value `v` is
+        // `[(idx, v), (idx, v)]`, which can't match the stored key
+        // `[(idx, "foo"), (idx, "bar")]` for any `v`. Route never fires
+        // regardless of what the event carries at `.a`.
+        let config = toml::from_str::<RouteConfig>(indoc! {r#"
+            route.first.type = "equality"
+            route.first.conjunct = [
+                { property = ".a", value = "foo" },
+                { property = ".a", value = "bar" },
+            ]
+        "#}).unwrap();
+
+        for v in ["foo", "bar", "baz"] {
+            let event = log_event(serde_json::json!({"a": v}));
+            let out = run(config.clone(), event.clone(), &["first", UNMATCHED_ROUTE]);
+            assert!(out["first"].is_empty(), "event {v:?} should not match");
+            assert_eq!(out[UNMATCHED_ROUTE], vec![event]);
+        }
+    }
+
+    #[test]
     fn route_equality_partial_match_wrong_value() {
         // Two 2-clause routes whose clauses cross-mix: the event satisfies
         // one clause of each route but neither route fully — both must
