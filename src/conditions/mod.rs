@@ -7,10 +7,12 @@ mod datadog_search;
 pub(crate) mod is_log;
 pub(crate) mod is_metric;
 pub(crate) mod is_trace;
+pub mod equality;
 mod vrl;
 
 pub use self::datadog_search::{DatadogSearchConfig, DatadogSearchRunner};
 pub use self::vrl::VrlConfig;
+pub use self::equality::{EqConjConfig, Constant, Equality};
 use self::{
     is_log::{check_is_log, check_is_log_with_context},
     is_metric::{check_is_metric, check_is_metric_with_context},
@@ -45,6 +47,9 @@ pub enum Condition {
     ///
     /// Used only for internal testing.
     AlwaysFail,
+
+    /// Matches an event using an equality check on chosen path.
+    Equality(Equality),
 }
 
 impl Condition {
@@ -61,6 +66,7 @@ impl Condition {
             Condition::DatadogSearch(x) => x.check(e),
             Condition::AlwaysPass => (true, e),
             Condition::AlwaysFail => (false, e),
+            Condition::Equality(x) => x.check(e),
         }
     }
 
@@ -77,6 +83,7 @@ impl Condition {
             Condition::DatadogSearch(x) => x.check_with_context(e),
             Condition::AlwaysPass => (Ok(()), e),
             Condition::AlwaysFail => (Ok(()), e),
+            Condition::Equality(x) => x.check_with_context(e),
         }
     }
 }
@@ -119,6 +126,9 @@ pub enum ConditionConfig {
     ///Always fail
     #[configurable(metadata(docs::hidden))]
     AlwaysFail,
+
+    /// Matches when a chosen event-attribute is equal to another
+    Equality(EqConjConfig),
 }
 
 impl ConditionConfig {
@@ -134,6 +144,7 @@ impl ConditionConfig {
             ConditionConfig::DatadogSearch(x) => x.build(enrichment_tables),
             ConditionConfig::AlwaysPass => Ok(Condition::AlwaysPass),
             ConditionConfig::AlwaysFail => Ok(Condition::AlwaysFail),
+            ConditionConfig::Equality(x) => x.build(enrichment_tables),
         }
     }
 }
@@ -254,5 +265,67 @@ mod tests {
             r#"Map(Vrl(VrlConfig { source: ".nork == true", runtime: Ast }))"#,
             format!("{:?}", conf.condition)
         )
+    }
+
+    #[test]
+    fn deserialize_anycondition_equality_toml() {
+        let conf: Test = toml::from_str(indoc! {r#"
+            condition.type = "equality"
+            condition.conjunct = [
+                { property = ".foo", value = 42 },
+                { property = ".bar", value = "hello" },
+            ]
+        "#})
+        .unwrap();
+
+        let expected = EqConjConfig {
+            conjunct: vec![
+                equality::EqConfig {
+                    property: ".foo".into(),
+                    value: Constant::Integer(42),
+                },
+                equality::EqConfig {
+                    property: ".bar".into(),
+                    value: Constant::String("hello".into()),
+                },
+            ],
+        };
+
+        match conf.condition {
+            AnyCondition::Map(ConditionConfig::Equality(actual)) => assert_eq!(actual, expected),
+            other => panic!("expected Map(Equality), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_anycondition_equality_yaml() {
+        let conf: Test = serde_yaml::from_str(indoc! {r#"
+            condition:
+              type: equality
+              conjunct:
+                - property: .foo
+                  value: 42
+                - property: .bar
+                  value: null
+        "#})
+        .unwrap();
+
+        let expected = EqConjConfig {
+            conjunct: vec![
+                equality::EqConfig {
+                    property: ".foo".into(),
+                    value: Constant::Integer(42),
+                },
+                equality::EqConfig {
+                    property: ".bar".into(),
+                    value: Constant::Null,
+                },
+            ],
+        };
+
+        match conf.condition {
+            AnyCondition::Map(ConditionConfig::Equality(actual)) => assert_eq!(actual, expected),
+            other => panic!("expected Map(Equality), got {other:?}"),
+        }
     }
 }

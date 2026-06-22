@@ -119,3 +119,9 @@ impl ToString for ConfigValuePath {
 }
 
 impl ConfigurableString for ConfigValuePath {}
+
+impl From<ConfigTargetPath> for OwnedTargetPath {
+    fn from(value: ConfigTargetPath) -> Self {
+        value.0
+    }
+}
