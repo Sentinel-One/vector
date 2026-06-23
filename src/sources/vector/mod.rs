@@ -114,8 +114,8 @@ impl AuthBatchStats {
 impl Service {
     /// Run request-level JWT validation against an inbound gRPC request.
     ///
-    /// Shared between `push_events` and `health_check` so both RPCs honor the
-    /// same `require_token` enforcement and reject the same set of bad tokens.
+    /// Shared between `push_events` and `health_check` so both RPCs require a
+    /// valid token and reject the same set of bad tokens.
     async fn validate_auth_header<T>(
         &self,
         request: &Request<T>,
@@ -254,8 +254,8 @@ impl proto::Service for Service {
         &self,
         request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        // Apply the same JWT validation as push_events — same auth posture,
-        // including `require_token` enforcement when configured.
+        // Apply the same JWT validation as push_events — same auth posture, so
+        // a misconfigured/unauthenticated sink fails its healthcheck.
         self.validate_auth_header(&request).await?;
 
         let message = proto::HealthCheckResponse {
@@ -974,24 +974,6 @@ value = "{token}""#
         }
 
         #[tokio::test]
-        async fn legacy_sink_without_auth_is_accepted() {
-            // Source has auth configured with require_token=false (legacy mode);
-            // sink sends no token → request allowed through.
-            let source_auth = format!(
-                r#"[auth]
-pub_key.type  = "inline"
-pub_key.value = "{}"
-membership_claim = "site_ids"
-require_token    = false"#,
-                TEST_PUBLIC_KEY.replace('\n', "\\n")
-            );
-            assert_eq!(
-                run_auth_pair(&source_auth, "").await,
-                BatchStatus::Delivered
-            );
-        }
-
-        #[tokio::test]
         async fn invalid_token_is_rejected() {
             let source_auth = format!(
                 r#"[auth]
@@ -1044,27 +1026,7 @@ value = "{token}""#
             );
         }
 
-        #[tokio::test]
-        async fn legacy_sink_with_value_path_configured_is_accepted() {
-            // Source has value_path with require_token=false (legacy mode); sink sends
-            // no token → per-event filtering is skipped entirely, all events pass through.
-            let source_auth = format!(
-                r#"[auth]
-pub_key.type  = "inline"
-pub_key.value = "{}"
-membership_claim = "site_ids"
-require_token    = false
-[auth.value_path]
-default = "tenant_id""#,
-                TEST_PUBLIC_KEY.replace('\n', "\\n")
-            );
-            assert_eq!(
-                run_auth_pair(&source_auth, "").await,
-                BatchStatus::Delivered
-            );
-        }
-
-        // ── require_token + healthcheck integration ──────────────────────────
+        // ── healthcheck integration ──────────────────────────────────────────
 
         /// Build a source+sink pair and return the result of the sink's healthcheck.
         async fn run_healthcheck_pair(
@@ -1093,50 +1055,9 @@ default = "tenant_id""#,
         }
 
         #[tokio::test]
-        async fn require_token_source_rejects_unauthenticated_push() {
-            // Source: require_token = true (explicit); sink: no auth → rejected.
-            let source_auth = format!(
-                r#"[auth]
-pub_key.type  = "inline"
-pub_key.value = "{}"
-membership_claim = "site_ids"
-require_token    = true"#,
-                TEST_PUBLIC_KEY.replace('\n', "\\n")
-            );
-            assert_eq!(
-                run_auth_pair(&source_auth, "").await,
-                BatchStatus::Rejected
-            );
-        }
-
-        #[tokio::test]
-        async fn require_token_source_accepts_authenticated_push() {
-            // Source: require_token = true (explicit); sink: valid token → delivered.
-            let token = make_token(HashMap::new());
-            let source_auth = format!(
-                r#"[auth]
-pub_key.type  = "inline"
-pub_key.value = "{}"
-membership_claim = "site_ids"
-require_token    = true"#,
-                TEST_PUBLIC_KEY.replace('\n', "\\n")
-            );
-            let sink_auth = format!(
-                r#"[auth]
-[auth.token]
-type  = "inline"
-value = "{token}""#
-            );
-            assert_eq!(
-                run_auth_pair(&source_auth, &sink_auth).await,
-                BatchStatus::Delivered
-            );
-        }
-
-        #[tokio::test]
-        async fn default_require_token_rejects_request_without_token() {
-            // Source TOML omits `require_token` — the default is `true`,
-            // so a sink with no token must be rejected.
+        async fn source_rejects_request_without_token() {
+            // Auth is configured; a token is always required, so a sink that
+            // sends none is rejected (no `require_token = false` escape hatch).
             let source_auth = format!(
                 r#"[auth]
 pub_key.type  = "inline"
@@ -1151,9 +1072,9 @@ membership_claim = "site_ids""#,
         }
 
         #[tokio::test]
-        async fn default_require_token_accepts_request_with_token() {
-            // Source TOML omits `require_token` — default `true`. Sink sends
-            // a valid token; request flows through.
+        async fn source_accepts_request_with_token() {
+            // Auth is configured; the sink sends a valid token, so the request
+            // flows through.
             let token = make_token(HashMap::new());
             let source_auth = format!(
                 r#"[auth]
@@ -1175,14 +1096,13 @@ value = "{token}""#
         }
 
         #[tokio::test]
-        async fn healthcheck_succeeds_when_sink_sends_token_to_require_token_source() {
+        async fn healthcheck_succeeds_when_sink_sends_token() {
             let token = make_token(HashMap::new());
             let source_auth = format!(
                 r#"[auth]
 pub_key.type  = "inline"
 pub_key.value = "{}"
-membership_claim = "site_ids"
-require_token    = true"#,
+membership_claim = "site_ids""#,
                 TEST_PUBLIC_KEY.replace('\n', "\\n")
             );
             let sink_auth = format!(
@@ -1195,13 +1115,12 @@ value = "{token}""#
         }
 
         #[tokio::test]
-        async fn healthcheck_fails_when_sink_omits_token_to_require_token_source() {
+        async fn healthcheck_fails_when_sink_omits_token() {
             let source_auth = format!(
                 r#"[auth]
 pub_key.type  = "inline"
 pub_key.value = "{}"
-membership_claim = "site_ids"
-require_token    = true"#,
+membership_claim = "site_ids""#,
                 TEST_PUBLIC_KEY.replace('\n', "\\n")
             );
             assert!(run_healthcheck_pair(&source_auth, "").await.is_err());
