@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use itertools::Itertools as _;
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, PublicKeyUse};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
 use openssl::x509::X509;
@@ -15,7 +16,7 @@ use vector_lib::event::Event;
 use vrl::path::{parse_target_path, OwnedTargetPath};
 
 use crate::http::HttpClient;
-use crate::internal_events::{JwtAuthError, JwtAuthSuccess};
+use crate::internal_events::{JwtAuthError, JwtAuthSuccess, JwtRejection};
 
 /// Shorthand for the decoded JWT claims map used throughout this module.
 type Claims = serde_json::Map<String, Value>;
@@ -1164,31 +1165,14 @@ impl Auth {
 
         let Some(auth_value) = authorization else {
             if self.0.require_token {
-                emit!(JwtAuthError {
-                    reason: "missing_token",
-                    message: "missing authorization header",
-                    error: None,
-                    claim_field: claim_field.map(Cow::Borrowed),
-                    claim_value: None,
-                    decoded_token: "",
-                });
-                return Err(AuthError::InvalidToken("missing authorization header"));
+                return Err(reject(JwtRejection::MissingToken, None, membership, None));
             }
             debug!(message = "No authorization header; allowing request.");
             return Ok(None);
         };
 
-        let token = strip_bearer_prefix(auth_value).ok_or_else(|| {
-            emit!(JwtAuthError {
-                reason: "invalid_scheme",
-                message: "expected bearer scheme",
-                error: None,
-                claim_field: claim_field.map(Cow::Borrowed),
-                claim_value: None,
-                decoded_token: "",
-            });
-            AuthError::InvalidToken("expected bearer scheme")
-        })?;
+        let token = strip_bearer_prefix(auth_value)
+            .ok_or_else(|| reject(JwtRejection::InvalidScheme, None, membership, None))?;
 
         let inner = &self.0;
         let token_data = match &inner.key_store {
@@ -1198,41 +1182,27 @@ impl Auth {
             // On miss, trigger a cooldown-gated reactive refresh and retry once.
             KeyStore::Jwks(cache) => {
                 let header = decode_header(token).map_err(|error| {
-                    emit!(JwtAuthError {
-                        reason: "malformed_header",
-                        message: "invalid token header",
-                        error: Some(error.to_string().into()),
-                        claim_field: claim_field.map(Cow::Borrowed),
-                        claim_value: membership_value_for_log(token, membership).map(Cow::Owned),
-                        decoded_token: &decoded_for_log(token),
-                    });
-                    AuthError::InvalidToken("invalid token header")
+                    reject(
+                        JwtRejection::MalformedHeader,
+                        Some(error.to_string().into()),
+                        membership,
+                        Some(token),
+                    )
                 })?;
                 let kid = header.kid.as_deref().ok_or_else(|| {
-                    emit!(JwtAuthError {
-                        reason: "missing_kid",
-                        message: "missing kid header",
-                        error: None,
-                        claim_field: claim_field.map(Cow::Borrowed),
-                        claim_value: membership_value_for_log(token, membership).map(Cow::Owned),
-                        decoded_token: &decoded_for_log(token),
-                    });
-                    AuthError::InvalidToken("missing kid header")
+                    reject(JwtRejection::MissingKid, None, membership, Some(token))
                 })?;
 
                 // jsonwebtoken v9 requires all entries in Validation::algorithms to share
                 // the same AlgorithmFamily as the DecodingKey. Use the precomputed
                 // per-algorithm Validation to avoid any hot-path allocation.
                 let per_alg_validation = inner.jwks_validations.get(&header.alg).ok_or_else(|| {
-                    emit!(JwtAuthError {
-                        reason: "unsupported_algorithm",
-                        message: "unsupported algorithm",
-                        error: Some(format!("{:?}", header.alg).into()),
-                        claim_field: claim_field.map(Cow::Borrowed),
-                        claim_value: membership_value_for_log(token, membership).map(Cow::Owned),
-                        decoded_token: &decoded_for_log(token),
-                    });
-                    AuthError::InvalidToken("unsupported algorithm")
+                    reject(
+                        JwtRejection::UnsupportedAlgorithm,
+                        Some(format!("{:?}", header.alg).into()),
+                        membership,
+                        Some(token),
+                    )
                 })?;
 
                 // Fast path: key already in snapshot — no network needed.
@@ -1253,15 +1223,12 @@ impl Auth {
                     cache.refresh_if_due().await;
                     let snapshot = cache.snapshot();
                     let key = snapshot.get(kid).ok_or_else(|| {
-                        emit!(JwtAuthError {
-                            reason: "unknown_key",
-                            message: "unknown signing key",
-                            error: Some(format!("kid={kid}").into()),
-                            claim_field: claim_field.map(Cow::Borrowed),
-                            claim_value: membership_value_for_log(token, membership).map(Cow::Owned),
-                            decoded_token: &decoded_for_log(token),
-                        });
-                        AuthError::InvalidToken("unknown signing key")
+                        reject(
+                            JwtRejection::UnknownKey,
+                            Some(format!("kid={kid}").into()),
+                            membership,
+                            Some(token),
+                        )
                     })?;
                     decode_claims(token, key, per_alg_validation, membership)?
                 }
@@ -1277,7 +1244,7 @@ impl Auth {
             claim_field: claim_field.map(Cow::Borrowed),
             claim_value: allowed_values
                 .as_ref()
-                .map(|values| Cow::Owned(values.iter().cloned().collect::<Vec<_>>().join(","))),
+                .map(|values| Cow::Owned(values.iter().join(","))),
         });
         Ok(Some(AuthContext { allowed_values }))
     }
@@ -1314,41 +1281,48 @@ fn membership_value_for_log(token: &str, membership: Option<&MembershipClaim>) -
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: Claims = serde_json::from_slice(&bytes).ok()?;
-    let values = membership.extract(&claims).ok()?;
-    if values.is_empty() {
-        return None;
-    }
-    Some(values.into_iter().collect::<Vec<_>>().join(","))
+    // `extract` errors on an empty set, so `.ok()?` already yields `None` for no match.
+    Some(membership.extract(&claims).ok()?.iter().join(","))
 }
 
-/// Map a `jsonwebtoken` error to a low-cardinality reason for the metric label.
-fn validation_reason(error: &jsonwebtoken::errors::Error) -> &'static str {
+/// Map a `jsonwebtoken` error to the corresponding [`JwtRejection`].
+fn validation_reason(error: &jsonwebtoken::errors::Error) -> JwtRejection {
     use jsonwebtoken::errors::ErrorKind;
     match error.kind() {
-        ErrorKind::ExpiredSignature => "expired",
-        ErrorKind::ImmatureSignature => "immature",
-        ErrorKind::InvalidSignature => "invalid_signature",
-        ErrorKind::InvalidIssuer => "invalid_issuer",
-        ErrorKind::InvalidAudience => "invalid_audience",
-        ErrorKind::InvalidSubject => "invalid_subject",
-        _ => "invalid_token",
+        ErrorKind::ExpiredSignature => JwtRejection::Expired,
+        ErrorKind::ImmatureSignature => JwtRejection::Immature,
+        ErrorKind::InvalidSignature => JwtRejection::InvalidSignature,
+        ErrorKind::InvalidIssuer => JwtRejection::InvalidIssuer,
+        ErrorKind::InvalidAudience => JwtRejection::InvalidAudience,
+        ErrorKind::InvalidSubject => JwtRejection::InvalidSubject,
+        _ => JwtRejection::InvalidToken,
     }
 }
 
-fn token_validation_failed(
-    token: &str,
-    error: jsonwebtoken::errors::Error,
+/// Emit the rejection telemetry (log + both error metrics) and build the
+/// `AuthError`. `token: Some(..)` attaches the membership value and decoded
+/// claims; `None` for pre-parse rejections.
+fn reject(
+    reason: JwtRejection,
+    error: Option<Cow<'_, str>>,
     membership: Option<&MembershipClaim>,
+    token: Option<&str>,
 ) -> AuthError {
+    let (claim_value, decoded_token) = match token {
+        Some(token) => (
+            membership_value_for_log(token, membership).map(Cow::Owned),
+            decoded_for_log(token),
+        ),
+        None => (None, String::new()),
+    };
     emit!(JwtAuthError {
-        reason: validation_reason(&error),
-        message: "invalid or expired token",
-        error: Some(error.to_string().into()),
+        reason,
+        error,
         claim_field: membership.map(|m| Cow::Borrowed(m.claim_name())),
-        claim_value: membership_value_for_log(token, membership).map(Cow::Owned),
-        decoded_token: &decoded_for_log(token),
+        claim_value,
+        decoded_token: &decoded_token,
     });
-    AuthError::InvalidToken("invalid or expired token")
+    AuthError::InvalidToken(reason.message())
 }
 
 fn decode_claims(
@@ -1357,8 +1331,14 @@ fn decode_claims(
     validation: &Validation,
     membership: Option<&MembershipClaim>,
 ) -> Result<TokenData<Claims>, AuthError> {
-    decode::<Claims>(token, key, validation)
-        .map_err(|error| token_validation_failed(token, error, membership))
+    decode::<Claims>(token, key, validation).map_err(|error| {
+        reject(
+            validation_reason(&error),
+            Some(error.to_string().into()),
+            membership,
+            Some(token),
+        )
+    })
 }
 
 /// Strip the `Bearer` auth scheme from a header value, case-insensitively and
@@ -1579,16 +1559,15 @@ mod tests {
     #[test]
     fn validation_reason_maps_error_kinds() {
         use jsonwebtoken::errors::{Error, ErrorKind};
-        // These strings are the `reason` metric label — part of the contract.
         let expired: Error = ErrorKind::ExpiredSignature.into();
-        assert_eq!(validation_reason(&expired), "expired");
+        assert_eq!(validation_reason(&expired), JwtRejection::Expired);
         let bad_sig: Error = ErrorKind::InvalidSignature.into();
-        assert_eq!(validation_reason(&bad_sig), "invalid_signature");
+        assert_eq!(validation_reason(&bad_sig), JwtRejection::InvalidSignature);
         let bad_iss: Error = ErrorKind::InvalidIssuer.into();
-        assert_eq!(validation_reason(&bad_iss), "invalid_issuer");
+        assert_eq!(validation_reason(&bad_iss), JwtRejection::InvalidIssuer);
         // Anything not explicitly mapped falls through to the generic reason.
         let other: Error = ErrorKind::InvalidToken.into();
-        assert_eq!(validation_reason(&other), "invalid_token");
+        assert_eq!(validation_reason(&other), JwtRejection::InvalidToken);
     }
 
     #[test]
@@ -1613,8 +1592,8 @@ mod tests {
         let result = auth.authenticate(Some(&bearer(&token))).await;
         assert!(matches!(result, Err(AuthError::InvalidToken(_))));
 
-        // The failure is logged with the jsonwebtoken error kind...
-        assert!(logs_contain("invalid or expired token"));
+        // The failure is logged with the rejection message and the error kind...
+        assert!(logs_contain("token has expired"));
         assert!(logs_contain("ExpiredSignature"));
         // ...the membership claim (field + value)...
         assert!(logs_contain("claim_field="));
@@ -1763,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_increments_component_jwt_auth_errors_total_metric() {
+    fn rejection_increments_jwt_auth_errors_total_metric() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let auth = rt.block_on(build_auth(None, None)); // Identity("site_ids")
         let mut extra = HashMap::new();
@@ -1773,13 +1752,13 @@ mod tests {
         let counters = auth_metrics(&auth, &bearer(&token));
         let (key, count) = counters
             .iter()
-            .find(|(key, _)| key.name() == "component_jwt_auth_errors_total")
-            .expect("component_jwt_auth_errors_total should have been emitted on rejection");
+            .find(|(key, _)| key.name() == "jwt_auth_errors_total")
+            .expect("jwt_auth_errors_total should have been emitted on rejection");
 
         // Incremented once, tagged with reason, error labels, and membership claim.
         assert_eq!(*count, 1);
         let tags = metric_tags(key);
-        assert_eq!(tags.get("reason"), Some(&"expired"));
+        assert_eq!(tags.get("reason"), Some(&JwtRejection::Expired.tag()));
         assert_eq!(tags.get("error_type"), Some(&"request_failed"));
         assert_eq!(tags.get("stage"), Some(&"receiving"));
         assert_eq!(tags.get("claim_field"), Some(&"site_ids"));
@@ -1792,7 +1771,7 @@ mod tests {
             .expect("component_errors_total should also have been emitted");
         assert_eq!(*generic_count, 1);
         let generic_tags = metric_tags(generic);
-        assert_eq!(generic_tags.get("reason"), Some(&"expired"));
+        assert_eq!(generic_tags.get("reason"), Some(&JwtRejection::Expired.tag()));
         assert_eq!(generic_tags.get("error_type"), Some(&"request_failed"));
         assert_eq!(generic_tags.get("stage"), Some(&"receiving"));
     }
@@ -1807,11 +1786,11 @@ mod tests {
 
         // Happy path: success counter incremented, no error counters of either kind.
         assert!(counters.iter().all(|(key, _)| {
-            key.name() != "component_jwt_auth_errors_total" && key.name() != "component_errors_total"
+            key.name() != "jwt_auth_errors_total" && key.name() != "component_errors_total"
         }));
         let (key, count) = counters
             .iter()
-            .find(|(key, _)| key.name() == "component_jwt_auth_success_total")
+            .find(|(key, _)| key.name() == "jwt_auth_success_total")
             .expect("success metric should have been emitted");
         assert_eq!(*count, 1);
         let tags = metric_tags(key);
