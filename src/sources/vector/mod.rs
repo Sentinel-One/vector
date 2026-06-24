@@ -68,14 +68,14 @@ struct AuthMetrics {
 impl AuthMetrics {
     fn new() -> Self {
         Self {
-            batch_failed: counter!("vector_source_auth_batch_failed_total"),
-            authorized: histogram!("vector_source_auth_events", "outcome" => "authorized"),
+            batch_failed: counter!("source_auth_batch_failed_total"),
+            authorized: histogram!("source_auth_events", "outcome" => "authorized"),
             authorization_missing: histogram!(
-                "vector_source_auth_events",
+                "source_auth_events",
                 "outcome" => AuthEventError::AuthorizationMissing.label(),
             ),
             forbidden: histogram!(
-                "vector_source_auth_events",
+                "source_auth_events",
                 "outcome" => AuthEventError::Forbidden.label(),
             ),
         }
