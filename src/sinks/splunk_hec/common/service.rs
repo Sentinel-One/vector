@@ -178,10 +178,26 @@ impl ResponseExt for http::Response<Bytes> {
     }
 }
 
+pub enum Token {
+    Fallback(String),
+
+    Enforced(String),
+}
+
+impl Token {
+    fn authz_header(&self, passthru: Option<Arc<str>>) -> String {
+        let t = match self {
+            Token::Fallback(t) => passthru.unwrap_or_else(|| t.as_str().into()),
+            Token::Enforced(t) => t.as_str().into(),
+        };
+        format!("Splunk {t}")
+    }
+}
+
 pub struct HttpRequestBuilder {
     pub endpoint_target: EndpointTarget,
     pub endpoint: String,
-    pub default_token: String,
+    pub token: Token,
     pub compression: Compression,
     // A Splunk channel must be a GUID/UUID formatted value
     // https://docs.splunk.com/Documentation/Splunk/8.2.3/Data/AboutHECIDXAck#About_channels_and_sending_data
@@ -201,7 +217,7 @@ impl HttpRequestBuilder {
     pub fn new(
         endpoint: String,
         endpoint_target: EndpointTarget,
-        default_token: String,
+        token: Token,
         compression: Compression,
         headers: IndexMap<HeaderName, HeaderValue>,
     ) -> Self {
@@ -209,7 +225,7 @@ impl HttpRequestBuilder {
         Self {
             endpoint,
             endpoint_target,
-            default_token,
+            token,
             compression,
             channel,
             headers,
@@ -253,13 +269,7 @@ impl HttpRequestBuilder {
 
         let mut builder = Request::post(uri)
             .header("Content-Type", "application/json")
-            .header(
-                "Authorization",
-                format!(
-                    "Splunk {}",
-                    passthrough_token.unwrap_or_else(|| self.default_token.as_str().into())
-                ),
-            )
+            .header("Authorization", self.token.authz_header(passthrough_token))
             .header("X-Splunk-Request-Channel", self.channel.as_str());
 
         let headers = builder
@@ -322,7 +332,7 @@ mod tests {
                 },
                 build_http_batch_service,
                 request::HecRequest,
-                service::{HecAckResponseBody, HecService, HttpRequestBuilder},
+                service::{HecAckResponseBody, HecService, HttpRequestBuilder, Token},
                 EndpointTarget,
             },
             util::{metadata::RequestMetadataBuilder, Compression},
@@ -341,7 +351,7 @@ mod tests {
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             endpoint,
             EndpointTarget::default(),
-            String::from(TOKEN),
+            Token::Fallback(String::from(TOKEN)),
             Compression::default(),
             IndexMap::default()
         ));
@@ -661,7 +671,7 @@ mod tests {
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             mock_server.uri(),
             EndpointTarget::default(),
-            String::from(TOKEN),
+            Token::Fallback(String::from(TOKEN)),
             Compression::default(),
             custom_headers,
         ));
@@ -705,7 +715,7 @@ mod tests {
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             mock_server.uri(),
             EndpointTarget::Event,
-            String::from(TOKEN),
+            Token::Fallback(String::from(TOKEN)),
             Compression::default(),
             custom_headers,
         ));
@@ -764,7 +774,7 @@ mod tests {
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             mock_server.uri(),
             EndpointTarget::Event,
-            String::from(TOKEN),
+            Token::Fallback(String::from(TOKEN)),
             Compression::default(),
             custom_headers,
         ));

@@ -192,7 +192,7 @@ mod tests {
     use crate::sinks::{
         splunk_hec::common::{
             build_healthcheck, build_uri, create_client,
-            service::{HttpRequestBuilder, MetadataFields},
+            service::{HttpRequestBuilder, MetadataFields, Token},
             EndpointTarget, HOST_FIELD, SOURCE_FIELD,
         },
         util::Compression,
@@ -285,7 +285,7 @@ mod tests {
         let http_request_builder = HttpRequestBuilder::new(
             String::from(endpoint),
             EndpointTarget::default(),
-            String::from(token),
+            Token::Fallback(String::from(token)),
             compression,
             IndexMap::default()
         );
@@ -330,7 +330,7 @@ mod tests {
         let http_request_builder = HttpRequestBuilder::new(
             String::from(endpoint),
             EndpointTarget::default(),
-            String::from(token),
+            Token::Fallback(String::from(token)),
             compression,
             IndexMap::default()
         );
@@ -378,7 +378,7 @@ mod tests {
         let http_request_builder = HttpRequestBuilder::new(
             String::from(endpoint),
             EndpointTarget::default(),
-            String::from(token),
+            Token::Fallback(String::from(token)),
             compression,
             IndexMap::default()
         );
@@ -458,7 +458,7 @@ mod tests {
         let http_request_builder = HttpRequestBuilder::new(
             String::from(endpoint),
             EndpointTarget::default(),
-            String::from(token),
+            Token::Fallback(String::from(token)),
             compression,
             IndexMap::default()
         );
@@ -520,7 +520,7 @@ mod tests {
         let http_request_builder = HttpRequestBuilder::new(
             String::from(endpoint),
             EndpointTarget::default(),
-            String::from(token),
+            Token::Fallback(String::from(token)),
             compression,
             static_headers,
         );

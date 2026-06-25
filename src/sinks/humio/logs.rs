@@ -195,6 +195,7 @@ impl HumioLogsConfig {
     fn build_hec_config(&self) -> HecLogsSinkConfig {
         HecLogsSinkConfig {
             default_token: self.token.clone(),
+            ignore_stored_token: false,
             endpoint: self.endpoint.clone(),
             host_key: Some(self.host_key.clone()),
             indexed_fields: self.indexed_fields.clone(),

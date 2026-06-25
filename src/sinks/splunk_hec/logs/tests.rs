@@ -234,6 +234,7 @@ async fn splunk_passthrough_token() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -743,6 +744,7 @@ async fn raw_endpoint_with_metadata_and_batch_headers() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -826,6 +828,7 @@ async fn raw_endpoint_with_only_batch_headers() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -887,6 +890,7 @@ async fn raw_endpoint_without_metadata_or_headers() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -937,6 +941,7 @@ async fn event_endpoint_with_two_batch_headers() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -1014,6 +1019,7 @@ async fn event_endpoint_with_one_batch_header() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -1073,6 +1079,7 @@ async fn event_endpoint_no_batching_on_metadata_fields() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -1132,6 +1139,7 @@ async fn batch_headers_missing_value_separate_batch() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -1191,6 +1199,7 @@ async fn batch_headers_static_headers_override() {
     let addr = next_addr();
     let config = HecLogsSinkConfig {
         default_token: "token".to_string().into(),
+        ignore_stored_token: false,
         endpoint: format!("http://{}", addr),
         host_key: None,
         indexed_fields: Vec::new(),
@@ -1314,4 +1323,59 @@ async fn batch_header_field_excluded_from_body_event_endpoint() {
     assert!(body.contains("other_field"), "other_field should be in body");
     assert!(body.contains("keep-me"), "other_field value should be in body");
     assert!(body.contains("evt-event-transform"), "event_id should be in body");
+}
+
+async fn run_and_collect_auth_tokens(config_toml: &str, events: Vec<Event>) -> Vec<http::HeaderValue> {
+    let addr = next_addr();
+    let config_toml = config_toml.replace("{addr}", &addr.to_string());
+    let (config, cx) = load_sink::<HecLogsSinkConfig>(&config_toml).unwrap();
+    let (sink, _) = config.build(cx).await.unwrap();
+
+    let (rx, _trigger, server) = build_test_server(addr);
+    tokio::spawn(server);
+
+    let n = events.len();
+    sink.run_events(events).await.unwrap();
+
+    rx.take(n)
+        .map(|r| r.0.headers.get("Authorization").unwrap().clone())
+        .collect()
+        .await
+}
+
+#[tokio::test]
+async fn splunk_enforce_token_overrides_passthrough() {
+    let tokens = run_and_collect_auth_tokens(
+        r#"
+            default_token = "enforced-token"
+            endpoint = "http://{addr}"
+            ignore_stored_token = true
+            encoding.codec = "json"
+        "#,
+        vec![
+            get_event_with_token("message-with-passthrough", "passthrough-token"),
+            Event::Log(LogEvent::from("message-without-passthrough")),
+        ],
+    )
+    .await;
+
+    for token in &tokens {
+        assert_eq!(token, "Splunk enforced-token");
+    }
+}
+
+#[tokio::test]
+async fn splunk_enforce_token_without_passthrough() {
+    let tokens = run_and_collect_auth_tokens(
+        r#"
+            default_token = "enforced-token"
+            endpoint = "http://{addr}"
+            ignore_stored_token = true
+            encoding.codec = "json"
+        "#,
+        vec![Event::Log(LogEvent::from("no-passthrough-event"))],
+    )
+    .await;
+
+    assert_eq!(tokens[0], "Splunk enforced-token");
 }
