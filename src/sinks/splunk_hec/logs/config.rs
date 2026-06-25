@@ -10,10 +10,7 @@ use crate::{
     sinks::{
         prelude::*,
         splunk_hec::common::{
-            acknowledgements::HecClientAcknowledgementsConfig,
-            build_healthcheck, build_http_batch_service, create_client,
-            service::{HecService, HttpRequestBuilder},
-            EndpointTarget, SplunkHecDefaultBatchSettings,
+            EndpointTarget, SplunkHecDefaultBatchSettings, acknowledgements::HecClientAcknowledgementsConfig, build_healthcheck, build_http_batch_service, create_client, service::{HecService, HttpRequestBuilder, Token}
         },
         util::http::HttpRetryLogic,
     },
@@ -77,6 +74,12 @@ pub struct HecLogsSinkConfig {
     /// If an event has a token set in its secrets (`splunk_hec_token`), it prevails over the one set here.
     #[serde(alias = "token")]
     pub default_token: SensitiveString,
+
+    /// Ignore stored token (the token in event metadata)
+    ///
+    /// If set, sink always uses default token (ignoring stored token)
+    #[serde(default)]
+    pub ignore_stored_token: bool,
 
     /// The base URL of the Splunk instance.
     ///
@@ -243,6 +246,7 @@ impl GenerateConfig for HecLogsSinkConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
             default_token: "${VECTOR_SPLUNK_HEC_TOKEN}".to_owned().into(),
+            ignore_stored_token: false,
             endpoint: "endpoint".to_owned(),
             host_key: None,
             indexed_fields: vec![],
@@ -319,10 +323,17 @@ impl HecLogsSinkConfig {
         let headers = validate_headers(&self.request.headers)?;
         let batch_headers = self.batch_headers.clone().into_validated()?;
 
+        let token_str = self.default_token.inner().to_owned();
+        let token = if self.ignore_stored_token {
+            Token::Enforced(token_str)
+        } else {
+            Token::Fallback(token_str)
+        };
+
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             self.endpoint.clone(),
             self.endpoint_target,
-            self.default_token.inner().to_owned(),
+            token,
             self.compression,
             headers,
         ));
@@ -460,6 +471,37 @@ mod tests {
         assert!(ts_config.preserve_timestamp_key);
     }
 
+    fn hec_logs_config_from_toml(toml: &str) -> HecLogsSinkConfig {
+        toml::from_str(toml).expect("failed to parse HecLogsSinkConfig from TOML")
+    }
+
+    #[test]
+    fn test_config_serde_ignore_stored_token_absent() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "my-token"
+            endpoint = "https://hec.example.com:8088"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert!(!config.ignore_stored_token);
+    }
+
+    #[test]
+    fn test_config_serde_ignore_stored_token_present() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "my-token"
+            endpoint = "https://hec.example.com:8088"
+            ignore_stored_token = true
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert!(config.ignore_stored_token);
+    }
+
     impl ValidatableComponent for HecLogsSinkConfig {
         fn validation_configuration() -> ValidationConfiguration {
             let endpoint = "http://127.0.0.1:9001".to_string();
@@ -470,6 +512,7 @@ mod tests {
             let config = Self {
                 endpoint: endpoint.clone(),
                 default_token: "i_am_an_island".to_string().into(),
+                ignore_stored_token: false,
                 host_key: None,
                 indexed_fields: vec![],
                 index: None,

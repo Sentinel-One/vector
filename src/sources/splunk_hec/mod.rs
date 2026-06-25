@@ -1363,6 +1363,7 @@ mod tests {
     ) -> (VectorSink, Healthcheck) {
         HecLogsSinkConfig {
             default_token: TOKEN.to_owned().into(),
+            ignore_stored_token: false,
             endpoint: format!("http://{}", address),
             host_key: None,
             indexed_fields: vec![],

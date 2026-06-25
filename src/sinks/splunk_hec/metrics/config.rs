@@ -15,7 +15,7 @@ use crate::{
         splunk_hec::common::{
             acknowledgements::HecClientAcknowledgementsConfig,
             build_healthcheck, build_http_batch_service, config_host_key, create_client,
-            service::{HecService, HttpRequestBuilder},
+            service::{HecService, HttpRequestBuilder, Token},
             EndpointTarget, SplunkHecDefaultBatchSettings,
         },
         util::{
@@ -189,7 +189,7 @@ impl HecMetricsSinkConfig {
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             self.endpoint.clone(),
             EndpointTarget::default(),
-            self.default_token.inner().to_owned(),
+            Token::Fallback(self.default_token.inner().to_owned()),
             self.compression,
             headers,
         ));

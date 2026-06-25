@@ -297,7 +297,7 @@ mod tests {
         http::HttpClient,
         sinks::{
             splunk_hec::common::{
-                acknowledgements::HecAckStatusRequest, service::HttpRequestBuilder, EndpointTarget,
+                acknowledgements::HecAckStatusRequest, service::{HttpRequestBuilder, Token}, EndpointTarget,
             },
             util::Compression,
         },
@@ -309,7 +309,7 @@ mod tests {
         let http_request_builder = HttpRequestBuilder::new(
             String::from(""),
             EndpointTarget::default(),
-            String::from(""),
+            Token::Fallback(String::from("")),
             Compression::default(),
             IndexMap::default()
         );
