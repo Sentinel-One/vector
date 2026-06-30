@@ -63,7 +63,7 @@ pub struct HecService<S> {
     current_ack_slot: Option<OwnedSemaphorePermit>,
     rej_rpt: RejectionReport,
     compression: Compression,
-    context: Arc<HecRejectionContext>,
+    rej_ctx: Arc<HecRejectionContext>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -86,7 +86,7 @@ where
         indexer_acknowledgements: HecClientAcknowledgementsConfig,
         rej_rpt: RejectionReport,
         compression: Compression,
-        context: Arc<HecRejectionContext>,
+        rej_ctx: Arc<HecRejectionContext>,
     ) -> Self {
         let max_pending_acks = indexer_acknowledgements.max_pending_acks.get();
         let tx = if let Some(ack_client) = ack_client {
@@ -110,7 +110,7 @@ where
             current_ack_slot: None,
             rej_rpt,
             compression,
-            context,
+            rej_ctx,
         }
     }
 }
@@ -149,7 +149,7 @@ where
         let ack_slot = self.current_ack_slot.take();
         let rej_rpt = self.rej_rpt.clone();
         let compression = self.compression;
-        let context = Arc::clone(&self.context);
+        let rej_ctx = Arc::clone(&self.rej_ctx);
         let req_for_rpt = if rej_rpt.needs_request() {
             Some((req.body.clone(), compression))
         } else {
@@ -202,10 +202,10 @@ where
                 } else {
                     rej_rpt
                 };
-                emit_rejection_error(context.as_ref(), response.status_code(), response.body(), None, mode);
+                emit_rejection_error(rej_ctx.as_ref(), response.status_code(), response.body(), None, mode);
                 EventStatus::Errored
             } else {
-                emit_rejection_error(context.as_ref(), response.status_code(), response.body(), req_for_rpt, rej_rpt);
+                emit_rejection_error(rej_ctx.as_ref(), response.status_code(), response.body(), req_for_rpt, rej_rpt);
                 EventStatus::Rejected
             };
 
@@ -404,7 +404,7 @@ mod tests {
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             endpoint,
             EndpointTarget::default(),
-            String::from(TOKEN),
+            Token::Fallback(String::from(TOKEN)),
             Compression::default(),
             IndexMap::default(),
         ));

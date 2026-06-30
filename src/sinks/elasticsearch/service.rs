@@ -108,7 +108,7 @@ pub struct ElasticsearchService {
     >,
     rej_rpt: RejectionReport,
     compression: Compression,
-    context: Arc<ElasticsearchRejectionContext>,
+    rej_ctx: Arc<ElasticsearchRejectionContext>,
 }
 
 impl ElasticsearchService {
@@ -117,7 +117,7 @@ impl ElasticsearchService {
         http_request_builder: HttpRequestBuilder,
         rej_rpt: RejectionReport,
         compression: Compression,
-        context: Arc<ElasticsearchRejectionContext>,
+        rej_ctx: Arc<ElasticsearchRejectionContext>,
     ) -> ElasticsearchService {
         let http_request_builder = Arc::new(http_request_builder);
         let batch_service = HttpBatchService::new(http_client, move |req| {
@@ -126,7 +126,7 @@ impl ElasticsearchService {
                 Box::pin(async move { request_builder.build_request(req).await });
             future
         });
-        ElasticsearchService { batch_service, rej_rpt, compression, context }
+        ElasticsearchService { batch_service, rej_rpt, compression, rej_ctx }
     }
 }
 
@@ -233,14 +233,14 @@ impl Service<ElasticsearchRequest> for ElasticsearchService {
         } else {
             None
         };
-        let context = Arc::clone(&self.context);
+        let rej_ctx = Arc::clone(&self.rej_ctx);
         Box::pin(async move {
             http_service.ready().await?;
             let events_byte_size =
                 std::mem::take(req.metadata_mut()).into_events_estimated_json_encoded_byte_size();
             let http_response = http_service.call(req).await?;
 
-            let event_status = get_event_status(&http_response, req_for_rpt, rej_rpt, &context);
+            let event_status = get_event_status(&http_response, req_for_rpt, rej_rpt, &rej_ctx);
             Ok(ElasticsearchResponse {
                 event_status,
                 http_response,
@@ -288,14 +288,14 @@ fn get_event_status(
     response: &Response<Bytes>,
     request: Option<(ElasticsearchRequest, Compression)>,
     rej_rpt: RejectionReport,
-    context: &ElasticsearchRejectionContext,
+    rej_ctx: &ElasticsearchRejectionContext,
 ) -> EventStatus {
     let status = response.status();
     if status.is_success() {
         let body = response.body();
         if String::from_utf8_lossy(body).contains(response_frag("errors", "true").as_str()) {
             let req = request.map(|(req, comp)| (req.payload, comp));
-            emit_rejection_error(context, status.as_u16(), body, req, rej_rpt);
+            emit_rejection_error(rej_ctx, status.as_u16(), body, req, rej_rpt);
             EventStatus::Rejected
         } else {
             EventStatus::Delivered
@@ -306,11 +306,11 @@ fn get_event_status(
         } else {
             rej_rpt
         };
-        emit_rejection_error(context, status.as_u16(), response.body(), None, mode);
+        emit_rejection_error(rej_ctx, status.as_u16(), response.body(), None, mode);
         EventStatus::Errored
     } else {
         let req = request.map(|(req, comp)| (req.payload, comp));
-        emit_rejection_error(context, status.as_u16(), response.body(), req, rej_rpt);
+        emit_rejection_error(rej_ctx, status.as_u16(), response.body(), req, rej_rpt);
         EventStatus::Rejected
     }
 }

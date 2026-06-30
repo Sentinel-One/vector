@@ -355,7 +355,7 @@ impl HecLogsSinkConfig {
                 self.path.clone()
             ));
 
-        let context = Arc::new(HecRejectionContext {
+        let rej_ctx = Arc::new(HecRejectionContext {
             rejected: metrics::counter!(
                 "hec_rejected",
                 "endpoint" => self.endpoint.clone(),
@@ -369,7 +369,7 @@ impl HecLogsSinkConfig {
             self.acknowledgements.clone(),
             self.rejection_report.clone(),
             self.compression,
-            context,
+            rej_ctx,
         );
 
         let batch_settings = self.batch.into_batcher_settings()?;
@@ -518,6 +518,75 @@ mod tests {
             "#,
         );
         assert!(config.ignore_stored_token);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_default() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_stats() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "stats"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_normal_alias() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "normal"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_response() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "response"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Response);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_request_response() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "request_response"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::RequestResponse);
     }
 
     impl ValidatableComponent for HecLogsSinkConfig {
