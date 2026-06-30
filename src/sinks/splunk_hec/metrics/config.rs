@@ -15,7 +15,7 @@ use crate::{
         splunk_hec::common::{
             acknowledgements::HecClientAcknowledgementsConfig,
             build_healthcheck, build_http_batch_service, config_host_key, create_client,
-            service::{HecRejectionContext, HecService, HttpRequestBuilder, Telemetry, Token},
+            service::{HecRejectionContext, HecService, HttpRequestBuilder, Token},
             EndpointTarget, SplunkHecDefaultBatchSettings,
         },
         util::{
