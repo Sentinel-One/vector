@@ -387,7 +387,7 @@ mod tests {
                 },
                 build_http_batch_service,
                 request::HecRequest,
-                service::{HecAckResponseBody, HecRejectionContext, HecService, HttpRequestBuilder,Token, Telemetry},
+                service::{HecAckResponseBody, HecRejectionContext, HecService, HttpRequestBuilder,Token},
                 EndpointTarget,
             },
             util::{metadata::RequestMetadataBuilder, Compression, RejectionContext, RejectionReport},
