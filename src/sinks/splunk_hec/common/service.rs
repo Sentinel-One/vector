@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use http::{HeaderName, Request, HeaderValue};
 use indexmap::IndexMap;
+use metrics::Counter;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -25,16 +26,44 @@ use crate::{
     internal_events::{SplunkIndexerAcknowledgementUnavailableError, SplunkResponseParseError},
     sinks::{
         splunk_hec::common::{build_uri, request::HecRequest, response::HecResponse},
-        util::{sink::Response, Compression},
+        util::{emit_rejection_error, sink::Response, Compression, RejectionContext, RejectionReport},
         UriParseSnafu,
     },
 };
+
+pub struct HecRejectionContext {
+    pub rejected: Counter,
+}
+
+#[derive(serde::Deserialize)]
+struct SplunkErrorBody {
+    text: Option<String>,
+}
+
+impl RejectionContext for HecRejectionContext {
+    fn error_message(&self, status: u16, body: &Bytes) -> String {
+        let splunk_text = serde_json::from_slice::<SplunkErrorBody>(body)
+            .ok()
+            .and_then(|b| b.text);
+        match splunk_text {
+            Some(text) => format!("Request rejected (status: {status}): {text}."),
+            None => format!("Request rejected (status: {status})."),
+        }
+    }
+
+    fn record_rejection(&self, _status: u16, _body: &Bytes) {
+        self.rejected.increment(1);
+    }
+}
 
 pub struct HecService<S> {
     pub inner: S,
     ack_finalizer_tx: Option<mpsc::Sender<(u64, oneshot::Sender<EventStatus>)>>,
     ack_slots: PollSemaphore,
     current_ack_slot: Option<OwnedSemaphorePermit>,
+    rej_rpt: RejectionReport,
+    compression: Compression,
+    rej_ctx: Arc<HecRejectionContext>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -55,6 +84,9 @@ where
         ack_client: Option<HttpClient>,
         http_request_builder: Arc<HttpRequestBuilder>,
         indexer_acknowledgements: HecClientAcknowledgementsConfig,
+        rej_rpt: RejectionReport,
+        compression: Compression,
+        rej_ctx: Arc<HecRejectionContext>,
     ) -> Self {
         let max_pending_acks = indexer_acknowledgements.max_pending_acks.get();
         let tx = if let Some(ack_client) = ack_client {
@@ -76,6 +108,9 @@ where
             ack_finalizer_tx: tx,
             ack_slots,
             current_ack_slot: None,
+            rej_rpt,
+            compression,
+            rej_ctx,
         }
     }
 }
@@ -112,6 +147,14 @@ where
     fn call(&mut self, mut req: HecRequest) -> Self::Future {
         let ack_finalizer_tx = self.ack_finalizer_tx.clone();
         let ack_slot = self.current_ack_slot.take();
+        let rej_rpt = self.rej_rpt.clone();
+        let compression = self.compression;
+        let rej_ctx = Arc::clone(&self.rej_ctx);
+        let req_for_rpt = if rej_rpt.needs_request() {
+            Some((req.body.clone(), compression))
+        } else {
+            None
+        };
 
         let metadata = std::mem::take(req.metadata_mut());
         let events_count = metadata.event_count();
@@ -154,8 +197,15 @@ where
                     EventStatus::Delivered
                 }
             } else if response.is_transient() {
+                let mode = if rej_rpt == RejectionReport::RequestResponse {
+                    RejectionReport::Response
+                } else {
+                    rej_rpt
+                };
+                emit_rejection_error(rej_ctx.as_ref(), response.status_code(), response.body(), None, mode);
                 EventStatus::Errored
             } else {
+                emit_rejection_error(rej_ctx.as_ref(), response.status_code(), response.body(), req_for_rpt, rej_rpt);
                 EventStatus::Rejected
             };
 
@@ -170,11 +220,16 @@ where
 
 pub trait ResponseExt {
     fn body(&self) -> &Bytes;
+    fn status_code(&self) -> u16;
 }
 
 impl ResponseExt for http::Response<Bytes> {
     fn body(&self) -> &Bytes {
         self.body()
+    }
+
+    fn status_code(&self) -> u16 {
+        self.status().as_u16()
     }
 }
 
@@ -332,15 +387,71 @@ mod tests {
                 },
                 build_http_batch_service,
                 request::HecRequest,
-                service::{HecAckResponseBody, HecService, HttpRequestBuilder, Token},
+                service::{HecAckResponseBody, HecRejectionContext, HecService, HttpRequestBuilder,Token},
                 EndpointTarget,
             },
-            util::{metadata::RequestMetadataBuilder, Compression},
+            util::{metadata::RequestMetadataBuilder, Compression, RejectionContext, RejectionReport},
         },
     };
 
+    fn get_hec_service_with_rejection_report(
+        endpoint: String,
+        rej_rpt: RejectionReport,
+        acknowledgements_config: HecClientAcknowledgementsConfig,
+    ) -> HecService<BoxService<HecRequest, http::Response<Bytes>, crate::Error>> {
+        let app_info = crate::app_info();
+        let client = HttpClient::new(None, &ProxyConfig::default(), &app_info).unwrap();
+        let http_request_builder = Arc::new(HttpRequestBuilder::new(
+            endpoint,
+            EndpointTarget::default(),
+            Token::Fallback(String::from(TOKEN)),
+            Compression::default(),
+            IndexMap::default(),
+        ));
+        let http_service = build_http_batch_service(
+            client.clone(),
+            Arc::clone(&http_request_builder),
+            EndpointTarget::Event,
+            false,
+            None,
+        );
+        HecService::new(
+            BoxService::new(http_service),
+            None,
+            http_request_builder,
+            acknowledgements_config,
+            rej_rpt,
+            Compression::default(),
+            test_context(),
+        )
+    }
+
     const TOKEN: &str = "token";
     static ACK_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_context() -> Arc<HecRejectionContext> {
+        Arc::new(HecRejectionContext {
+            rejected: metrics::counter!("hec_rejected_test"),
+        })
+    }
+
+    #[test]
+    fn error_message_extracts_splunk_text_field() {
+        let ctx = HecRejectionContext { rejected: metrics::counter!("_test") };
+        assert_eq!(
+            ctx.error_message(400, &Bytes::from(r#"{"text":"Invalid token","code":4}"#)),
+            "Request rejected (status: 400): Invalid token."
+        );
+    }
+
+    #[test]
+    fn error_message_falls_back_to_status_when_no_text_field() {
+        let ctx = HecRejectionContext { rejected: metrics::counter!("_test") };
+        assert_eq!(
+            ctx.error_message(503, &Bytes::from("Service Unavailable")),
+            "Request rejected (status: 503)."
+        );
+    }
 
     fn get_hec_service(
         endpoint: String,
@@ -367,6 +478,9 @@ mod tests {
             Some(client),
             http_request_builder,
             acknowledgements_config,
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         )
     }
 
@@ -689,6 +803,9 @@ mod tests {
             Some(client),
             http_request_builder,
             acknowledgements_config,
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         );
 
         let request = get_hec_request();
@@ -736,6 +853,9 @@ mod tests {
                 indexer_acknowledgements_enabled: false,
                 ..Default::default()
             },
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         );
 
         let request = get_hec_request();
@@ -795,11 +915,89 @@ mod tests {
                 indexer_acknowledgements_enabled: false,
                 ..Default::default()
             },
+            RejectionReport::default(),
+            Compression::default(),
+            test_context(),
         );
 
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(EventStatus::Delivered, response.event_status);
+    }
+
+    fn no_ack_config() -> HecClientAcknowledgementsConfig {
+        HecClientAcknowledgementsConfig {
+            indexer_acknowledgements_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn hec_service_4xx_returns_rejected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(r#"{"text":"Invalid token","code":4}"#))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::Stats,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Rejected, response.event_status);
+    }
+
+    #[tokio::test]
+    async fn hec_service_5xx_returns_errored() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::Stats,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Errored, response.event_status);
+    }
+
+    #[tokio::test]
+    async fn hec_service_5xx_with_request_response_mode_still_errored() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::RequestResponse,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Errored, response.event_status);
+    }
+
+    #[tokio::test]
+    async fn hec_service_4xx_with_request_response_mode_returns_rejected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(r#"{"text":"Forbidden","code":6}"#))
+            .mount(&mock_server)
+            .await;
+
+        let mut service = get_hec_service_with_rejection_report(
+            mock_server.uri(),
+            RejectionReport::RequestResponse,
+            no_ack_config(),
+        );
+        let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
+        assert_eq!(EventStatus::Rejected, response.event_status);
     }
 }
 

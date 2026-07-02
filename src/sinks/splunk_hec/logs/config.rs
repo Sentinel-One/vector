@@ -10,9 +10,12 @@ use crate::{
     sinks::{
         prelude::*,
         splunk_hec::common::{
-            EndpointTarget, SplunkHecDefaultBatchSettings, acknowledgements::HecClientAcknowledgementsConfig, build_healthcheck, build_http_batch_service, create_client, service::{HecService, HttpRequestBuilder, Token}
+            acknowledgements::HecClientAcknowledgementsConfig,
+            build_healthcheck, build_http_batch_service, create_client,
+            service::{HecRejectionContext, HecService, HttpRequestBuilder, Token},
+            EndpointTarget, SplunkHecDefaultBatchSettings,
         },
-        util::http::HttpRetryLogic,
+        util::{http::HttpRetryLogic, RejectionReport},
     },
 };
 use crate::sinks::util::http::{validate_headers, RequestConfig};
@@ -192,6 +195,10 @@ pub struct HecLogsSinkConfig {
     #[configurable(derived)]
     #[serde(default = "default_timestamp_configuration")]
     pub timestamp_configuration: Option<TimestampConfiguration>,
+
+    /// Controls how much detail is logged when Splunk HEC rejects a batch.
+    #[serde(default)]
+    pub rejection_report: RejectionReport,
 }
 
 
@@ -264,6 +271,7 @@ impl GenerateConfig for HecLogsSinkConfig {
             auto_extract_timestamp: None,
             endpoint_target: EndpointTarget::Event,
             timestamp_configuration: None,
+            rejection_report: RejectionReport::default(),
         })
         .unwrap()
     }
@@ -347,11 +355,21 @@ impl HecLogsSinkConfig {
                 self.path.clone()
             ));
 
+        let rej_ctx = Arc::new(HecRejectionContext {
+            rejected: metrics::counter!(
+                "hec_rejected",
+                "endpoint" => self.endpoint.clone(),
+            ),
+        });
+
         let service = HecService::new(
             http_service,
             ack_client,
             http_request_builder,
             self.acknowledgements.clone(),
+            self.rejection_report.clone(),
+            self.compression,
+            rej_ctx,
         );
 
         let batch_settings = self.batch.into_batcher_settings()?;
@@ -502,6 +520,75 @@ mod tests {
         assert!(config.ignore_stored_token);
     }
 
+    #[test]
+    fn test_config_serde_rejection_report_default() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_stats() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "stats"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_normal_alias() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "normal"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_response() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "response"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Response);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_request_response() {
+        let config = hec_logs_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "request_response"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::RequestResponse);
+    }
+
     impl ValidatableComponent for HecLogsSinkConfig {
         fn validation_configuration() -> ValidationConfiguration {
             let endpoint = "http://127.0.0.1:9001".to_string();
@@ -549,6 +636,7 @@ mod tests {
                 auto_extract_timestamp: None,
                 endpoint_target: EndpointTarget::Raw,
                 timestamp_configuration: None,
+                rejection_report: RejectionReport::default(),
             };
 
             let endpoint = format!("{endpoint}/services/collector/raw");
