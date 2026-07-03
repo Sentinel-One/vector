@@ -15,6 +15,7 @@ pub mod normalizer;
 pub mod partitioner;
 pub mod processed_event;
 pub mod request_builder;
+pub mod rejection_report;
 pub mod retries;
 pub mod service;
 pub mod sink;
@@ -49,6 +50,7 @@ pub use jwt_auth::AuthTokenConfig;
 pub use jwt_auth::{AuthState, AuthToken};
 pub use compressor::Compressor;
 pub use compressor::Decompressor;
+pub use rejection_report::{emit_rejection_error, RejectionContext, RejectionReport};
 pub use normalizer::Normalizer;
 pub use request_builder::{IncrementalRequestBuilder, RequestBuilder};
 pub use service::{

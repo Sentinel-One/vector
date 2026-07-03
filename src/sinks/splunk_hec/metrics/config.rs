@@ -15,11 +15,11 @@ use crate::{
         splunk_hec::common::{
             acknowledgements::HecClientAcknowledgementsConfig,
             build_healthcheck, build_http_batch_service, config_host_key, create_client,
-            service::{HecService, HttpRequestBuilder, Token},
+            service::{HecRejectionContext, HecService, HttpRequestBuilder, Token},
             EndpointTarget, SplunkHecDefaultBatchSettings,
         },
         util::{
-            http::HttpRetryLogic, BatchConfig, Compression, ServiceBuilderExt,
+            http::HttpRetryLogic, BatchConfig, Compression, RejectionReport, ServiceBuilderExt,
         },
         Healthcheck,
     },
@@ -124,6 +124,10 @@ pub struct HecMetricsSinkConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub path: Option<String>,
+
+    /// Controls how much detail is logged when Splunk HEC rejects a batch.
+    #[serde(default)]
+    pub rejection_report: RejectionReport,
 }
 
 impl GenerateConfig for HecMetricsSinkConfig {
@@ -142,6 +146,7 @@ impl GenerateConfig for HecMetricsSinkConfig {
             tls: None,
             acknowledgements: Default::default(),
             path: None,
+            rejection_report: RejectionReport::default(),
         })
         .unwrap()
     }
@@ -203,11 +208,21 @@ impl HecMetricsSinkConfig {
                 self.path.clone()
             ));
 
+        let rej_ctx = Arc::new(HecRejectionContext {
+            rejected: metrics::counter!(
+                "hec_rejected",
+                "endpoint" => self.endpoint.clone(),
+            ),
+        });
+
         let service = HecService::new(
             http_service,
             ack_client,
             http_request_builder,
             self.acknowledgements.clone(),
+            self.rejection_report.clone(),
+            self.compression,
+            rej_ctx,
         );
 
         let batch_settings = self.batch.into_batcher_settings()?;
@@ -224,5 +239,78 @@ impl HecMetricsSinkConfig {
         };
 
         Ok(VectorSink::from_event_streamsink(sink))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hec_metrics_config_from_toml(toml: &str) -> HecMetricsSinkConfig {
+        toml::from_str(toml).expect("failed to parse HecMetricsSinkConfig from TOML")
+    }
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<HecMetricsSinkConfig>();
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_default() {
+        let config = hec_metrics_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_stats() {
+        let config = hec_metrics_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "stats"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_normal_alias() {
+        let config = hec_metrics_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "normal"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Stats);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_response() {
+        let config = hec_metrics_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "response"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::Response);
+    }
+
+    #[test]
+    fn test_config_serde_rejection_report_request_response() {
+        let config = hec_metrics_config_from_toml(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            rejection_report = "request_response"
+            "#,
+        );
+        assert_eq!(config.rejection_report, RejectionReport::RequestResponse);
     }
 }

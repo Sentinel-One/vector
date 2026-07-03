@@ -251,7 +251,8 @@ async fn splunk_passthrough_token() {
         path: None,
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
-        timestamp_configuration: None
+        timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -765,6 +766,7 @@ async fn raw_endpoint_with_metadata_and_batch_headers() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Raw,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -846,6 +848,7 @@ async fn raw_endpoint_with_only_batch_headers() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Raw,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -908,6 +911,7 @@ async fn raw_endpoint_without_metadata_or_headers() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Raw,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -962,6 +966,7 @@ async fn event_endpoint_with_two_batch_headers() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1037,6 +1042,7 @@ async fn event_endpoint_with_one_batch_header() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1097,6 +1103,7 @@ async fn event_endpoint_no_batching_on_metadata_fields() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1157,6 +1164,7 @@ async fn batch_headers_missing_value_separate_batch() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1222,6 +1230,7 @@ async fn batch_headers_static_headers_override() {
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
+        rejection_report: Default::default(),
     };
     let cx = SinkContext::default();
 
