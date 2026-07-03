@@ -48,6 +48,7 @@ once_cell = { version = "1.21" }
 url.workspace = true
 rand.workspace = true
 chrono.workspace = true
+cron = "0.15"
 bstr = { version = "1.0", features = ["std"], default-features = false }
 hyper.workspace = true
 itertools.workspace = true
