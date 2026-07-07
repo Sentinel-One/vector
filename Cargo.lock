@@ -10024,12 +10024,14 @@ dependencies = [
  "http 0.2.9",
  "hyper 0.14.28",
  "inventory",
+ "ipnet",
  "itertools 0.14.0",
  "keyed_priority_queue",
  "lext",
  "metrics",
  "mlua",
  "mlua-json",
+ "moka",
  "once_cell",
  "oxide-auth",
  "oxide-auth-poem",
@@ -12372,7 +12374,7 @@ dependencies = [
 
 [[package]]
 name = "vector"
-version = "0.44.11"
+version = "0.44.12"
 dependencies = [
  "apache-avro",
  "approx",

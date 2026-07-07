@@ -51,7 +51,9 @@ chrono.workspace = true
 cron = "0.15"
 bstr = { version = "1.0", features = ["std"], default-features = false }
 hyper.workspace = true
+ipnet = { version = "2", default-features = false, features = ["std"] }
 itertools.workspace = true
+moka = { version = "0.12", default-features = false, features = ["sync"] }
 async-recursion = "1.1.1"
 inventory.workspace = true
 tokio-util.workspace = true
@@ -71,6 +73,7 @@ vrl = {workspace = true, optional = true}
 
 [dev-dependencies]
 assert_matches = { version = "1.5" }
+rstest = "0.24.0"
 vrl.workspace = true
 regex = "1"
 serde_urlencoded = "0.7"
