@@ -10790,6 +10790,7 @@ name = "stcp"
 version = "0.1.0"
 dependencies = [
  "bytes 1.9.0",
+ "chrono",
  "hex",
  "indexmap 2.7.0",
  "inventory",
