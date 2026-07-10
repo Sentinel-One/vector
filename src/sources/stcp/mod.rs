@@ -94,3 +94,38 @@ impl TcpSource for STcpSource {
     }
 }
 
+#[cfg(test)]
+async fn start_stcp(config: STcpConfig) -> impl futures::Stream<Item = Event> + Unpin {
+    use crate::event::EventStatus;
+    use crate::test_util::wait_for_tcp;
+    use vector_lib::net::SocketListenAddr;
+
+    let addr = match config.address {
+        SocketListenAddr::SocketAddr(a) => a,
+        _ => panic!("expected SocketAddr in test config"),
+    };
+    let (sender, recv) = crate::SourceSender::new_test_finalize(EventStatus::Delivered);
+    let source = config
+        .build(crate::config::SourceContext::new_test(sender, None))
+        .await
+        .unwrap();
+    tokio::spawn(source);
+    wait_for_tcp(addr).await;
+    recv
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_util::next_addr;
+    use stcp::test_scenarios as s;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_happy_path() {
+        s::test_happy_path(next_addr(), super::start_stcp).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_error_scenarios() {
+        s::test_error_scenarios(next_addr(), super::start_stcp).await;
+    }
+}

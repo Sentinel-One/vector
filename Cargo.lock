@@ -10791,6 +10791,7 @@ version = "0.1.0"
 dependencies = [
  "bytes 1.9.0",
  "chrono",
+ "futures 0.3.31",
  "hex",
  "indexmap 2.7.0",
  "inventory",
@@ -10800,6 +10801,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "snafu 0.7.5",
+ "stcp",
  "tokio",
  "tokio-util",
  "toml",

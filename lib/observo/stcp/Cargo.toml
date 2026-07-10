@@ -31,6 +31,11 @@ inventory.workspace = true
 toml.workspace = true
 chrono.workspace = true
 metrics.workspace = true
+futures.workspace = true
+
+[features]
+test-scenarios = []
 
 [dev-dependencies]
 regex = "1"
+stcp = { path = ".", features = ["test-scenarios"] }
