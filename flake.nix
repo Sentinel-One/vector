@@ -34,11 +34,10 @@
             cue
             gcc
             gawk
-            # mold
             nodejs
             python3
             flex
-          ];
+          ] ++ lib.optionals stdenv.isLinux [ mold ];
           hardeningDisable = [ "fortify" ];
 
           RUSTC_VERSION = overrides.toolchain.channel;

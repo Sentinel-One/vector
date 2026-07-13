@@ -1015,7 +1015,8 @@ observo-test = [
   "observo",
   "scol/test-scenarios",
   "lv3/test-scenarios",
-  "ssa/test-scenarios"
+  "ssa/test-scenarios",
+  "stcp/test-scenarios"
 ]
 
 # End-to-End testing-related features
