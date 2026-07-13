@@ -27,6 +27,7 @@ cfg_if::cfg_if! {
 
         use chrono::Utc;
         use futures::StreamExt;
+        use tracing::Instrument;
         use vector_lib::EstimatedJsonEncodedSizeOf;
         use vector_lib::finalizer::OrderedFinalizer;
         use vector_lib::internal_event::{
@@ -101,7 +102,8 @@ impl Finalizer {
                 OrderedFinalizer::<FinalizerEntry>::new(Some(shutdown.clone()));
 
             // Spawn background task to process acknowledgments and update checkpoints
-            tokio::spawn(async move {
+            tokio::spawn(
+                async move {
                 while let Some((status, entry)) = ack_stream.next().await {
                     if status == BatchStatus::Delivered {
                         if let Err(e) = checkpointer.set_batch(entry.bookmarks.clone()).await {
@@ -123,7 +125,9 @@ impl Finalizer {
                     }
                 }
                 debug!(message = "Acknowledgement stream completed.");
-            });
+                }
+                .in_current_span(),
+            );
 
             Self::Async(finalizer)
         } else {
@@ -361,17 +365,21 @@ impl WindowsEventLogSource {
             }
         };
         let shutdown_watcher = shutdown.clone();
-        tokio::spawn(async move {
-            shutdown_watcher.await;
-            unsafe {
-                let handle =
-                    windows::Win32::Foundation::HANDLE(watcher_handle_raw as *mut std::ffi::c_void);
-                let _ = windows::Win32::System::Threading::SetEvent(handle);
-                if watcher_owns_handle {
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+        tokio::spawn(
+            async move {
+                shutdown_watcher.await;
+                unsafe {
+                    let handle = windows::Win32::Foundation::HANDLE(
+                        watcher_handle_raw as *mut std::ffi::c_void,
+                    );
+                    let _ = windows::Win32::System::Threading::SetEvent(handle);
+                    if watcher_owns_handle {
+                        let _ = windows::Win32::Foundation::CloseHandle(handle);
+                    }
                 }
             }
-        });
+            .in_current_span(),
+        );
 
         // Track when we last flushed checkpoints
         let mut last_checkpoint = std::time::Instant::now();
