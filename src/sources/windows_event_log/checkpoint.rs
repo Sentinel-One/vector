@@ -67,10 +67,10 @@ impl Checkpointer {
         let checkpoint_path = data_dir.join(CHECKPOINT_FILENAME);
 
         // Ensure the data directory exists
-        if let Err(e) = fs::create_dir_all(data_dir).await
-            && e.kind() != ErrorKind::AlreadyExists
-        {
-            return Err(WindowsEventLogError::IoError { source: e });
+        if let Err(e) = fs::create_dir_all(data_dir).await {
+            if e.kind() != ErrorKind::AlreadyExists {
+                return Err(WindowsEventLogError::IoError { source: e });
+            }
         }
 
         // Load existing checkpoint state or create new

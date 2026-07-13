@@ -344,12 +344,12 @@ pub fn build_event(
     }
 
     // Apply event ID filters early
-    if let Some(ref only_ids) = config.only_event_ids
-        && !only_ids.contains(&event_id)
-    {
-        counter!("windows_event_log_events_filtered_total", "reason" => "event_id_not_in_only_list")
-            .increment(1);
-        return Ok(None);
+    if let Some(ref only_ids) = config.only_event_ids {
+        if !only_ids.contains(&event_id) {
+            counter!("windows_event_log_events_filtered_total", "reason" => "event_id_not_in_only_list")
+                .increment(1);
+            return Ok(None);
+        }
     }
 
     if config.ignore_event_ids.contains(&event_id) {
@@ -543,13 +543,12 @@ fn parse_section(
                 }
             }
             Ok(XmlEvent::Text(ref e)) => {
-                if inside_section
-                    && inside_data
-                    && let Ok(text) = e.unescape()
-                {
-                    const MAX_VALUE_SIZE: usize = 1024 * 1024;
-                    if current_data_value.len() + text.len() <= MAX_VALUE_SIZE {
-                        current_data_value.push_str(&text);
+                if inside_section && inside_data {
+                    if let Ok(text) = e.unescape() {
+                        const MAX_VALUE_SIZE: usize = 1024 * 1024;
+                        if current_data_value.len() + text.len() <= MAX_VALUE_SIZE {
+                            current_data_value.push_str(&text);
+                        }
                     }
                 }
             }

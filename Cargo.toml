@@ -712,7 +712,7 @@ sources-utils-net-udp = ["listenfd", "vector-lib/sources-utils-net-udp"]
 sources-utils-net-unix = []
 sources-websocket = ["dep:tokio-tungstenite"]
 sources-wef = ["dep:wef"]
-sources-windows_event_log = ["dep:windows", "dep:quick-xml", "dep:governor"]
+sources-windows_event_log = ["dep:windows", "dep:quick-xml", "dep:governor", "dep:lru"]
 sources-windows_event_log-integration-tests = ["sources-windows_event_log"]
 
 sources-vector = ["dep:prost", "dep:tonic", "dep:jsonwebtoken", "dep:arc-swap", "protobuf-build"]

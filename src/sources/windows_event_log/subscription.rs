@@ -656,15 +656,15 @@ impl EventLogSubscription {
                             // the expensive resolve_event_metadata / format_event_message
                             // calls. This guarantees improved performance even when
                             // XPath-level filtering is not applied (e.g. large ID lists).
-                            if let Some(ref only_ids) = self.config.only_event_ids
-                                && !only_ids.contains(&system_fields.event_id)
-                            {
-                                counter!("windows_event_log_events_filtered_total", "reason" => "event_id_prefilter")
-                                    .increment(1);
-                                unsafe {
-                                    let _ = EvtClose(event_handle);
+                            if let Some(ref only_ids) = self.config.only_event_ids {
+                                if !only_ids.contains(&system_fields.event_id) {
+                                    counter!("windows_event_log_events_filtered_total", "reason" => "event_id_prefilter")
+                                        .increment(1);
+                                    unsafe {
+                                        let _ = EvtClose(event_handle);
+                                    }
+                                    continue;
                                 }
-                                continue;
                             }
                             if self
                                 .config
@@ -1054,27 +1054,29 @@ pub(super) fn build_xpath_query(
     }
 
     // Generate XPath from only_event_ids if present and non-empty.
-    if let Some(ref ids) = config.only_event_ids
-        && !ids.is_empty()
-    {
-        let query = if ids.len() == 1 {
-            format!("*[System[EventID={}]]", ids[0])
-        } else {
-            let predicates: Vec<String> = ids.iter().map(|id| format!("EventID={id}")).collect();
-            format!("*[System[{}]]", predicates.join(" or "))
-        };
+    if let Some(ref ids) = config.only_event_ids {
+        if !ids.is_empty() {
+            let query = if ids.len() == 1 {
+                format!("*[System[EventID={}]]", ids[0])
+            } else {
+                let predicates: Vec<String> =
+                    ids.iter().map(|id| format!("EventID={id}")).collect();
+                format!("*[System[{}]]", predicates.join(" or "))
+            };
 
-        if query.len() <= XPATH_MAX_LENGTH {
-            return Ok(query);
+            if query.len() <= XPATH_MAX_LENGTH {
+                return Ok(query);
+            }
+            // Query too long — fall back to wildcard and rely on
+            // the in-process filter in build_event().
+            warn!(
+                message =
+                    "Generated XPath query exceeds maximum length, falling back to wildcard.",
+                query_len = query.len(),
+                max_len = XPATH_MAX_LENGTH,
+                num_event_ids = ids.len(),
+            );
         }
-        // Query too long — fall back to wildcard and rely on
-        // the in-process filter in build_event().
-        warn!(
-            message = "Generated XPath query exceeds maximum length, falling back to wildcard.",
-            query_len = query.len(),
-            max_len = XPATH_MAX_LENGTH,
-            num_event_ids = ids.len(),
-        );
     }
 
     Ok("*".to_string())

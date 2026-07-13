@@ -1,11 +1,8 @@
 use metrics::counter;
 use tracing::error;
-use vector_lib::{
-    NamedInternalEvent,
-    internal_event::{InternalEvent, error_stage, error_type},
-};
+use vector_lib::internal_event::{InternalEvent, error_stage, error_type};
 
-#[derive(Debug, NamedInternalEvent)]
+#[derive(Debug)]
 pub struct WindowsEventLogParseError {
     pub error: String,
     pub channel: String,
@@ -13,6 +10,10 @@ pub struct WindowsEventLogParseError {
 }
 
 impl InternalEvent for WindowsEventLogParseError {
+    fn name(&self) -> Option<&'static str> {
+        Some("WindowsEventLogParseError")
+    }
+
     fn emit(self) {
         error!(
             message = "Failed to parse Windows Event Log event.",
@@ -34,7 +35,7 @@ impl InternalEvent for WindowsEventLogParseError {
     }
 }
 
-#[derive(Debug, NamedInternalEvent)]
+#[derive(Debug)]
 pub struct WindowsEventLogQueryError {
     pub channel: String,
     pub query: Option<String>,
@@ -42,6 +43,10 @@ pub struct WindowsEventLogQueryError {
 }
 
 impl InternalEvent for WindowsEventLogQueryError {
+    fn name(&self) -> Option<&'static str> {
+        Some("WindowsEventLogQueryError")
+    }
+
     fn emit(self) {
         error!(
             message = "Failed to query Windows Event Log.",
@@ -63,13 +68,17 @@ impl InternalEvent for WindowsEventLogQueryError {
     }
 }
 
-#[derive(Debug, NamedInternalEvent)]
+#[derive(Debug)]
 pub struct WindowsEventLogBookmarkError {
     pub channel: String,
     pub error: String,
 }
 
 impl InternalEvent for WindowsEventLogBookmarkError {
+    fn name(&self) -> Option<&'static str> {
+        Some("WindowsEventLogBookmarkError")
+    }
+
     fn emit(self) {
         error!(
             message = "Failed to save bookmark for Windows Event Log channel.",
