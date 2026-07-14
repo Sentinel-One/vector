@@ -39,3 +39,4 @@ test-scenarios = []
 [dev-dependencies]
 regex = "1"
 stcp = { path = ".", features = ["test-scenarios"] }
+rstest = "0.24.0"
