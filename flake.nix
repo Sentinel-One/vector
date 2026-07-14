@@ -37,6 +37,7 @@
             nodejs
             python3
             flex
+            gh
           ] ++ lib.optionals stdenv.isLinux [ mold ];
           hardeningDisable = [ "fortify" ];
 
