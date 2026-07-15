@@ -125,6 +125,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_happy_path_default() {
+        s::test_happy_path_default(next_addr(), super::start_stcp).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_error_scenarios() {
         s::test_error_scenarios(next_addr(), super::start_stcp).await;
     }
