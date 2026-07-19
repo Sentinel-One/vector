@@ -67,6 +67,7 @@ use crate::{
     shutdown::ShutdownSignal,
     SourceSender,
 };
+use crate::sources::kafka::BuildError::EmptyTopicsError;
 
 #[derive(Debug, Snafu)]
 enum BuildError {
@@ -79,6 +80,8 @@ enum BuildError {
     CreateError { source: rdkafka::error::KafkaError },
     #[snafu(display("Could not subscribe to Kafka topics: {}", source))]
     SubscribeError { source: rdkafka::error::KafkaError },
+    #[snafu(display("At least one Kafka topic must be specified in `topics`"))]
+    EmptyTopicsError,
 }
 
 /// Metrics (beta) configuration.
@@ -342,6 +345,10 @@ impl SourceConfig for KafkaSourceConfig {
                     session_timeout_ms: self.session_timeout_ms
                 }
             );
+        }
+
+        if self.topics.is_empty() {
+            return Err(EmptyTopicsError.into());
         }
 
         let (consumer, callback_rx) = create_consumer(self, acknowledgements)?;
@@ -1532,6 +1539,21 @@ mod test {
             ..make_config("topic", "group", LogNamespace::Legacy, None)
         };
         assert!(create_consumer(&config, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn build_rejects_empty_topics() {
+        let config = KafkaSourceConfig {
+            topics: vec![],
+            ..make_config("topic", "group", LogNamespace::Legacy, None)
+        };
+        let (sender, _recv) = SourceSender::new_test();
+        let cx = SourceContext::new_test(sender, None);
+        let error = config.build(cx).await.err().expect("expected build to fail");
+        assert!(
+            error.to_string().contains("topics"),
+            "unexpected error: {error}"
+        );
     }
 }
 
