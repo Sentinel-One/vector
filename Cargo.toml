@@ -193,7 +193,7 @@ vector-lib = { path = "lib/vector-lib", default-features = false, features = ["v
 vector-config = { path = "lib/vector-config" }
 vector-config-common = { path = "lib/vector-config-common" }
 vector-config-macros = { path = "lib/vector-config-macros" }
-vrl = { git = "https://github.com/Observo-Inc/vrl.git", rev = "f75c70c8dffc0874666f4998126a729b151a403c", features = ["arbitrary", "cli", "test", "test_framework"] }
+vrl = { git = "https://github.com/Observo-Inc/vrl.git", rev = "0b7ee95b6b4b4b0855553cee121f918655e24510", features = ["arbitrary", "cli", "test", "test_framework"] }
 wasserglas = { version = "0.1.0" }
 tracing = { version = "0.1.34", default-features = false }
 dyn-clone = { version = "1.0.17", default-features = false }
