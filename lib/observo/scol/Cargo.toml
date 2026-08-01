@@ -27,7 +27,7 @@ vector-config = { path = "../../vector-config", default-features = false }
 vector-config-macros = { path = "../../vector-config-macros", default-features = false }
 vector-core = { path = "../../vector-core", default-features = false }
 vector-lib = { path = "../../vector-lib", default-features = false, features = ["lua", "observo"] }
-sauth = { path = "../sauth", features = ["jwt-bearer"] }
+sauth = { path = "../sauth" }
 base64 = "0.13.1"
 async-channel = { version = "2.3.1" }
 serde_with.workspace = true
