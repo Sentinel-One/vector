@@ -9953,6 +9953,7 @@ dependencies = [
 name = "sauth"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "headers 0.3.9",
  "http 0.2.9",
  "http 1.1.0",
@@ -9967,12 +9968,14 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "regex",
+ "reqwest 0.11.26",
  "rstest",
  "sauth",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "serde_with",
+ "smpl_jwt",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
