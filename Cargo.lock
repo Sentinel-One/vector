@@ -9953,13 +9953,13 @@ dependencies = [
 name = "sauth"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "headers 0.3.9",
  "http 0.2.9",
  "http 1.1.0",
  "hyper 0.14.28",
  "hyper-util",
  "itertools 0.14.0",
+ "jsonwebtoken",
  "oauth2 5.0.0",
  "oxide-auth",
  "oxide-auth-poem",
@@ -9975,7 +9975,6 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "serde_with",
- "smpl_jwt",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
