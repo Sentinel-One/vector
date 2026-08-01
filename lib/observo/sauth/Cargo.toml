@@ -38,12 +38,16 @@ rand.workspace = true
 url = { workspace = true, optional = true }
 # this is a hack to enable tracing in hyper-util (debugging can be difficult without this)
 hyper-util = { version = "0.1.10", optional = true, features = ["full"] }
+smpl_jwt = { version = "0.8.0", default-features = false, optional = true }
+reqwest = { version = "0.11", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+base64 = { version = "0.22", optional = true }
 
 [features]
 default = []
+jwt-bearer = ["dep:smpl_jwt", "dep:reqwest"]
 test-support = ["dep:thiserror", "dep:poem", "dep:poem-derive", "dep:oxide-auth",
   "dep:oxide-auth-poem", "dep:tempfile", "dep:rcgen", "dep:serde_urlencoded", "dep:url",
-  "dep:hyper-util"]
+  "dep:hyper-util", "dep:base64"]
 
 [dev-dependencies]
 sauth = {features = ["test-support"], path = "."}
