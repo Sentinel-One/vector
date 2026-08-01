@@ -35,7 +35,7 @@ serde_json.workspace = true
 toml.workspace = true
 hyper.workspace = true
 rand.workspace = true
-url = { workspace = true, optional = true }
+url.workspace = true
 # this is a hack to enable tracing in hyper-util (debugging can be difficult without this)
 hyper-util = { version = "0.1.10", optional = true, features = ["full"] }
 jsonwebtoken.workspace = true
@@ -44,7 +44,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 [features]
 default = []
 test-support = ["dep:thiserror", "dep:poem", "dep:poem-derive", "dep:oxide-auth",
-  "dep:oxide-auth-poem", "dep:tempfile", "dep:rcgen", "dep:serde_urlencoded", "dep:url",
+  "dep:oxide-auth-poem", "dep:tempfile", "dep:rcgen", "dep:serde_urlencoded",
   "dep:hyper-util"]
 
 [dev-dependencies]
