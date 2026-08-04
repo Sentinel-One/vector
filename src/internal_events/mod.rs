@@ -136,12 +136,6 @@ mod unix;
 #[cfg(any(feature = "sources-websocket", feature = "sinks-websocket"))]
 mod websocket;
 
-#[cfg(any(
-    feature = "sources-file",
-    feature = "sources-kubernetes_logs",
-    feature = "sinks-file",
-))]
-mod file;
 #[cfg(all(windows, feature = "sources-windows_event_log"))]
 mod windows_event_log;
 mod windows;
