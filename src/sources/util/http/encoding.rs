@@ -6,7 +6,7 @@ use warp::{filters::BoxedFilter, Filter};
 
 use super::error::ErrorMessage;
 use crate::internal_events::HttpDecompressError;
-use vector_common::decompression::{
+use crate::sources::util::decompression::{
     is_decompressed_size_limit_error, max_decompressed_size_bytes, CappedDecoder,
 };
 

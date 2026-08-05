@@ -2688,7 +2688,7 @@ mod decompression_caps {
             .decode(&Some("gzip".to_owned()), gzip_bomb(), "/api/v2/logs")
             .expect_err("a body inflating past the cap must be rejected");
 
-        assert_eq!(error.status_code(), http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
@@ -2697,7 +2697,7 @@ mod decompression_caps {
             .decode(&Some("deflate".to_owned()), zlib_bomb(), "/api/v2/logs")
             .expect_err("a body inflating past the cap must be rejected");
 
-        assert_eq!(error.status_code(), http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// Stacking encodings used to multiply the amplification. Capping each round bounds the chain,
@@ -2721,7 +2721,7 @@ mod decompression_caps {
             )
             .expect_err("a stacked chain inflating past the cap must be rejected");
 
-        assert_eq!(error.status_code(), http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// Level 1 keeps each frame's declared window well under the RFC 9659 8 MiB ceiling that
@@ -2739,7 +2739,7 @@ mod decompression_caps {
             .decode(&Some("zstd".to_owned()), Bytes::from(bomb), "/api/v2/logs")
             .expect_err("a body inflating past the cap must be rejected");
 
-        assert_eq!(error.status_code(), http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// A realistic agent frame must still decode: the 8 MiB window clamp must not reject ordinary
@@ -2754,6 +2754,21 @@ mod decompression_caps {
             .expect("a body within the cap must decode");
 
         assert_eq!(decoded, Bytes::from_static(payload));
+    }
+
+    /// Malformed input must stay a 422, distinct from the 413 the cap raises — otherwise the
+    /// size tests above could be passing for the wrong reason.
+    #[test]
+    fn malformed_payload_is_422_not_413() {
+        let error = test_source()
+            .decode(
+                &Some("gzip".to_owned()),
+                Bytes::from_static(b"not gzip at all"),
+                "/api/v2/logs",
+            )
+            .expect_err("malformed input must be rejected");
+
+        assert_eq!(error.status_code(), http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// The cap must not disturb ordinary traffic.

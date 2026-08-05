@@ -33,7 +33,9 @@ use snafu::Snafu;
 use tokio::net::TcpStream;
 use tower::ServiceBuilder;
 use tracing::Span;
-use vector_common::decompression::CappedDecoder;
+use crate::sources::util::decompression::{
+    is_decompressed_size_limit_error, max_decompressed_size_bytes, CappedDecoder,
+};
 use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
 use vector_lib::config::{LegacyKey, LogNamespace};
 use vector_lib::configurable::configurable_component;
@@ -540,7 +542,19 @@ pub(crate) async fn handle_request(
     }
 }
 
-fn handle_decode_error(encoding: &str, error: impl std::error::Error) -> ErrorMessage {
+fn handle_decode_error(encoding: &str, error: std::io::Error) -> ErrorMessage {
+    // A size-cap trip is an oversized-request client fault, so report it as 413 with the limit
+    // that was enforced, matching the shared HTTP decoder. Anything else is malformed input (422).
+    if is_decompressed_size_limit_error(&error) {
+        return ErrorMessage::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Decompressed {} body exceeds limit of {} bytes.",
+                encoding,
+                max_decompressed_size_bytes()
+            ),
+        );
+    }
     emit!(HttpDecompressError {
         encoding,
         error: &error

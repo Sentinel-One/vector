@@ -22,7 +22,12 @@ mod query;
 
 #[cfg(feature = "sources-utils-http-auth")]
 pub use auth::{HttpSourceAuth, HttpSourceAuthConfig};
-#[cfg(feature = "sources-splunk_hec")]
+#[cfg(any(
+    feature = "sources-aws_kinesis_firehose",
+    feature = "sources-opentelemetry",
+    feature = "sources-splunk_hec",
+    feature = "sources-utils-http-prelude",
+))]
 pub(crate) use encoding::capped_body;
 #[cfg(feature = "sources-utils-http-encoding")]
 pub use encoding::decode;

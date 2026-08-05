@@ -44,7 +44,7 @@ use crate::{
 
 use super::{
     auth::{HttpSourceAuth, HttpSourceAuthConfig},
-    encoding::decode,
+    encoding::{capped_body, decode},
     error::ErrorMessage,
 };
 
@@ -132,7 +132,7 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
                 .and(warp::header::optional::<String>("authorization"))
                 .and(warp::header::optional::<String>("content-encoding"))
                 .and(warp::header::headers_cloned())
-                .and(warp::body::bytes())
+                .and(capped_body())
                 .and(warp::query::<HashMap<String, String>>())
                 .and(warp::filters::ext::optional())
                 .and_then(

@@ -20,7 +20,6 @@ use snafu::Snafu;
 use tokio::net::TcpStream;
 use tower::ServiceBuilder;
 use tracing::Span;
-use vector_common::decompression::CappedDecoder;
 use vector_lib::internal_event::{CountByteSize, InternalEventHandle as _, Registered};
 use vector_lib::lookup::lookup_v2::OptionalValuePath;
 use vector_lib::lookup::{self, event_path, owned_value_path};
@@ -53,8 +52,10 @@ use crate::{
         EventsReceived, HttpBytesReceived, SplunkHecRequestBodyInvalidError, SplunkHecRequestError,
     },
     serde::bool_or_struct,
-    sources::util::{handle_accept_error, http::capped_body, http::ErrorMessage},
     source_sender::ClosedError,
+    sources::util::{
+        decompression::CappedDecoder, handle_accept_error, http::capped_body, http::ErrorMessage,
+    },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
     SourceSender,
 };
@@ -536,10 +537,15 @@ impl SplunkSource {
             .and(path!("ack"))
             .and(self.authorization())
             .and(SplunkSource::required_channel())
-            .and(warp::body::json())
-            .and_then(move |_, channel_id: String, body: HecAckStatusRequest| {
+            // `warp::body::json()` aggregates the whole body unbounded; cap it first and parse the
+            // bytes ourselves. Token auth is optional in config, so this endpoint can be reached
+            // unauthenticated.
+            .and(capped_body())
+            .and_then(move |_, channel_id: String, body: Bytes| {
                 let idx_ack = idx_ack.clone();
                 async move {
+                    let body: HecAckStatusRequest = serde_json::from_slice(&body)
+                        .map_err(|_| Rejection::from(ApiError::BadRequest))?;
                     if let Some(idx_ack) = idx_ack {
                         let ack_statuses = idx_ack
                             .get_acks_status_from_channel(channel_id, &body.acks)
@@ -3051,6 +3057,55 @@ mod tests {
             let raw = post_gzip(address, "services/collector/raw", gzip(b"hello")).await;
             assert_eq!(200, raw.status().as_u16());
         }
+    }
+
+    /// `capped_body()` replaced `warp::body::bytes()` on both HEC handlers. It collects the body
+    /// by streaming chunks rather than letting hyper buffer it in one shot, so it is worth pinning
+    /// that this does not add per-request latency.
+    ///
+    /// Measured at 0-3 ms when this was written; the 100 ms bound is deliberately loose so the
+    /// test catches a systematic regression (a stall waiting on end-of-stream would cost hundreds
+    /// of ms) without tripping on CI scheduling noise. The median is used so one stalled sample
+    /// cannot fail the run.
+    #[tokio::test]
+    async fn capped_body_does_not_add_request_latency() {
+        const SAMPLES: usize = 9;
+        const MAX_MEDIAN: Duration = Duration::from_millis(100);
+
+        let (_source, address) = source(None).await;
+        let client = reqwest::Client::new();
+
+        let post = |client: reqwest::Client, address: SocketAddr| async move {
+            client
+                .post(format!("http://{}/services/collector/event", address))
+                .header("Authorization", format!("Splunk {}", TOKEN))
+                .header("x-splunk-request-channel", "channel")
+                .body(r#"{"event":"hello"}"#)
+                .send()
+                .await
+                .unwrap()
+        };
+
+        // Warm the connection pool so we measure the filter, not TCP setup.
+        assert_eq!(200, post(client.clone(), address).await.status().as_u16());
+
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = std::time::Instant::now();
+            let response = post(client.clone(), address).await;
+            let elapsed = started.elapsed();
+            assert_eq!(200, response.status().as_u16());
+            samples.push(elapsed);
+        }
+
+        samples.sort_unstable();
+        let median = samples[SAMPLES / 2];
+
+        assert!(
+            median < MAX_MEDIAN,
+            "capped_body() added per-request latency: median {median:?} over {SAMPLES} requests \
+             exceeds {MAX_MEDIAN:?} (samples: {samples:?})"
+        );
     }
 
     register_validatable_component!(SplunkConfig);

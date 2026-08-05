@@ -3,6 +3,7 @@
 mod body_decoding;
 #[cfg(feature = "sources-vector")]
 pub mod jwt_auth;
+pub mod decompression;
 mod encoding_config;
 #[cfg(all(unix, feature = "sources-dnstap"))]
 pub mod framestream;

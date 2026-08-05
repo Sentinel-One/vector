@@ -33,6 +33,7 @@ use vector_lib::ipallowlist::IpAllowlistConfig;
 use crate::http::{KeepaliveConfig, MaxConnectionAgeLayer};
 use crate::sources::http_server::HttpConfigParamKind;
 use crate::sources::util::add_headers;
+use crate::sources::util::http::capped_body;
 use crate::sources::util::handle_accept_error;
 use crate::{
     event::Event,
@@ -161,7 +162,7 @@ fn build_warp_log_filter(
         ))
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::headers_cloned())
-        .and(warp::body::bytes())
+        .and(capped_body())
         .and_then(
             move |encoding_header: Option<String>, headers_config: HeaderMap, body: Bytes| {
                 let events = decode(encoding_header.as_deref(), body)
@@ -199,7 +200,7 @@ fn build_warp_metrics_filter(
             "application/x-protobuf",
         ))
         .and(warp::header::optional::<String>("content-encoding"))
-        .and(warp::body::bytes())
+        .and(capped_body())
         .and_then(move |encoding_header: Option<String>, body: Bytes| {
             let events = decode(encoding_header.as_deref(), body).and_then(|body| {
                 bytes_received.emit(ByteSize(body.len()));
@@ -230,7 +231,7 @@ fn build_warp_trace_filter(
             "application/x-protobuf",
         ))
         .and(warp::header::optional::<String>("content-encoding"))
-        .and(warp::body::bytes())
+        .and(capped_body())
         .and_then(move |encoding_header: Option<String>, body: Bytes| {
             let events = decode(encoding_header.as_deref(), body).and_then(|body| {
                 bytes_received.emit(ByteSize(body.len()));

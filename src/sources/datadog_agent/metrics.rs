@@ -14,6 +14,7 @@ use vector_lib::{
     EstimatedJsonEncodedSizeOf,
 };
 
+use crate::sources::util::http::capped_body;
 use crate::{
     common::datadog::{DatadogMetricType, DatadogSeriesMetric},
     config::log_schema,
@@ -69,7 +70,7 @@ fn sketches_service(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::optional::<String>("dd-api-key"))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
+        .and(capped_body())
         .and_then(
             move |path: FullPath,
                   encoding_header: Option<String>,
@@ -107,7 +108,7 @@ fn series_v1_service(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::optional::<String>("dd-api-key"))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
+        .and(capped_body())
         .and_then(
             move |path: FullPath,
                   encoding_header: Option<String>,
@@ -148,7 +149,7 @@ fn series_v2_service(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::optional::<String>("dd-api-key"))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
+        .and(capped_body())
         .and_then(
             move |path: FullPath,
                   encoding_header: Option<String>,

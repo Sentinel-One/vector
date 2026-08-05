@@ -3,12 +3,11 @@ use std::time::Duration;
 use std::{
     collections::{BTreeMap, VecDeque},
     convert::TryFrom,
-    io::{self, Read},
+    io,
 };
 use vector_lib::ipallowlist::IpAllowlistConfig;
 
 use bytes::{Buf, Bytes, BytesMut};
-use flate2::read::ZlibDecoder;
 use smallvec::{smallvec, SmallVec};
 use snafu::{ResultExt, Snafu};
 use tokio_util::codec::Decoder;
@@ -22,6 +21,9 @@ use vector_lib::{
 use vrl::value::kind::Collection;
 use vrl::value::{KeyString, Kind};
 
+use super::util::decompression::{
+    max_decompressed_size_bytes, max_zlib_compressed_frame_size_bytes, CappedDecoder,
+};
 use super::util::net::{SocketListenAddr, TcpSource, TcpSourceAck, TcpSourceAcker};
 use crate::{
     config::{
@@ -654,21 +656,33 @@ fn decode_compressed_frame(
         return Ok(None);
     }
     let payload_size = rest.get_u32() as usize;
+    let limit = max_decompressed_size_bytes();
+
+    // Reject an oversized declared payload before buffering it, so a peer cannot force multi-GB
+    // buffering by advertising a huge length and slow-streaming its bytes. The bound includes
+    // zlib's worst-case expansion so a valid frame whose decompressed content is within `limit`
+    // is never rejected here; the decompressed cap itself is still enforced below.
+    let compressed_limit = max_zlib_compressed_frame_size_bytes();
+    if payload_size > compressed_limit {
+        return Err(DecodeError::DecompressionFailed {
+            source: io::Error::other(format!(
+                "compressed frame payload size {} exceeds limit of {} bytes",
+                payload_size, compressed_limit
+            )),
+        });
+    }
 
     if rest.remaining() < payload_size {
-        src.reserve(payload_size);
         return Ok(None);
     }
 
     let (slice, right) = rest.split_at(payload_size);
     rest = right;
 
-    let mut buf = Vec::new();
-
-    let res = ZlibDecoder::new(io::Cursor::new(slice))
-        .read_to_end(&mut buf)
-        .context(DecompressionFailedSnafu)
-        .map(|_| BytesMut::from(&buf[..]));
+    let res = CappedDecoder::zlib_with_limit(io::Cursor::new(slice), limit)
+        .decompress()
+        .map(|decompressed| BytesMut::from(decompressed.as_slice()))
+        .context(DecompressionFailedSnafu);
 
     let byte_size = bytes_remaining(src, rest);
     src.advance(byte_size);
@@ -903,6 +917,88 @@ mod test {
         .with_event_field(&owned_value_path!("host"), Kind::bytes(), Some("host"));
 
         assert_eq!(definitions, Some(expected_definition))
+    }
+
+    /// OBE-10711: a compressed frame's 4-byte length header was fed straight to `src.reserve()`,
+    /// so six bytes on the wire could commit a multi-gigabyte allocation. The declared length is
+    /// now checked against zlib's worst-case expansion of the decompressed cap first.
+    #[test]
+    fn oversized_declared_frame_is_rejected_before_reserving() {
+        let mut src = BytesMut::new();
+        src.put_u32(u32::MAX);
+        src.put_slice(b"partial");
+
+        let error = decode_compressed_frame(&mut src)
+            .expect_err("a frame declaring more than the cap must be rejected");
+
+        assert!(
+            error.to_string().contains("exceeds limit"),
+            "expected the declared-size guard, got: {error}"
+        );
+    }
+
+    /// A frame whose *compressed* length is legitimate but which inflates past the decompressed
+    /// cap must still be refused — the declared-length guard alone is not enough.
+    #[test]
+    fn decompressed_bomb_is_rejected() {
+        use std::io::Write as _;
+
+        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+
+        assert!(
+            compressed.len() < max_zlib_compressed_frame_size_bytes(),
+            "the bomb must pass the declared-length guard so the decompressed cap is what fires"
+        );
+
+        let mut src = BytesMut::new();
+        src.put_u32(compressed.len() as u32);
+        src.put_slice(&compressed);
+
+        let error = decode_compressed_frame(&mut src)
+            .expect_err("a frame inflating past the cap must be rejected");
+
+        assert!(matches!(error, DecodeError::DecompressionFailed { .. }));
+    }
+
+    /// The caps must not disturb an ordinary compressed frame.
+    #[test]
+    fn ordinary_compressed_frame_is_accepted() {
+        use std::io::Write as _;
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"").unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut src = BytesMut::new();
+        src.put_u32(compressed.len() as u32);
+        src.put_slice(&compressed);
+
+        let frames = decode_compressed_frame(&mut src)
+            .expect("a well-formed frame within the caps must decode");
+
+        assert!(frames.is_some_and(|frames| frames.is_empty()));
+    }
+
+    /// An incomplete frame whose declared length is legitimate must still be treated as "need more
+    /// bytes", not rejected — otherwise the caps would break normal streaming reads.
+    #[test]
+    fn incomplete_frame_within_the_cap_waits_for_more_bytes() {
+        let mut src = BytesMut::new();
+        src.put_u32(64);
+        src.put_slice(b"only a few bytes so far");
+
+        let result = decode_compressed_frame(&mut src)
+            .expect("an incomplete but legitimate frame must not error");
+
+        assert!(result.is_none(), "expected the decoder to await more bytes");
     }
 }
 

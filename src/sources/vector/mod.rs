@@ -24,8 +24,8 @@ use crate::{
     serde::bool_or_struct,
     sources::{
         util::{
-            add_auth_metadata, grpc::run_grpc_server, Auth, AuthConfig, AuthContext, AuthError,
-            AuthEventError, EventValidator,
+            add_auth_metadata, decompression::max_decompressed_size_bytes, grpc::run_grpc_server,
+            Auth, AuthConfig, AuthContext, AuthError, AuthEventError, EventValidator,
         },
         Source,
     },
@@ -366,8 +366,10 @@ impl SourceConfig for VectorConfig {
             auth_metrics,
         })
         .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        // Tonic added a default of 4MB in 0.9. This replaces the old behavior.
-        .max_decoding_message_size(usize::MAX);
+        // Tonic added a default of 4MB in 0.9. Bound this by the global decompressed-size cap
+        // rather than `usize::MAX` so a single oversized message cannot drive unbounded
+        // allocation on this unauthenticated listener.
+        .max_decoding_message_size(max_decompressed_size_bytes());
 
         let source =
             run_grpc_server(self.address, tls_settings, service, cx.shutdown).map_err(|error| {
