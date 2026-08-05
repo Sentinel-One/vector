@@ -38,6 +38,9 @@
             python3
             flex
             gh
+            colima
+            docker
+            docker-compose
           ] ++ lib.optionals stdenv.isLinux [ mold ];
           hardeningDisable = [ "fortify" ];
 
