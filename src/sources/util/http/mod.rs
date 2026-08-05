@@ -22,6 +22,8 @@ mod query;
 
 #[cfg(feature = "sources-utils-http-auth")]
 pub use auth::{HttpSourceAuth, HttpSourceAuthConfig};
+#[cfg(feature = "sources-splunk_hec")]
+pub(crate) use encoding::capped_body;
 #[cfg(feature = "sources-utils-http-encoding")]
 pub use encoding::decode;
 #[cfg(feature = "sources-utils-http-error")]

@@ -1,16 +1,16 @@
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::{Buf, Bytes, BytesMut};
 use chrono::Utc;
-use flate2::read::MultiGzDecoder;
 use rmp_serde::{decode, Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 use tokio_util::codec::Decoder;
+use vector_common::decompression::CappedDecoder;
 use vector_lib::codecs::{BytesDeserializerConfig, StreamDecodingError};
 use vector_lib::config::{LegacyKey, LogNamespace};
 use vector_lib::configurable::configurable_component;
@@ -406,13 +406,9 @@ impl FluentDecoder {
             }
             FluentMessage::PackedForwardWithOptions(tag, bin, options) => {
                 let buf = match options.compressed.as_deref() {
-                    Some("gzip") => {
-                        let mut buf = Vec::new();
-                        MultiGzDecoder::new(io::Cursor::new(bin.into_vec()))
-                            .read_to_end(&mut buf)
-                            .map(|_| buf)
-                            .map_err(Into::into)
-                    }
+                    Some("gzip") => CappedDecoder::gzip(io::Cursor::new(bin.into_vec()))
+                        .decompress()
+                        .map_err(Into::into),
                     Some("text") | None => Ok(bin.into_vec()),
                     Some(s) => Err(DecodeError::UnknownCompression(s.to_owned())),
                 }?;
@@ -849,6 +845,46 @@ mod tests {
         assert_event_data_eq!(got.0[0], expected[0]);
         assert_event_data_eq!(got.0[1], expected[1]);
         assert_event_data_eq!(got.0[2], expected[2]);
+    }
+
+    /// OBE-11233 / OBE-10708: `CompressedPackedForward` inflated the client's gzip payload with an
+    /// unbounded `read_to_end`, so a small frame could drive an arbitrarily large allocation.
+    ///
+    /// `MultiGzDecoder` walks every concatenated member, so repeating one cheap member past the cap
+    /// is enough to exceed it — no single oversized member required.
+    #[test]
+    fn compressed_packed_forward_decompression_is_capped() {
+        use std::collections::BTreeMap;
+        use std::io::Write as _;
+
+        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        let member = encoder.finish().unwrap();
+
+        let mut bomb = Vec::new();
+        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            bomb.extend_from_slice(&member);
+        }
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+            bomb.len()
+        );
+
+        let options = BTreeMap::from([("compressed", "gzip")]);
+        let message = rmp_serde::to_vec(&("tag.name", serde_bytes::ByteBuf::from(bomb), options))
+            .expect("failed to build the fluent frame");
+
+        let error =
+            decode_all(message).expect_err("a payload inflating past the cap must be rejected");
+
+        assert!(matches!(error, DecodeError::IO(_)), "got {error:?}");
+        assert!(
+            !error.can_continue(),
+            "an oversized frame must drop the connection rather than be retried"
+        );
     }
 
     fn decode_all(message: Vec<u8>) -> Result<(SmallVec<[Event; 1]>, usize), DecodeError> {

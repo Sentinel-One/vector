@@ -236,6 +236,45 @@ pub struct RootOpts {
     /// `--watch-config`.
     #[arg(long, env = "VECTOR_ALLOW_EMPTY_CONFIG", default_value = "false")]
     pub allow_empty_config: bool,
+
+    /// Maximum number of bytes allowed after decompressing a payload.
+    ///
+    /// Sources that decompress incoming payloads (gzip, deflate, zstd) enforce this cap to
+    /// prevent a compressed "bomb" from exhausting memory. Payloads whose decompressed size
+    /// exceeds the limit are rejected.
+    ///
+    /// Defaults to 104857600 (100 MiB). Raise this only when sources routinely receive
+    /// legitimately large compressed payloads.
+    ///
+    /// Must be at least 1024; a cap below that would reject essentially all traffic rather than
+    /// just bombs.
+    #[arg(
+        long,
+        env = "VECTOR_MAX_DECOMPRESSED_SIZE_BYTES",
+        default_value_t = vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES,
+        value_parser = parse_max_decompressed_size_bytes,
+    )]
+    pub max_decompressed_size_bytes: usize,
+}
+
+/// Lower bound for `--max-decompressed-size-bytes`.
+///
+/// Guards against a value (notably `0`) that would silently reject all compressed ingestion, which
+/// looks identical to a broken pipeline from the outside.
+const MIN_MAX_DECOMPRESSED_SIZE_BYTES: usize = 1024;
+
+fn parse_max_decompressed_size_bytes(raw: &str) -> Result<usize, String> {
+    let value: usize = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a valid number of bytes"))?;
+
+    if value < MIN_MAX_DECOMPRESSED_SIZE_BYTES {
+        return Err(format!(
+            "must be at least {MIN_MAX_DECOMPRESSED_SIZE_BYTES} bytes, got {value}"
+        ));
+    }
+
+    Ok(value)
 }
 
 impl RootOpts {
@@ -262,6 +301,10 @@ impl RootOpts {
         }
 
         crate::metrics::init_global().expect("metrics initialization failed");
+
+        vector_common::decompression::set_max_decompressed_size_bytes(
+            self.max_decompressed_size_bytes,
+        );
     }
 }
 
@@ -394,4 +437,50 @@ pub fn handle_config_errors(errors: Vec<String>) -> exitcode::ExitCode {
     }
 
     exitcode::CONFIG
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_decompressed_size_accepts_reasonable_values() {
+        assert_eq!(
+            parse_max_decompressed_size_bytes("104857600"),
+            Ok(104_857_600)
+        );
+        assert_eq!(
+            parse_max_decompressed_size_bytes("1024"),
+            Ok(MIN_MAX_DECOMPRESSED_SIZE_BYTES)
+        );
+    }
+
+    /// A zero (or near-zero) cap would reject essentially all compressed ingestion while looking
+    /// like a silently broken pipeline, so it must fail loudly at startup instead.
+    #[test]
+    fn max_decompressed_size_rejects_values_below_the_floor() {
+        for raw in ["0", "1", "512", "1023"] {
+            assert!(
+                parse_max_decompressed_size_bytes(raw).is_err(),
+                "{raw} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn max_decompressed_size_rejects_non_numeric() {
+        assert!(parse_max_decompressed_size_bytes("100MiB").is_err());
+        assert!(parse_max_decompressed_size_bytes("-1").is_err());
+        assert!(parse_max_decompressed_size_bytes("").is_err());
+    }
+
+    /// The clap default must track the constant the decompression module actually enforces.
+    #[test]
+    fn cli_default_matches_the_enforced_default() {
+        let opts = RootOpts::parse_from(["vector"]);
+        assert_eq!(
+            opts.max_decompressed_size_bytes,
+            vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
+        );
+    }
 }
