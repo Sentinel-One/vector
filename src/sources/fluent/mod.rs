@@ -35,7 +35,20 @@ use crate::{
 };
 
 mod message;
+mod scan;
 use self::message::{FluentEntry, FluentMessage, FluentRecord, FluentTag, FluentTimestamp};
+use self::scan::{scan_msgpack_frame, MAX_MSGPACK_DEPTH};
+
+/// Default ceiling on concurrent connections to the (unauthenticated) fluent listener.
+const fn default_connection_limit() -> Option<u32> {
+    Some(1024)
+}
+
+/// Maximum number of entries decoded from a single frame.
+///
+/// A frame within the byte cap can still carry a very large number of tiny entries, each of which
+/// becomes an `Event`; this bounds the burst that one frame can turn into.
+const MAX_ENTRIES_PER_FRAME: usize = 100_000;
 
 /// Configuration for the `fluent` source.
 #[configurable_component(source("fluent", "Collect logs from a Fluentd or Fluent Bit agent."))]
@@ -45,8 +58,20 @@ pub struct FluentConfig {
     address: SocketListenAddr,
 
     /// The maximum number of TCP connections that are allowed at any given time.
+    ///
+    /// Defaults to a finite value: the source is unauthenticated, so an unlimited connection
+    /// count lets a peer multiply any per-connection memory cost without bound.
     #[configurable(metadata(docs::type_unit = "connections"))]
+    #[serde(default = "default_connection_limit")]
     connection_limit: Option<u32>,
+
+    /// The maximum size, in bytes, of a single MessagePack frame buffered while waiting for a
+    /// complete message.
+    ///
+    /// Defaults to the global `--max-decompressed-size-bytes` limit.
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    max_frame_bytes: Option<usize>,
 
     #[configurable(derived)]
     keepalive: Option<TcpKeepaliveConfig>,
@@ -83,7 +108,8 @@ impl GenerateConfig for FluentConfig {
             tls: None,
             receive_buffer_bytes: None,
             acknowledgements: Default::default(),
-            connection_limit: Some(2),
+            connection_limit: default_connection_limit(),
+            max_frame_bytes: None,
             log_namespace: None,
         })
         .unwrap()
@@ -95,7 +121,7 @@ impl GenerateConfig for FluentConfig {
 impl SourceConfig for FluentConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
-        let source = FluentSource::new(log_namespace);
+        let source = FluentSource::new(log_namespace, self.max_frame_bytes);
         let shutdown_secs = Duration::from_secs(30);
         let tls_config = self.tls.as_ref().map(|tls| tls.tls_config.clone());
         let tls_client_metadata_key = self
@@ -213,13 +239,15 @@ impl FluentConfig {
 struct FluentSource {
     log_namespace: LogNamespace,
     legacy_host_key_path: Option<OwnedValuePath>,
+    max_frame_bytes: Option<usize>,
 }
 
 impl FluentSource {
-    fn new(log_namespace: LogNamespace) -> Self {
+    fn new(log_namespace: LogNamespace, max_frame_bytes: Option<usize>) -> Self {
         Self {
             log_namespace,
             legacy_host_key_path: log_schema().host_key().cloned(),
+            max_frame_bytes,
         }
     }
 }
@@ -231,7 +259,7 @@ impl TcpSource for FluentSource {
     type Acker = FluentAcker;
 
     fn decoder(&self) -> Self::Decoder {
-        FluentDecoder::new(self.log_namespace)
+        FluentDecoder::new(self.log_namespace, self.max_frame_bytes)
     }
 
     fn handle_events(&self, events: &mut [Event], host: SocketAddr) {
@@ -263,12 +291,32 @@ pub enum DecodeError {
     IO(io::Error),
     Decode(decode::Error),
     UnknownCompression(String),
-    UnexpectedValue(rmpv::Value),
     /// The buffered frame grew past the maximum allowed size before a complete message could be
     /// decoded. Bounds memory when a peer declares an oversized msgpack array/map/string and
     /// streams the bytes to force unbounded buffering.
     FrameTooLarge {
         size: usize,
+        max: usize,
+    },
+    /// The frame nests deeper than `rmp_serde` can safely recurse over. Nesting costs one byte per
+    /// level, so a byte-size cap cannot bound it.
+    FrameTooDeep {
+        depth: usize,
+        max: usize,
+    },
+    /// The frame declares a string/binary length or element count that no frame within the size
+    /// cap could satisfy.
+    DeclaredLengthTooLarge {
+        len: usize,
+        max: usize,
+    },
+    /// A marker byte that is never valid MessagePack.
+    InvalidMarker {
+        marker: u8,
+    },
+    /// One frame decoded into more entries than a single frame is allowed to produce.
+    TooManyEntries {
+        count: usize,
         max: usize,
     },
 }
@@ -281,14 +329,35 @@ impl std::fmt::Display for DecodeError {
             DecodeError::UnknownCompression(compression) => {
                 write!(f, "unknown compression: {}", compression)
             }
-            DecodeError::UnexpectedValue(value) => {
-                write!(f, "unexpected msgpack value, ignoring: {}", value)
-            }
             DecodeError::FrameTooLarge { size, max } => {
                 write!(
                     f,
                     "fluent frame exceeds maximum size before decoding: {} bytes buffered, limit is {} bytes",
                     size, max
+                )
+            }
+            DecodeError::FrameTooDeep { depth, max } => {
+                write!(
+                    f,
+                    "fluent frame nests too deeply: depth {} exceeds limit of {}",
+                    depth, max
+                )
+            }
+            DecodeError::DeclaredLengthTooLarge { len, max } => {
+                write!(
+                    f,
+                    "fluent frame declares a length of {} bytes, beyond the {} byte limit",
+                    len, max
+                )
+            }
+            DecodeError::InvalidMarker { marker } => {
+                write!(f, "invalid msgpack marker byte {:#04x}", marker)
+            }
+            DecodeError::TooManyEntries { count, max } => {
+                write!(
+                    f,
+                    "fluent frame decodes to {} entries, beyond the limit of {}",
+                    count, max
                 )
             }
         }
@@ -301,10 +370,13 @@ impl StreamDecodingError for DecodeError {
             DecodeError::IO(_) => false,
             DecodeError::Decode(_) => true,
             DecodeError::UnknownCompression(_) => true,
-            DecodeError::UnexpectedValue(_) => true,
-            // An oversized partial frame has no framing boundary to resync on, so the connection
-            // must be dropped rather than re-decoded in a loop.
-            DecodeError::FrameTooLarge { .. } => false,
+            // A structurally hostile or oversized partial frame has no framing boundary to
+            // resync on, so the connection must be dropped rather than re-decoded in a loop.
+            DecodeError::FrameTooLarge { .. }
+            | DecodeError::FrameTooDeep { .. }
+            | DecodeError::DeclaredLengthTooLarge { .. }
+            | DecodeError::InvalidMarker { .. }
+            | DecodeError::TooManyEntries { .. } => false,
         }
     }
 }
@@ -331,11 +403,23 @@ struct FluentDecoder {
 }
 
 impl FluentDecoder {
-    fn new(log_namespace: LogNamespace) -> Self {
+    fn new(log_namespace: LogNamespace, max_frame_bytes: Option<usize>) -> Self {
         Self {
             log_namespace,
-            max_frame_size: max_decompressed_size_bytes(),
+            max_frame_size: max_frame_bytes.unwrap_or_else(max_decompressed_size_bytes),
         }
+    }
+
+    /// Bounds how many events one frame may expand into. A frame within the byte cap can still
+    /// carry a very large number of tiny entries.
+    fn ensure_entry_count(count: usize) -> Result<(), DecodeError> {
+        if count > MAX_ENTRIES_PER_FRAME {
+            return Err(DecodeError::TooManyEntries {
+                count,
+                max: MAX_ENTRIES_PER_FRAME,
+            });
+        }
+        Ok(())
     }
 
     fn handle_message(
@@ -373,6 +457,7 @@ impl FluentDecoder {
                 Ok(Some((frame, byte_size)))
             }
             FluentMessage::Forward(tag, entries) => {
+                Self::ensure_entry_count(entries.len())?;
                 let events = entries
                     .into_iter()
                     .map(|FluentEntry(timestamp, record)| {
@@ -391,6 +476,7 @@ impl FluentDecoder {
                 Ok(Some((frame, byte_size)))
             }
             FluentMessage::ForwardWithOptions(tag, entries, options) => {
+                Self::ensure_entry_count(entries.len())?;
                 let events = entries
                     .into_iter()
                     .map(|FluentEntry(timestamp, record)| {
@@ -415,6 +501,7 @@ impl FluentDecoder {
                 while let Some(FluentEntry(timestamp, record)) =
                     FluentEntryStreamDecoder.decode(&mut buf)?
                 {
+                    Self::ensure_entry_count(events.len() + 1)?;
                     events.push(Event::from(FluentEvent {
                         tag: tag.clone(),
                         timestamp,
@@ -443,6 +530,7 @@ impl FluentDecoder {
                 while let Some(FluentEntry(timestamp, record)) =
                     FluentEntryStreamDecoder.decode(&mut buf)?
                 {
+                    Self::ensure_entry_count(events.len() + 1)?;
                     events.push(Event::from(FluentEvent {
                         tag: tag.clone(),
                         timestamp,
@@ -456,8 +544,7 @@ impl FluentDecoder {
                 };
                 Ok(Some((frame, byte_size)))
             }
-            FluentMessage::Heartbeat(rmpv::Value::Nil) => Ok(None),
-            FluentMessage::Heartbeat(value) => Err(DecodeError::UnexpectedValue(value)),
+            FluentMessage::Heartbeat(()) => Ok(None),
         }
     }
 }
@@ -471,6 +558,12 @@ impl Decoder for FluentDecoder {
             if src.is_empty() {
                 return Ok(None);
             }
+
+            // Reject structurally hostile frames before `rmp_serde` recurses over them. Nesting
+            // costs one byte per level on the wire, so `max_frame_size` cannot bound recursion
+            // depth on its own. Truncation is not an error here: the `UnexpectedEof` path below
+            // still asks for more bytes.
+            scan_msgpack_frame(&src[..], MAX_MSGPACK_DEPTH, self.max_frame_size)?;
 
             let (byte_size, res) = {
                 let mut des = Deserializer::new(io::Cursor::new(&src[..]));
@@ -530,6 +623,10 @@ impl Decoder for FluentEntryStreamDecoder {
         if src.is_empty() {
             return Ok(None);
         }
+
+        // The entries inside a `PackedForward` payload are attacker-controlled too — the gzip cap
+        // bounds their size but not their nesting depth.
+        scan_msgpack_frame(&src[..], MAX_MSGPACK_DEPTH, max_decompressed_size_bytes())?;
         let (byte_size, res) = {
             let mut des = Deserializer::new(io::Cursor::new(&src[..]));
 
@@ -890,7 +987,7 @@ mod tests {
         // 4 bytes provided: a valid, incomplete frame.
         let partial: Vec<u8> = vec![0x92, 0xb0, b't', b'a', b'g'];
         let mut buf = BytesMut::from(&partial[..]);
-        let mut decoder = FluentDecoder::new(LogNamespace::default());
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
 
         assert!(matches!(decoder.decode(&mut buf), Ok(None)));
         // The buffer is retained so more bytes can complete the frame.
@@ -925,6 +1022,121 @@ mod tests {
         );
         // A frame-too-large error must terminate the connection.
         assert!(!error.can_continue());
+    }
+
+    /// OBE-11233: the report asks for a per-source frame cap rather than only a global one.
+    #[test]
+    fn max_frame_bytes_config_overrides_the_global_cap() {
+        let decoder = FluentDecoder::new(LogNamespace::default(), Some(4096));
+        assert_eq!(decoder.max_frame_size, 4096);
+
+        let default = FluentDecoder::new(LogNamespace::default(), None);
+        assert_eq!(default.max_frame_size, max_decompressed_size_bytes());
+    }
+
+    /// OBE-11233: the listener is unauthenticated, so an unlimited connection count multiplies
+    /// every per-connection cost.
+    #[test]
+    fn connection_limit_defaults_to_a_finite_value() {
+        let config: FluentConfig = toml::from_str(r#"address = "0.0.0.0:24224""#).unwrap();
+        assert_eq!(config.connection_limit, default_connection_limit());
+        assert!(config.connection_limit.is_some());
+    }
+
+    /// OBE-11233: a frame within the byte cap can still carry a huge number of tiny entries.
+    #[test]
+    fn entry_count_beyond_the_limit_is_rejected() {
+        let error = FluentDecoder::ensure_entry_count(MAX_ENTRIES_PER_FRAME + 1)
+            .expect_err("a frame decoding to too many entries must be rejected");
+
+        assert!(matches!(error, DecodeError::TooManyEntries { .. }));
+        assert!(!error.can_continue());
+    }
+
+    #[test]
+    fn entry_count_within_the_limit_is_accepted() {
+        FluentDecoder::ensure_entry_count(MAX_ENTRIES_PER_FRAME)
+            .expect("a frame at the limit must be accepted");
+    }
+
+    /// A nil heartbeat is the documented Forward-protocol keepalive and must still be accepted.
+    #[test]
+    fn nil_heartbeat_is_accepted() {
+        let mut buf = BytesMut::from(&[0xc0u8][..]); // msgpack nil
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+
+        assert!(
+            matches!(decoder.decode(&mut buf), Ok(None)),
+            "a nil heartbeat must be consumed without producing an event"
+        );
+        assert!(buf.is_empty(), "the heartbeat byte must be consumed");
+    }
+
+    /// OBE-11233: the catch-all used to be `rmpv::Value`, so any unrecognised message was
+    /// materialised into an arbitrary value. It is now typed as nil, so serde refuses the message
+    /// instead — and the failure must stay recoverable, since an unknown message shape from an
+    /// otherwise well-behaved client is not a reason to drop the connection.
+    #[test]
+    fn unrecognised_message_is_refused_without_materialising_it() {
+        // A bare integer matches no variant: not a heartbeat, not a tagged message.
+        let mut buf = BytesMut::from(&[0x2au8][..]);
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+
+        let error = match decoder.decode(&mut buf) {
+            Err(error) => error,
+            Ok(_) => panic!("expected a decode error, got Ok"),
+        };
+
+        assert!(
+            error.can_continue(),
+            "an unknown message shape must not drop the connection"
+        );
+    }
+
+    /// OBE-10708: a deeply nested frame must be refused by our pre-scan *before* `rmp_serde`
+    /// sees it.
+    ///
+    /// This cannot be written as a test of the library's own behaviour: OBE-11233 claims
+    /// rmp-serde/rmpv "provide a recursion-depth guard (MAX_DEPTH=128)", but that is wrong on two
+    /// counts. rmp-serde 1.3.0 defaults to 1024, not 128, and measurement shows the guard does not
+    /// fire on the `rmpv::Value` path at all — deserialising 2,000 nesting levels directly
+    /// overflows the stack and aborts the process rather than returning `DepthLimitExceeded`.
+    /// Our scan is therefore the only thing standing between this input and a crash, and the
+    /// assertion below is safe precisely because the scan runs first.
+    #[test]
+    fn deeply_nested_frame_is_rejected_before_rmp_serde_recurses() {
+        // 0x91 is a one-element array, so each byte adds a nesting level. 2,000 levels is enough
+        // to abort the process if it ever reaches `rmp_serde`.
+        let mut buf = BytesMut::from(&vec![0x91u8; 2_000][..]);
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+
+        let error = match decoder.decode(&mut buf) {
+            Err(error) => error,
+            Ok(_) => panic!("expected FrameTooDeep, got Ok"),
+        };
+
+        assert!(
+            matches!(error, DecodeError::FrameTooDeep { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            !error.can_continue(),
+            "an over-deep frame must drop the connection"
+        );
+    }
+
+    /// The same guard must protect the inner entry stream, whose contents come from a decompressed
+    /// `PackedForward` payload and are equally untrusted.
+    #[test]
+    fn deeply_nested_inner_entry_is_rejected() {
+        let mut buf = BytesMut::from(&vec![0x91u8; 2_000][..]);
+
+        let error = match FluentEntryStreamDecoder.decode(&mut buf) {
+            Err(error) => error,
+            Ok(_) => panic!("expected FrameTooDeep, got Ok"),
+        };
+
+        assert!(matches!(error, DecodeError::FrameTooDeep { .. }));
     }
 
     /// OBE-11233 / OBE-10708: `CompressedPackedForward` inflated the client's gzip payload with an
@@ -970,7 +1182,7 @@ mod tests {
     fn decode_all(message: Vec<u8>) -> Result<(SmallVec<[Event; 1]>, usize), DecodeError> {
         let mut buf = BytesMut::from(&message[..]);
 
-        let mut decoder = FluentDecoder::new(LogNamespace::default());
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
 
         let (frame, byte_size) = decoder.decode(&mut buf)?.unwrap();
         Ok((frame.into(), byte_size))
@@ -1022,6 +1234,7 @@ mod tests {
             receive_buffer_bytes: None,
             acknowledgements: true.into(),
             connection_limit: None,
+            max_frame_bytes: None,
             log_namespace: None,
         }
         .build(SourceContext::new_test(sender, None))
@@ -1087,6 +1300,7 @@ mod tests {
             receive_buffer_bytes: None,
             acknowledgements: false.into(),
             connection_limit: None,
+            max_frame_bytes: None,
             log_namespace: Some(true),
         };
 
@@ -1143,6 +1357,7 @@ mod tests {
             receive_buffer_bytes: None,
             acknowledgements: false.into(),
             connection_limit: None,
+            max_frame_bytes: None,
             log_namespace: None,
         };
 
@@ -1365,6 +1580,7 @@ mod integration_tests {
                 receive_buffer_bytes: None,
                 acknowledgements: false.into(),
                 connection_limit: None,
+                max_frame_bytes: None,
                 log_namespace: None,
             }
             .build(SourceContext::new_test(sender, None))
