@@ -6,13 +6,13 @@ use axum::{
     Router,
 };
 use chrono::Utc;
-use flate2::read::GzDecoder;
 use indoc::indoc;
 use rmp_serde;
 use serde::Serialize;
-use std::{collections::HashMap, io::Read, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::{sleep, Duration};
+use vector_common::decompression::CappedDecoder;
 
 use crate::{
     config::ConfigBuilder,
@@ -122,9 +122,8 @@ async fn process_stats(Extension(state): Extension<Arc<AppState>>, mut request: 
                 .await
                 .expect("could not decode body into bytes");
 
-            let mut gz = GzDecoder::new(compressed_body_bytes.as_ref());
-            let mut decompressed_body_bytes = vec![];
-            gz.read_to_end(&mut decompressed_body_bytes)
+            let decompressed_body_bytes = CappedDecoder::gzip(compressed_body_bytes.as_ref())
+                .decompress()
                 .expect("unable to decompress gzip stats payload");
 
             let payload: StatsPayload = rmp_serde::from_slice(&decompressed_body_bytes).unwrap();

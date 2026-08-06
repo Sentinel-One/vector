@@ -15,10 +15,10 @@ use aws_sdk_s3::{
 };
 use aws_smithy_runtime_api::client::result::SdkError;
 use bytes::Buf;
-use flate2::read::MultiGzDecoder;
 use futures::{stream, Stream};
 use similar_asserts::assert_eq;
 use tokio_stream::StreamExt;
+use vector_common::decompression::CappedDecoder;
 use vector_lib::codecs::{encoding::FramingConfig, TextSerializerConfig};
 use vector_lib::{
     config::proxy::ProxyConfig,
@@ -608,14 +608,17 @@ async fn get_lines(obj: GetObjectOutput) -> Vec<String> {
 
 async fn get_gzipped_lines(obj: GetObjectOutput) -> Vec<String> {
     let body = get_object_output_body(obj).await;
-    let buf_read = BufReader::new(MultiGzDecoder::new(body));
+    let buf_read = BufReader::new(CappedDecoder::gzip(body).into_reader());
     buf_read.lines().map(|l| l.unwrap()).collect()
 }
 
 async fn get_zstd_lines(obj: GetObjectOutput) -> Vec<String> {
     let body = get_object_output_body(obj).await;
-    let decoder = zstd::Decoder::new(body).expect("zstd decoder initialization failed");
-    let buf_read = BufReader::new(decoder);
+    let buf_read = BufReader::new(
+        CappedDecoder::zstd(body)
+            .expect("zstd decoder initialization failed")
+            .into_reader(),
+    );
     buf_read.lines().map(|l| l.unwrap()).collect()
 }
 

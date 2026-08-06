@@ -1,7 +1,6 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
 use bytes::Bytes;
-use flate2::read::ZlibDecoder;
-use std::io::Read;
+use vector_common::decompression::CappedDecoder;
 
 use vector::test_util::trace_init;
 
@@ -11,10 +10,7 @@ mod sketches;
 use super::*;
 
 fn decompress_payload(payload: Vec<u8>) -> std::io::Result<Vec<u8>> {
-    let mut decompressor = ZlibDecoder::new(&payload[..]);
-    let mut decompressed = Vec::new();
-    let result = decompressor.read_to_end(&mut decompressed);
-    result.map(|_| decompressed)
+    CappedDecoder::zlib(&payload[..]).decompress()
 }
 
 fn unpack_proto_payloads<T>(in_payloads: &FakeIntakeResponseRaw) -> Vec<T>

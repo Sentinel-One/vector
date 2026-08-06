@@ -4,6 +4,10 @@ cognitive-complexity-threshold = 75
 # https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_method
 disallowed-methods = [
   { path = "std::io::Write::write", reason = "This doesn't handle short writes, use `write_all` instead." },
+  { path = "zstd::stream::copy_decode", reason = "Use `vector_common::decompression::CappedDecoder::zstd` (or `CappedDecoder::zstd_http` in HTTP contexts) to enforce the decompression size cap." },
+  { path = "zstd::stream::decode_all", reason = "Use `vector_common::decompression::CappedDecoder::zstd` (or `CappedDecoder::zstd_http` in HTTP contexts) to enforce the decompression size cap." },
+  { path = "zstd::bulk::decompress", reason = "Use `vector_common::decompression::CappedDecoder::zstd` (or `CappedDecoder::zstd_http` in HTTP contexts) to enforce the decompression size cap." },
+  { path = "warp::body::bytes", reason = "Reads the whole request body into memory unbounded. Use `crate::sources::util::http::capped_body()` to cap the compressed body size at the global decompressed-size limit." },
 ]
 
 disallowed-types = [
@@ -11,4 +15,9 @@ disallowed-types = [
   { path = "once_cell::unsync::OnceCell", reason = "Use `std::cell::OnceCell` instead." },
   { path = "once_cell::sync::Lazy", reason = "Use `std::sync::LazyLock` instead." },
   { path = "once_cell::unsync::Lazy", reason = "Use `std::sync::LazyCell` instead." },
+  { path = "flate2::read::GzDecoder", reason = "Use `vector_common::decompression::CappedDecoder::gzip` to enforce the decompression size cap." },
+  { path = "flate2::read::MultiGzDecoder", reason = "Use `vector_common::decompression::CappedDecoder::gzip` to enforce the decompression size cap." },
+  { path = "flate2::read::ZlibDecoder", reason = "Use `vector_common::decompression::CappedDecoder::zlib` to enforce the decompression size cap." },
+  { path = "flate2::read::DeflateDecoder", reason = "Use `vector_common::decompression::CappedDecoder` for decompression with the size cap." },
+  { path = "zstd::stream::read::Decoder", reason = "Use `vector_common::decompression::CappedDecoder::zstd` (or `CappedDecoder::zstd_http` in HTTP contexts) to enforce the decompression size cap." },
 ]

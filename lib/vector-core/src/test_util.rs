@@ -21,7 +21,6 @@ use crate::event::EventContainer;
 use crate::event::{BatchNotifier, Event, EventArray, LogEvent, MetricTags, MetricValue};
 use crate::event::{Metric, MetricKind};
 use chrono::{DateTime, SubsecRound, Utc};
-use flate2::read::MultiGzDecoder;
 use futures::{stream, task::noop_waker_ref, FutureExt, SinkExt, Stream, StreamExt, TryStreamExt};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
 use rand::{thread_rng, Rng};
@@ -39,8 +38,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::codec::{Encoder, FramedRead, FramedWrite, LinesCodec};
 use vector_buffers::topology::channel::LimitedReceiver;
+use vector_common::decompression::CappedDecoder;
 use vector_config::component::GenerateConfig;
-use zstd::Decoder as ZstdDecoder;
 
 #[cfg(test)]
 pub(crate) fn open_fixture(path: impl AsRef<Path>) -> crate::Result<serde_json::Value> {
@@ -434,22 +433,23 @@ pub fn lines_from_gzip_file<P: AsRef<Path>>(path: P) -> Vec<String> {
     let mut file = File::open(path).unwrap();
     let mut gzip_bytes = Vec::new();
     file.read_to_end(&mut gzip_bytes).unwrap();
-    let mut output = String::new();
-    MultiGzDecoder::new(&gzip_bytes[..])
-        .read_to_string(&mut output)
-        .unwrap();
-    output.lines().map(|s| s.to_owned()).collect()
+    let output = CappedDecoder::gzip(&gzip_bytes[..]).decompress().unwrap();
+    String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|s| s.to_owned())
+        .collect()
 }
 
 pub fn lines_from_zstd_file<P: AsRef<Path>>(path: P) -> Vec<String> {
     trace!(message = "Reading zstd file.", path = %path.as_ref().display());
     let file = File::open(path).unwrap();
-    let mut output = String::new();
-    ZstdDecoder::new(file)
+    let output = CappedDecoder::zstd(file).unwrap().decompress().unwrap();
+    String::from_utf8(output)
         .unwrap()
-        .read_to_string(&mut output)
-        .unwrap();
-    output.lines().map(|s| s.to_owned()).collect()
+        .lines()
+        .map(|s| s.to_owned())
+        .collect()
 }
 
 pub fn runtime() -> runtime::Runtime {

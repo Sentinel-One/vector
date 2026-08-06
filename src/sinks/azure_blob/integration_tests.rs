@@ -6,9 +6,9 @@ use std::{
 use azure_core::{error::HttpError, prelude::Range};
 use azure_storage_blobs::prelude::*;
 use bytes::{Buf, BytesMut};
-use flate2::read::GzDecoder;
 use futures::{stream, Stream, StreamExt};
 use http::StatusCode;
+use vector_common::decompression::CappedDecoder;
 use vector_lib::codecs::{
     encoding::FramingConfig, JsonSerializerConfig, NewlineDelimitedEncoderConfig,
     TextSerializerConfig,
@@ -320,7 +320,7 @@ impl AzureBlobSinkConfig {
         if self.compression == Compression::None {
             BufReader::new(body).lines().map(|l| l.unwrap()).collect()
         } else {
-            BufReader::new(GzDecoder::new(body))
+            BufReader::new(CappedDecoder::gzip(body).into_reader())
                 .lines()
                 .map(|l| l.unwrap())
                 .collect()

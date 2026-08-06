@@ -4,7 +4,7 @@ use std::{io, io::Read, io::BufWriter};
 
 use bytes::{BufMut, BytesMut, Bytes, Buf};
 use flate2::write::{GzEncoder, ZlibEncoder};
-use flate2::read::{GzDecoder, ZlibDecoder};
+use vector_common::decompression::CappedDecoder;
 use crate::sink::compression::Compression;
 use super::{
     snappy::SnappyEncoder, snappy::SnappyDecoder,
@@ -206,18 +206,10 @@ impl Decompressor {
     pub fn decompress(&self, bytes: Bytes) -> io::Result<Bytes> {
         match self {
             Decompressor::Plain => Ok(bytes),
-            Decompressor::Gzip => {
-                let mut decoder = GzDecoder::new(io::Cursor::new(bytes));
-                let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
-                Read::read_to_end(&mut decoder, &mut buff)?;
-                Ok(buff.into())
-            },
-            Decompressor::Zlib => {
-                let mut decoder = ZlibDecoder::new(bytes.reader());
-                let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
-                Read::read_to_end(&mut decoder, &mut buff)?;
-                Ok(buff.into())
-            },
+            Decompressor::Gzip => Ok(CappedDecoder::gzip(io::Cursor::new(bytes))
+                .decompress()?
+                .into()),
+            Decompressor::Zlib => Ok(CappedDecoder::zlib(bytes.reader()).decompress()?.into()),
             Decompressor::Zstd => {
                 let mut decoder = ZstdDecoder::new(bytes.reader())?;
                 let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);

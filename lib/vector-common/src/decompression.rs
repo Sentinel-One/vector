@@ -19,9 +19,11 @@
 //! The constructors enforce the global decompressed-size cap so that a compression bomb cannot
 //! drive unbounded allocation.
 
-// Raw decoder types (flate2 / zstd) should only be constructed here, in the module that wraps
-// them safely. Once every source is migrated off the raw types this can be enforced with a
-// `clippy.toml` `disallowed-types` entry.
+// Raw decoder types (flate2 / zstd) are only allowed in this module, which wraps them safely.
+#![expect(
+    clippy::disallowed_types,
+    reason = "this module implements CappedDecoder, the safe wrapper around raw decoders; raw types may only appear here"
+)]
 
 use std::{
     fmt,
@@ -248,6 +250,14 @@ pub struct CappedReader<R: Read> {
     limit: usize,
     consumed: usize,
 }
+
+/// The reader type produced by [`CappedDecoder::zstd`] and friends via
+/// [`CappedDecoder::into_reader`].
+///
+/// Naming this type otherwise requires spelling the raw `zstd` decoder, which the
+/// `disallowed-types` lint forbids outside this module. Store this alias instead of the raw type
+/// when a struct needs to hold a capped zstd reader.
+pub type CappedZstdReader<R> = CappedReader<zstd::stream::read::Decoder<'static, io::BufReader<R>>>;
 
 impl<R: Read> Read for CappedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {

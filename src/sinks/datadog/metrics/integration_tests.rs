@@ -2,13 +2,13 @@ use std::num::NonZeroU32;
 
 use bytes::Bytes;
 use chrono::{SubsecRound, Utc};
-use flate2::read::ZlibDecoder;
 use futures::{channel::mpsc::Receiver, stream, StreamExt};
 use http::request::Parts;
 use hyper::StatusCode;
 use indoc::indoc;
 use prost::Message;
 use rand::{thread_rng, Rng};
+use vector_common::decompression::CappedDecoder;
 
 use vector_lib::{
     config::{init_telemetry, Tags, Telemetry},
@@ -143,10 +143,7 @@ async fn start_test(events: Vec<Event>) -> (Vec<Event>, Receiver<(http::request:
 }
 
 fn decompress_payload(payload: Vec<u8>) -> std::io::Result<Vec<u8>> {
-    let mut decompressor = ZlibDecoder::new(&payload[..]);
-    let mut decompressed = Vec::new();
-    let result = std::io::copy(&mut decompressor, &mut decompressed);
-    result.map(|_| decompressed)
+    CappedDecoder::zlib(&payload[..]).decompress()
 }
 
 #[tokio::test]
