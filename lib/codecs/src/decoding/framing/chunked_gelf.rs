@@ -19,9 +19,22 @@ use vector_config::configurable_component;
 const GELF_MAGIC: &[u8] = &[0x1e, 0x0f];
 const GELF_MAX_TOTAL_CHUNKS: u8 = 128;
 const DEFAULT_TIMEOUT_SECS: f64 = 5.0;
+/// Default cap on concurrent incomplete messages. Prevents HashMap from growing unbounded
+/// when senders open many message IDs without completing them.
+pub const DEFAULT_PENDING_MESSAGES_LIMIT: usize = 1000;
+/// Default cap on the reassembled payload of a single GELF message (5 MiB).
+pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 5 * 1024 * 1024;
 
 const fn default_timeout_secs() -> f64 {
     DEFAULT_TIMEOUT_SECS
+}
+
+fn default_pending_messages_limit() -> Option<usize> {
+    Some(DEFAULT_PENDING_MESSAGES_LIMIT)
+}
+
+fn default_max_message_length() -> Option<usize> {
+    Some(DEFAULT_MAX_MESSAGE_LENGTH)
 }
 
 /// Config used to build a `ChunkedGelfDecoder`.
@@ -58,21 +71,22 @@ pub struct ChunkedGelfDecoderOptions {
 
     /// The maximum number of pending incomplete messages. If this limit is reached, the decoder starts
     /// dropping chunks of new messages, ensuring the memory usage of the decoder's state is bounded.
-    /// If this option is not set, the decoder does not limit the number of pending messages and the memory usage
-    /// of its messages buffer can grow unbounded. This matches Graylog Server's behavior.
-    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
+    /// Defaults to 1000. Set to a very large value to approximate the previous unbounded behavior.
+    #[serde(default = "default_pending_messages_limit")]
+    #[derivative(Default(value = "Some(DEFAULT_PENDING_MESSAGES_LIMIT)"))]
     pub pending_messages_limit: Option<usize>,
 
     /// The maximum length of a single GELF message, in bytes. Messages longer than this length will
-    /// be dropped. If this option is not set, the decoder does not limit the length of messages and
-    /// the per-message memory is unbounded.
+    /// be dropped. Defaults to 5 MiB. Set to a very large value to approximate the previous
+    /// unbounded behavior.
     ///
     /// Note that a message can be composed of multiple chunks and this limit is applied to the whole
     /// message, not to individual chunks.
     ///
     /// This limit takes only into account the message's payload and the GELF header bytes are excluded from the calculation.
     /// The message's payload is the concatenation of all the chunks' payloads.
-    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
+    #[serde(default = "default_max_message_length")]
+    #[derivative(Default(value = "Some(DEFAULT_MAX_MESSAGE_LENGTH)"))]
     pub max_length: Option<usize>,
 
     /// Decompression configuration for GELF messages.
@@ -486,8 +500,8 @@ impl Default for ChunkedGelfDecoder {
     fn default() -> Self {
         Self::new(
             DEFAULT_TIMEOUT_SECS,
-            None,
-            None,
+            Some(DEFAULT_PENDING_MESSAGES_LIMIT),
+            Some(DEFAULT_MAX_MESSAGE_LENGTH),
             ChunkedGelfDecompressionConfig::Auto,
         )
     }
@@ -1277,5 +1291,52 @@ mod tests {
         let detected_compression = ChunkedGelfDecompression::from_magic(&payload.into());
 
         assert_eq!(detected_compression, ChunkedGelfDecompression::None);
+    }
+
+    #[tokio::test]
+    async fn default_pending_messages_limit_is_finite() {
+        // The default decoder must enforce a pending-messages cap so an attacker
+        // cannot grow the HashMap unbounded by opening many message IDs.
+        let decoder = ChunkedGelfDecoder::default();
+        assert_eq!(decoder.pending_messages_limit, Some(DEFAULT_PENDING_MESSAGES_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn default_max_length_is_finite() {
+        let decoder = ChunkedGelfDecoder::default();
+        assert_eq!(decoder.max_length, Some(DEFAULT_MAX_MESSAGE_LENGTH));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn pending_messages_limit_rejects_excess_when_default(
+        two_chunks_message: ([BytesMut; 2], String),
+    ) {
+        // With pending_messages_limit = 1, a second in-flight message is rejected.
+        let (mut two_chunks, _) = two_chunks_message;
+        let second_msg_id = 99u64;
+        let mut extra_chunk = {
+            let mut c = BytesMut::new();
+            c.put_slice(GELF_MAGIC);
+            c.put_u64(second_msg_id);
+            c.put_u8(0u8);
+            c.put_u8(2u8);
+            c.extend_from_slice(b"x");
+            c
+        };
+        let mut decoder = ChunkedGelfDecoder {
+            pending_messages_limit: Some(1),
+            ..Default::default()
+        };
+
+        let frame = decoder.decode_eof(&mut two_chunks[0]).unwrap();
+        assert!(frame.is_none());
+
+        let err = decoder.decode_eof(&mut extra_chunk).unwrap_err();
+        let downcasted = downcast_framing_error(&err);
+        assert!(matches!(
+            downcasted,
+            ChunkedGelfDecoderError::PendingMessagesLimitReached { .. }
+        ));
     }
 }
