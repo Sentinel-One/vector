@@ -10,8 +10,10 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio;
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
 use tokio_util::codec::Decoder;
+use tokio_util::time::DelayQueue;
+use std::future::poll_fn;
 use tracing::{debug, trace, warn};
 use vector_common::constants::{GZIP_MAGIC, ZLIB_MAGIC};
 use vector_config::configurable_component;
@@ -140,17 +142,15 @@ struct MessageState {
     chunks: [Bytes; GELF_MAX_TOTAL_CHUNKS as usize],
     chunks_bitmap: u128,
     current_length: usize,
-    timeout_task: JoinHandle<()>,
 }
 
 impl MessageState {
-    pub const fn new(total_chunks: u8, timeout_task: JoinHandle<()>) -> Self {
+    pub const fn new(total_chunks: u8) -> Self {
         Self {
             total_chunks,
             chunks: [const { Bytes::new() }; GELF_MAX_TOTAL_CHUNKS as usize],
             chunks_bitmap: 0,
             current_length: 0,
-            timeout_task,
         }
     }
 
@@ -176,7 +176,6 @@ impl MessageState {
 
     fn retrieve_message(&self) -> Option<Bytes> {
         if self.is_complete() {
-            self.timeout_task.abort();
             let chunks = &self.chunks[0..self.total_chunks as usize];
             let mut message = BytesMut::new();
             for chunk in chunks {
@@ -323,6 +322,10 @@ pub struct ChunkedGelfDecoder {
     timeout: Duration,
     pending_messages_limit: Option<usize>,
     max_length: Option<usize>,
+    // Sender to the single background reaper task that uses DelayQueue to evict timed-out
+    // incomplete messages. O(1) tasks instead of O(N) per-message spawns.
+    // UnboundedSender is Clone, so the decoder can be cheaply cloned.
+    reaper_tx: tokio::sync::mpsc::UnboundedSender<u64>,
 }
 
 impl ChunkedGelfDecoder {
@@ -333,13 +336,47 @@ impl ChunkedGelfDecoder {
         max_length: Option<usize>,
         decompression_config: ChunkedGelfDecompressionConfig,
     ) -> Self {
+        let state: Arc<Mutex<HashMap<u64, MessageState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let timeout = Duration::from_secs_f64(timeout_secs);
+
+        let (reaper_tx, mut reaper_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let reaper_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            use tokio_util::time::DelayQueue;
+            let mut delay_queue: DelayQueue<u64> = DelayQueue::new();
+            loop {
+                tokio::select! {
+                    msg = reaper_rx.recv() => {
+                        match msg {
+                            Some(message_id) => { delay_queue.insert(message_id, timeout); }
+                            None => break,
+                        }
+                    }
+                    Some(expired) = delay_queue.next() => {
+                        let message_id = expired.into_inner();
+                        let mut state_lock = reaper_state.lock().expect("poisoned lock");
+                        if state_lock.remove(&message_id).is_some() {
+                            warn!(
+                                message_id = message_id,
+                                timeout_secs = timeout.as_secs_f64(),
+                                internal_log_rate_limit = true,
+                                "Message was not fully received within the timeout window. Discarding it."
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
             bytes_decoder: BytesDecoder::new(),
             decompression_config,
-            state: Arc::new(Mutex::new(HashMap::new())),
-            timeout: Duration::from_secs_f64(timeout_secs),
+            state,
+            timeout,
             pending_messages_limit,
             max_length,
+            reaper_tx,
         }
     }
 
@@ -403,23 +440,8 @@ impl ChunkedGelfDecoder {
         }
 
         let message_state = state_lock.entry(message_id).or_insert_with(|| {
-            // We need to spawn a task that will clear the message state after a certain time
-            // otherwise we will have a memory leak due to messages that never complete
-            let state = Arc::clone(&self.state);
-            let timeout = self.timeout;
-            let timeout_handle = tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                let mut state_lock = state.lock().expect("poisoned lock");
-                if state_lock.remove(&message_id).is_some() {
-                    warn!(
-                        message_id = message_id,
-                        timeout_secs = timeout.as_secs_f64(),
-                        internal_log_rate_limit = true,
-                        "Message was not fully received within the timeout window. Discarding it."
-                    );
-                }
-            });
-            MessageState::new(total_chunks, timeout_handle)
+            let _ = self.reaper_tx.send(message_id);
+            MessageState::new(total_chunks)
         });
 
         ensure!(
@@ -1305,6 +1327,35 @@ mod tests {
     async fn default_max_length_is_finite() {
         let decoder = ChunkedGelfDecoder::default();
         assert_eq!(decoder.max_length, Some(DEFAULT_MAX_MESSAGE_LENGTH));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn reaper_evicts_multiple_incomplete_messages() {
+        // Verify the DelayQueue reaper (O(1) tasks) correctly evicts N concurrent
+        // incomplete messages — not just one.
+        let timeout_secs = 1.0_f64;
+        let mut decoder = ChunkedGelfDecoder::new(
+            timeout_secs,
+            None,
+            None,
+            ChunkedGelfDecompressionConfig::Auto,
+        );
+
+        // Open 5 different message IDs, each with 2 chunks, but only send chunk 0.
+        for msg_id in 1u64..=5 {
+            let mut chunk = create_chunk(msg_id, 0, 2, &b"partial");
+            let result = decoder.decode_eof(&mut chunk).unwrap();
+            assert!(result.is_none());
+        }
+        assert_eq!(decoder.state.lock().unwrap().len(), 5);
+
+        // Advance time past the timeout; reaper should clear all five entries.
+        tokio::time::sleep(Duration::from_secs_f64(timeout_secs + 0.5)).await;
+        assert!(
+            decoder.state.lock().unwrap().is_empty(),
+            "reaper must evict all incomplete messages"
+        );
     }
 
     #[rstest]
