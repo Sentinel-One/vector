@@ -11,10 +11,10 @@ Jira: OBE-10709, OBE-10712, OBE-10718, OBE-11232, OBE-11234, OBE-11235, OBE-1123
 - [x] Task 3: WEF body limit + SLDC decompress cap (OBE-10718, OBE-11236) — `c78583d` (private submodule, `2b175f603` parent)
 - [x] Task 4: Newline framer max_length default + socket/statsd exposure (OBE-11232) — `15c3bc3ad`
 - [x] Task 5: GELF finite defaults — pending_messages_limit and max_length (OBE-11235 part 1) — `0153d5aa6`
-- [ ] Task 6: GELF DelayQueue reaper — O(N) task → O(1) (OBE-11235 part 2)
+- [x] Task 6: GELF DelayQueue reaper — O(N) task → O(1) (OBE-11235 part 2) — `bd3735b63`
 - [x] Task 7: STCP frame buffer cap — max_frame_bytes in decode() (OBE-11238) — `a05d0ca` (private submodule, `2b175f603` parent)
-- [ ] Task 8: STCP RegisterChannel header-count cap + LEB128 error propagation (OBE-11234)
-- [ ] Task 9: STCP parse_lines clone → Arc shared metadata + max_lines cap (OBE-11556)
+- [x] Task 8: STCP RegisterChannel header-count cap + LEB128 error propagation (OBE-11234) — `4ec05c8` (private submodule, `17debea15` parent)
+- [x] Task 9: STCP parse_lines clone → Arc shared metadata + max_lines cap (OBE-11556) — `18fac46` (private submodule, `17debea15` parent)
 - [x] Task 10: TCP ack permit release before write_all (OBE-11555) — `e99054335`
 
 ## Tasks
