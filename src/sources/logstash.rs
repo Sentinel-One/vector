@@ -1077,4 +1077,54 @@ mod integration_tests {
         wait_for_tcp(address).await;
         recv
     }
+
+    #[test]
+    fn decompression_bomb_exceeds_limit() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let plain = vec![b'A'; 200];
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&plain).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut src = BytesMut::new();
+        src.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        src.extend_from_slice(&compressed);
+
+        // limit of 10 bytes is less than the 200-byte output
+        let result = decode_compressed_frame(&mut src, 10);
+        assert!(
+            matches!(result, Err(DecodeError::DecompressionFailed { .. })),
+            "expected DecompressionFailed, got {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn nested_compressed_frame_rejected() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Inner payload: version=0x32, type=0x43 ('C'), payload_len=0x00000000.
+        // When the inside_compressed decoder encounters 'C' in ReadFrame state it
+        // returns NestedCompressionRejected before ever calling decode_compressed_frame.
+        let inner_plain: Vec<u8> = vec![0x32, 0x43, 0, 0, 0, 0];
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&inner_plain).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut src = BytesMut::new();
+        src.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        src.extend_from_slice(&compressed);
+
+        let result = decode_compressed_frame(&mut src, 1024 * 1024);
+        assert!(
+            matches!(result, Err(DecodeError::NestedCompressionRejected)),
+            "expected NestedCompressionRejected, got {:?}",
+            result,
+        );
+    }
 }
