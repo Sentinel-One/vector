@@ -66,14 +66,18 @@ impl NewlineDelimitedDecoderConfig {
     }
 }
 
+/// Default maximum line length (100 KiB) applied when no explicit limit is configured.
+/// Guards against unbounded `BytesMut` growth from malformed or adversarial streams.
+pub const DEFAULT_MAX_LENGTH: usize = 100 * 1024;
+
 /// A codec for handling bytes that are delimited by (a) newline(s).
 #[derive(Debug, Clone)]
 pub struct NewlineDelimitedDecoder(CharacterDelimitedDecoder);
 
 impl NewlineDelimitedDecoder {
-    /// Creates a new `NewlineDelimitedDecoder`.
+    /// Creates a new `NewlineDelimitedDecoder` with the default 100 KiB max-line limit.
     pub const fn new() -> Self {
-        Self(CharacterDelimitedDecoder::new(b'\n'))
+        Self::new_with_max_length(DEFAULT_MAX_LENGTH)
     }
 
     /// Creates a `NewlineDelimitedDecoder` with a maximum frame length limit.
@@ -169,5 +173,18 @@ mod tests {
         assert_eq!(decoder.decode_eof(&mut input).unwrap().unwrap(), "foo");
         assert_eq!(decoder.decode_eof(&mut input).unwrap().unwrap(), "baz");
         assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
+    }
+
+    #[test]
+    fn new_enforces_default_max_length() {
+        // A line exactly at the limit passes; one byte over is discarded.
+        let at_limit = "a".repeat(DEFAULT_MAX_LENGTH);
+        let over_limit = "b".repeat(DEFAULT_MAX_LENGTH + 1);
+        let mut input = BytesMut::from(format!("{at_limit}\n{over_limit}\nok\n").as_str());
+        let mut decoder = NewlineDelimitedDecoder::new();
+
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap().len(), DEFAULT_MAX_LENGTH);
+        // Oversized line is silently discarded.
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "ok");
     }
 }
