@@ -10,10 +10,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio;
-use tokio::sync::mpsc;
 use tokio_util::codec::Decoder;
-use tokio_util::time::DelayQueue;
-use std::future::poll_fn;
 use tracing::{debug, trace, warn};
 use vector_common::constants::{GZIP_MAGIC, ZLIB_MAGIC};
 use vector_config::configurable_component;
@@ -319,7 +316,6 @@ pub struct ChunkedGelfDecoder {
     bytes_decoder: BytesDecoder,
     decompression_config: ChunkedGelfDecompressionConfig,
     state: Arc<Mutex<HashMap<u64, MessageState>>>,
-    timeout: Duration,
     pending_messages_limit: Option<usize>,
     max_length: Option<usize>,
     // Sender to the single background reaper task that uses DelayQueue to evict timed-out
@@ -373,7 +369,6 @@ impl ChunkedGelfDecoder {
             bytes_decoder: BytesDecoder::new(),
             decompression_config,
             state,
-            timeout,
             pending_messages_limit,
             max_length,
             reaper_tx,
