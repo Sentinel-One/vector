@@ -497,6 +497,7 @@ wiremock = "0.6.2"
 zstd = { version = "0.13.0", default-features = false }
 
 [patch.crates-io]
+mlua = { git = "https://github.com/janmejay-s1/mlua.git", branch = "mlua_0.10.2_list_iter_safety" }
 # The upgrade for `tokio-util` >= 0.6.9 is blocked on https://github.com/vectordotdev/vector/issues/11257.
 tokio-util = { git = "https://github.com/vectordotdev/tokio", branch = "tokio-util-0.7.13-framed-read-continue-on-error" }
 nix = { git = "https://github.com/vectordotdev/nix.git", branch = "memfd/gnu/musl" }
