@@ -6,6 +6,16 @@ vdev = "run --quiet --package vdev --"
 # CentOS 7, 8, and a few other Linux distributions.
 JEMALLOC_SYS_WITH_LG_PAGE = "16"
 
+# libz-sys 1.1.12 bundles zlib 1.2.13 which fails to compile on Apple SDK 14.4: the MACOS/
+# TARGET_OS_MAC guard in zutil.h defines fdopen(fd,mode) as NULL, then stdio.h's real
+# fdopen declaration fails to parse. Bypassing the build script uses macOS's system libz
+# (/usr/lib/libz.dylib) instead. metadata.include tells dependent build scripts (curl-sys,
+# rdkafka-sys) where to find zlib.h via DEP_Z_INCLUDE.
+[target.aarch64-apple-darwin.z]
+rustc-link-lib = ["z"]
+rustc-link-search = ["/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk/usr/lib"]
+include = "/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk/usr/include"
+
 [target.'cfg(all())']
 rustflags = [
   "-Dclippy::print_stdout",
