@@ -1,10 +1,60 @@
 use bytes::{Buf, Bytes, BytesMut};
 use memchr::memchr;
 use tokio_util::codec::Decoder;
-use tracing::{trace, warn};
+use tracing::trace;
 use vector_config::configurable_component;
 
-use super::BoxedFramingError;
+use super::{BoxedFramingError, FramingError};
+use crate::decoding::StreamDecodingError;
+use crate::max_length::max_frame_length_bytes;
+
+/// A frame exceeded `max_length`.
+///
+/// Always fatal (`can_continue() == false`): the buffer is dropped and the transport resets the
+/// connection. A peer that sends one illegal frame gives us no reason to trust the rest of its
+/// stream, so the frame is not skipped over even when its delimiter is present and we could.
+///
+/// `terminated` records whether the delimiter had arrived, purely so the log says which of the two
+/// situations occurred — it does not change the outcome.
+#[derive(Debug)]
+pub struct FrameTooLong {
+    frame_length: usize,
+    max_length: usize,
+    terminated: bool,
+}
+
+impl std::fmt::Display for FrameTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.terminated {
+            write!(
+                f,
+                "frame exceeds max_length: {} bytes, limit is {}; resetting the connection",
+                self.frame_length, self.max_length
+            )
+        } else {
+            write!(
+                f,
+                "frame exceeds max_length: buffered {} bytes with no delimiter, limit is {}; \
+                 resetting the connection",
+                self.frame_length, self.max_length
+            )
+        }
+    }
+}
+
+impl std::error::Error for FrameTooLong {}
+
+impl StreamDecodingError for FrameTooLong {
+    fn can_continue(&self) -> bool {
+        false
+    }
+}
+
+impl FramingError for FrameTooLong {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self as &dyn std::any::Any
+    }
+}
 
 /// Config used to build a `CharacterDelimitedDecoder`.
 #[configurable_component]
@@ -22,7 +72,7 @@ impl CharacterDelimitedDecoderConfig {
         }
     }
     /// Build the `CharacterDelimitedDecoder` from this configuration.
-    pub const fn build(&self) -> CharacterDelimitedDecoder {
+    pub fn build(&self) -> CharacterDelimitedDecoder {
         if let Some(max_length) = self.character_delimited.max_length {
             CharacterDelimitedDecoder::new_with_max_length(
                 self.character_delimited.delimiter,
@@ -47,13 +97,12 @@ pub struct CharacterDelimitedDecoderOptions {
     ///
     /// This length does *not* include the trailing delimiter.
     ///
-    /// By default, there is no maximum length enforced. If events are malformed, this can lead to
-    /// additional resource usage as events continue to be buffered in memory, and can potentially
-    /// lead to memory exhaustion in extreme cases.
+    /// Defaults to the global frame length cap, set by `--max-frame-length-bytes` (or
+    /// `VECTOR_MAX_FRAME_LENGTH_BYTES`), which is 100 KiB unless overridden. Set this to override
+    /// the cap for this component alone.
     ///
-    /// If there is a risk of processing malformed data, such as logs with user-controlled input,
-    /// consider setting the maximum length to a reasonably large value as a safety net. This
-    /// ensures that processing is not actually unbounded.
+    /// A frame longer than the limit is a fatal decode error and the connection is reset, whether
+    /// or not its delimiter had arrived.
     #[serde(skip_serializing_if = "vector_core::serde::is_default")]
     pub max_length: Option<usize>,
 }
@@ -78,21 +127,20 @@ pub struct CharacterDelimitedDecoder {
 }
 
 impl CharacterDelimitedDecoder {
-    /// Creates a `CharacterDelimitedDecoder` with the specified delimiter.
-    pub const fn new(delimiter: u8) -> Self {
-        CharacterDelimitedDecoder {
-            delimiter,
-            max_length: usize::MAX,
-        }
+    /// Creates a `CharacterDelimitedDecoder` with the specified delimiter, using the global frame
+    /// length cap (see [`crate::max_length`]).
+    pub fn new(delimiter: u8) -> Self {
+        Self::new_with_max_length(delimiter, max_frame_length_bytes())
     }
 
     /// Creates a `CharacterDelimitedDecoder` with a maximum frame length limit.
     ///
-    /// Any frames longer than `max_length` bytes will be discarded entirely.
+    /// A frame longer than `max_length` is a fatal decode error and the connection is reset — see
+    /// [`FrameTooLong`].
     pub const fn new_with_max_length(delimiter: u8, max_length: usize) -> Self {
         CharacterDelimitedDecoder {
+            delimiter,
             max_length,
-            ..CharacterDelimitedDecoder::new(delimiter)
         }
     }
 
@@ -107,36 +155,50 @@ impl Decoder for CharacterDelimitedDecoder {
     type Error = BoxedFramingError;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Bytes>, Self::Error> {
-        loop {
-            // This function has the following goal: we are searching for
-            // sub-buffers delimited by `self.delimiter` with size no more than
-            // `self.max_length`. If a sub-buffer is found that exceeds
-            // `self.max_length` we discard it, else we return it. At the end of
-            // the buffer if the delimiter is not present the remainder of the
-            // buffer is discarded.
-            match memchr(self.delimiter, buf) {
-                None => return Ok(None),
-                Some(next_delimiter_idx) => {
-                    if next_delimiter_idx > self.max_length {
-                        // The discovered sub-buffer is too big, so we discard
-                        // it, taking care to also discard the delimiter.
-                        warn!(
-                            message = "Discarding frame larger than max_length.",
-                            buf_len = buf.len(),
-                            max_length = self.max_length,
-                            internal_log_rate_limit = true
-                        );
-                        buf.advance(next_delimiter_idx + 1);
-                    } else {
-                        let frame = buf.split_to(next_delimiter_idx).freeze();
-                        trace!(
-                            message = "Decoding the frame.",
-                            bytes_processed = frame.len()
-                        );
-                        buf.advance(1); // scoot past the delimiter
-                        return Ok(Some(frame));
+        // A frame longer than `max_length` fails the stream, whether or not its delimiter has
+        // arrived. See `FrameTooLong`.
+        match memchr(self.delimiter, buf) {
+            None => {
+                // `memchr` searched all of `buf` and found no delimiter, and any frame emitted or
+                // rejected previously was removed from `buf` at that point. So whatever is here is
+                // exactly one incomplete frame — `buf.len()` is that frame's length so far, not
+                // the size of the last socket read. A read much larger than `max_length` is fine
+                // as long as it contains delimiters: those frames are handled by the arm below.
+                //
+                // `>` and not `>=`: at exactly `max_length` bytes the next byte could still be the
+                // delimiter, which would make it a legal frame of the maximum size.
+                if buf.len() > self.max_length {
+                    let frame_length = buf.len();
+                    buf.clear();
+                    return Err(FrameTooLong {
+                        frame_length,
+                        max_length: self.max_length,
+                        terminated: false,
                     }
+                    .into());
                 }
+                Ok(None)
+            }
+            Some(next_delimiter_idx) => {
+                if next_delimiter_idx > self.max_length {
+                    // We could resync here — the delimiter marks exactly where this frame ended —
+                    // but an over-long frame fails the stream outright, so everything buffered
+                    // goes with it.
+                    buf.clear();
+                    return Err(FrameTooLong {
+                        frame_length: next_delimiter_idx,
+                        max_length: self.max_length,
+                        terminated: true,
+                    }
+                    .into());
+                }
+                let frame = buf.split_to(next_delimiter_idx).freeze();
+                trace!(
+                    message = "Decoding the frame.",
+                    bytes_processed = frame.len()
+                );
+                buf.advance(1); // scoot past the delimiter
+                Ok(Some(frame))
             }
         }
     }
@@ -147,15 +209,9 @@ impl Decoder for CharacterDelimitedDecoder {
             None => {
                 if buf.is_empty() {
                     Ok(None)
-                } else if buf.len() > self.max_length {
-                    warn!(
-                        message = "Discarding frame larger than max_length.",
-                        buf_len = buf.len(),
-                        max_length = self.max_length,
-                        internal_log_rate_limit = true
-                    );
-                    Ok(None)
                 } else {
+                    // `decode` returned `Ok(None)`, so the remainder is within `max_length`;
+                    // anything longer would already have errored above.
                     let bytes: Bytes = buf.split_to(buf.len()).freeze();
                     Ok(Some(bytes))
                 }
@@ -181,31 +237,198 @@ mod tests {
         assert_eq!(Some("abc".into()), codec.decode(buf).unwrap());
     }
 
+    /// A peer that never sends the delimiter must not be able to grow the buffer without bound.
+    /// `max_length` previously only applied once a delimiter had been found, so this stream was
+    /// unbounded even with the limit set explicitly.
     #[test]
-    fn decode_max_length() {
-        const MAX_LENGTH: usize = 6;
+    fn incomplete_frame_over_max_length_is_a_fatal_error() {
+        const MAX_LENGTH: usize = 10;
+
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let buf = &mut BytesMut::new();
+        buf.put_slice(&[b'x'; 100]);
+
+        let error = codec.decode(buf).unwrap_err();
+        assert!(
+            !error.can_continue(),
+            "an over-long incomplete frame must be fatal so the stream closes",
+        );
+        assert!(
+            error.to_string().contains("exceeds max_length"),
+            "error should name the limit, got: {error}",
+        );
+        assert!(buf.is_empty(), "the pending bytes must be released");
+    }
+
+    /// The bound must not fire while the frame is still within the limit — that would reject
+    /// ordinary streaming reads that simply have not seen their delimiter yet.
+    #[test]
+    fn incomplete_frame_within_max_length_waits_for_more_bytes() {
+        const MAX_LENGTH: usize = 100;
 
         let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
 
-        // limit is 6 so it will skip longer lines
-        buf.put_slice(b"1234567\n123456\n123412314\n123");
-
-        assert_eq!(codec.decode(buf).unwrap(), Some(Bytes::from("123456")));
+        buf.put_slice(b"partial");
         assert_eq!(codec.decode(buf).unwrap(), None);
+        assert_eq!(buf.len(), 7, "pending bytes must be kept for the next read");
 
+        buf.put_slice(b" frame\n");
+        assert_eq!(
+            codec.decode(buf).unwrap(),
+            Some(Bytes::from("partial frame"))
+        );
+    }
+
+    /// A frame of exactly `max_length` is accepted; one byte more is not. Pins the boundary so a
+    /// later refactor cannot silently turn `>` into `>=`.
+    #[test]
+    fn max_length_boundary_is_exact() {
+        const MAX_LENGTH: usize = 10;
+
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let buf = &mut BytesMut::new();
+        buf.put_slice(&[b'x'; MAX_LENGTH]);
+        buf.put_slice(b"\n");
+        assert_eq!(
+            codec.decode(buf).unwrap(),
+            Some(Bytes::from(vec![b'x'; MAX_LENGTH])),
+            "a frame of exactly max_length must be accepted",
+        );
+
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let buf = &mut BytesMut::new();
+        buf.put_slice(&[b'x'; MAX_LENGTH + 1]);
+        assert!(
+            codec.decode(buf).is_err(),
+            "one byte past max_length must be rejected",
+        );
+    }
+
+    /// A single socket read is routinely far larger than `max_length`. That must be fine as long
+    /// as it contains delimiters: the limit bounds one *frame*, not the read. This is the
+    /// regression guard against measuring the wrong thing.
+    #[test]
+    fn read_much_larger_than_max_length_is_fine_when_it_contains_frames() {
+        const MAX_LENGTH: usize = 10;
+
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
 
-        // limit is 6 so it will skip longer lines
-        buf.put_slice(b"1234567\n123456\n123412314\n123");
+        // 8 KiB in one read, made of 1000 short valid frames — 800x the limit in total.
+        for _ in 0..1_000 {
+            buf.put_slice(b"abcdefg\n");
+        }
+        let total = buf.len();
+        assert!(
+            total > MAX_LENGTH * 100,
+            "test should exceed the limit many times over"
+        );
 
-        assert_eq!(codec.decode_eof(buf).unwrap(), Some(Bytes::from("123456")));
+        for i in 0..1_000 {
+            assert_eq!(
+                codec.decode(buf).unwrap(),
+                Some(Bytes::from("abcdefg")),
+                "frame {i} of a large multi-frame read should decode",
+            );
+        }
+        assert_eq!(codec.decode(buf).unwrap(), None);
+        assert!(buf.is_empty());
+    }
+
+    /// The same, but the large read ends mid-frame: the complete frames decode and the short tail
+    /// waits for more bytes rather than being judged against the total read size.
+    #[test]
+    fn large_read_with_trailing_partial_frame_waits_instead_of_erroring() {
+        const MAX_LENGTH: usize = 10;
+
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let buf = &mut BytesMut::new();
+        for _ in 0..500 {
+            buf.put_slice(b"abcdefg\n");
+        }
+        buf.put_slice(b"tail"); // 4 bytes, under the limit, no delimiter yet
+
+        for _ in 0..500 {
+            assert_eq!(codec.decode(buf).unwrap(), Some(Bytes::from("abcdefg")));
+        }
+        assert_eq!(
+            codec.decode(buf).unwrap(),
+            None,
+            "a short trailing partial must wait, not error",
+        );
+        assert_eq!(buf.len(), 4, "the partial frame must be retained");
+    }
+
+    /// Exactly `max_length` bytes with no delimiter must wait: the very next byte could be the
+    /// delimiter, making it a legal maximum-size frame. One byte more cannot be legal.
+    #[test]
+    fn exactly_max_length_without_delimiter_still_waits() {
+        const MAX_LENGTH: usize = 10;
+
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let buf = &mut BytesMut::new();
+        buf.put_slice(&[b'x'; MAX_LENGTH]);
+        assert_eq!(
+            codec.decode(buf).unwrap(),
+            None,
+            "at exactly max_length the frame may still be completed by the next byte",
+        );
+
+        buf.put_slice(b"\n");
+        assert_eq!(
+            codec.decode(buf).unwrap(),
+            Some(Bytes::from(vec![b'x'; MAX_LENGTH])),
+        );
+    }
+
+    /// `new()` must pick up the global cap rather than the old unbounded default.
+    #[test]
+    fn new_uses_the_global_frame_length_cap() {
+        let codec = CharacterDelimitedDecoder::new(b'\n');
+        assert_eq!(
+            codec.max_length(),
+            crate::max_length::max_frame_length_bytes()
+        );
+        assert_ne!(codec.max_length(), usize::MAX);
+    }
+
+    #[test]
+    fn decode_max_length() {
+        const MAX_LENGTH: usize = 6;
+
+        // A terminated frame longer than the limit is fatal, exactly as an over-long incomplete
+        // frame is. It used to be skipped so that following frames still decoded; that split
+        // behaviour is gone, so nothing after the offending frame is read.
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let buf = &mut BytesMut::new();
+        buf.put_slice(b"1234567\n123456\n");
+        let error = codec.decode(buf).unwrap_err();
+        assert!(!error.can_continue());
+        assert!(
+            buf.is_empty(),
+            "the stream is abandoned, not resynchronized"
+        );
+
+        // Frames within the limit are untouched, including one of exactly `max_length`.
+        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let buf = &mut BytesMut::new();
+        buf.put_slice(b"123456\n12345\n123");
+        assert_eq!(codec.decode(buf).unwrap(), Some(Bytes::from("123456")));
+        assert_eq!(codec.decode(buf).unwrap(), Some(Bytes::from("12345")));
+        assert_eq!(codec.decode(buf).unwrap(), None);
         assert_eq!(codec.decode_eof(buf).unwrap(), Some(Bytes::from("123")));
         assert_eq!(codec.decode_eof(buf).unwrap(), None);
     }
 
     // Regression test for [infinite loop bug](https://github.com/vectordotdev/vector/issues/2564)
     // Derived from https://github.com/tokio-rs/tokio/issues/1483
+    //
+    // The guarantee this pins is "no spinning on the same bytes". It used to be met by returning
+    // `Ok(None)` for an over-long incomplete frame, which meant the caller kept reading and the
+    // buffer kept growing — bounded progress, but unbounded memory. It is now met by failing the
+    // frame outright and releasing the buffer, so there is still no repeated work on the same
+    // bytes and memory is bounded as well.
     #[test]
     fn decode_discard_repeat() {
         const MAX_LENGTH: usize = 1;
@@ -215,7 +438,10 @@ mod tests {
 
         buf.reserve(200);
         buf.put(&b"aa"[..]);
-        assert!(codec.decode(buf).unwrap().is_none());
+        assert!(codec.decode(buf).is_err());
+        assert!(buf.is_empty(), "the rejected frame must be released");
+
+        // No spin: the decoder makes progress rather than re-failing on the same bytes.
         buf.put(&b"a"[..]);
         assert!(codec.decode(buf).unwrap().is_none());
     }

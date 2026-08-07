@@ -23,13 +23,12 @@ pub struct NewlineDelimitedDecoderOptions {
     ///
     /// This length does *not* include the trailing delimiter.
     ///
-    /// By default, there is no maximum length enforced. If events are malformed, this can lead to
-    /// additional resource usage as events continue to be buffered in memory, and can potentially
-    /// lead to memory exhaustion in extreme cases.
+    /// Defaults to the global frame length cap, set by `--max-frame-length-bytes` (or
+    /// `VECTOR_MAX_FRAME_LENGTH_BYTES`), which is 100 KiB unless overridden. Set this to override
+    /// the cap for this component alone.
     ///
-    /// If there is a risk of processing malformed data, such as logs with user-controlled input,
-    /// consider setting the maximum length to a reasonably large value as a safety net. This
-    /// ensures that processing is not actually unbounded.
+    /// A frame longer than the limit is a fatal decode error and the connection is reset, whether
+    /// or not its delimiter had arrived.
     #[serde(skip_serializing_if = "vector_core::serde::is_default")]
     pub max_length: Option<usize>,
 }
@@ -57,7 +56,7 @@ impl NewlineDelimitedDecoderConfig {
     }
 
     /// Build the `NewlineDelimitedDecoder` from this configuration.
-    pub const fn build(&self) -> NewlineDelimitedDecoder {
+    pub fn build(&self) -> NewlineDelimitedDecoder {
         if let Some(max_length) = self.newline_delimited.max_length {
             NewlineDelimitedDecoder::new_with_max_length(max_length)
         } else {
@@ -72,7 +71,7 @@ pub struct NewlineDelimitedDecoder(CharacterDelimitedDecoder);
 
 impl NewlineDelimitedDecoder {
     /// Creates a new `NewlineDelimitedDecoder`.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self(CharacterDelimitedDecoder::new(b'\n'))
     }
 
@@ -132,12 +131,16 @@ mod tests {
 
     #[test]
     fn decode_bytes_with_newlines_and_max_length() {
+        // An over-long line is now fatal rather than skipped, so "baz" behind it is never read.
         let mut input = BytesMut::from("foo\nbarbara\nbaz\n");
         let mut decoder = NewlineDelimitedDecoder::new_with_max_length(3);
 
         assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "foo");
-        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "baz");
-        assert_eq!(decoder.decode(&mut input).unwrap(), None);
+        assert!(decoder.decode(&mut input).is_err());
+        assert!(
+            input.is_empty(),
+            "the stream is abandoned, not resynchronized"
+        );
     }
 
     #[test]
@@ -167,6 +170,20 @@ mod tests {
         let mut decoder = NewlineDelimitedDecoder::new_with_max_length(3);
 
         assert_eq!(decoder.decode_eof(&mut input).unwrap().unwrap(), "foo");
+        assert!(decoder.decode_eof(&mut input).is_err());
+        assert!(input.is_empty());
+    }
+
+    /// Lines within the limit are unaffected by the cap, including at EOF without a trailing
+    /// delimiter — the accept half of the pair above.
+    #[test]
+    fn decode_bytes_within_max_length_are_unaffected() {
+        let mut input = BytesMut::from("foo\nbar\nbaz");
+        let mut decoder = NewlineDelimitedDecoder::new_with_max_length(3);
+
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "foo");
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "bar");
+        assert_eq!(decoder.decode(&mut input).unwrap(), None);
         assert_eq!(decoder.decode_eof(&mut input).unwrap().unwrap(), "baz");
         assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
     }
