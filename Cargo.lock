@@ -6568,8 +6568,7 @@ dependencies = [
 [[package]]
 name = "mlua"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea43c3ffac2d0798bd7128815212dd78c98316b299b7a902dabef13dc7b6b8d"
+source = "git+https://github.com/janmejay-s1/mlua.git?branch=mlua_0.10.2_list_iter_safety#17367dbdaa8d786dbc26310564f76adff6ea3ba2"
 dependencies = [
  "bstr 1.11.0",
  "either",
@@ -6597,8 +6596,7 @@ dependencies = [
 [[package]]
 name = "mlua-sys"
 version = "0.6.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63a11d485edf0f3f04a508615d36c7d50d299cf61a7ee6d3e2530651e0a31771"
+source = "git+https://github.com/janmejay-s1/mlua.git?branch=mlua_0.10.2_list_iter_safety#17367dbdaa8d786dbc26310564f76adff6ea3ba2"
 dependencies = [
  "cc",
  "cfg-if",
@@ -6610,8 +6608,7 @@ dependencies = [
 [[package]]
 name = "mlua_derive"
 version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "870d71c172fcf491c6b5fb4c04160619a2ee3e5a42a1402269c66bcbf1dd4deb"
+source = "git+https://github.com/janmejay-s1/mlua.git?branch=mlua_0.10.2_list_iter_safety#17367dbdaa8d786dbc26310564f76adff6ea3ba2"
 dependencies = [
  "itertools 0.13.0",
  "once_cell",
