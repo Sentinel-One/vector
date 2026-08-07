@@ -7,15 +7,15 @@ Jira: OBE-10709, OBE-10712, OBE-10718, OBE-11232, OBE-11234, OBE-11235, OBE-1123
 ## Progress
 
 - [ ] Task 1: GCS decompression cap + framing max_length (OBE-10709)
-- [ ] Task 2: Logstash decompression + nested-C recursion guard (OBE-10712)
+- [x] Task 2: Logstash decompression + nested-C recursion guard (OBE-10712) — `b034a7fd7`
 - [ ] Task 3: WEF body limit + SLDC decompress cap (OBE-10718, OBE-11236)
-- [ ] Task 4: Newline framer max_length default + socket/statsd exposure (OBE-11232)
-- [ ] Task 5: GELF finite defaults — pending_messages_limit and max_length (OBE-11235 part 1)
+- [x] Task 4: Newline framer max_length default + socket/statsd exposure (OBE-11232) — `15c3bc3ad`
+- [x] Task 5: GELF finite defaults — pending_messages_limit and max_length (OBE-11235 part 1) — `0153d5aa6`
 - [ ] Task 6: GELF DelayQueue reaper — O(N) task → O(1) (OBE-11235 part 2)
 - [ ] Task 7: STCP frame buffer cap — max_frame_bytes in decode() (OBE-11238)
 - [ ] Task 8: STCP RegisterChannel header-count cap + LEB128 error propagation (OBE-11234)
 - [ ] Task 9: STCP parse_lines clone → Arc shared metadata + max_lines cap (OBE-11556)
-- [ ] Task 10: TCP ack permit release before write_all (OBE-11555)
+- [x] Task 10: TCP ack permit release before write_all (OBE-11555) — `e99054335`
 
 ## Tasks
 
