@@ -44,6 +44,13 @@ pub use vector_lib::net::*;
 
 pub const MAX_IN_FLIGHT_EVENTS_TARGET: usize = 100_000;
 
+/// How long to wait for a peer to accept an acknowledgement before dropping the connection.
+///
+/// `write_all` progresses only as the peer's TCP receive window opens, so a peer that simply
+/// stops calling `recv()` parks the write - and with it the task, socket and fd - indefinitely.
+/// Generous enough that a merely slow client is never dropped.
+const ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn try_bind_tcp_listener(
     addr: SocketListenAddr,
     mut listenfd: ListenFd,
@@ -376,11 +383,38 @@ async fn handle_stream<T>(
                                             }
                                         }
                                 };
+                                // The permit bounds in-flight *decoded events*, and that work is
+                                // finished: the batch is in the pipeline and has been acknowledged.
+                                // Holding it across the ack write lets a peer that stops reading pin
+                                // it forever, because `write_all` makes progress only as the peer's
+                                // TCP receive window opens. Permits are replenished (and grown) only
+                                // on drop and one limiter is shared per source, so a couple of such
+                                // connections freeze ingestion for every other client.
+                                drop(permit.take());
+
                                 if let Some(ack_bytes) = acker.build_ack(ack){
                                     let stream = reader.get_mut().get_mut();
-                                    if let Err(error) = stream.write_all(&ack_bytes).await {
-                                        emit!(TcpSendAckError{ error });
-                                        break;
+                                    // Releasing the permit stops the source-wide freeze but would
+                                    // still leak this task, its socket and its fd to a peer that
+                                    // never drains. Time the write out and treat expiry as fatal.
+                                    match tokio::time::timeout(ACK_WRITE_TIMEOUT, stream.write_all(&ack_bytes)).await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => {
+                                            emit!(TcpSendAckError{ error });
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            emit!(TcpSendAckError {
+                                                error: io::Error::new(
+                                                    io::ErrorKind::TimedOut,
+                                                    format!(
+                                                        "peer did not accept the acknowledgement within {}s",
+                                                        ACK_WRITE_TIMEOUT.as_secs()
+                                                    ),
+                                                ),
+                                            });
+                                            break;
+                                        }
                                     }
                                 }
                                 if ack != TcpSourceAck::Ack {
