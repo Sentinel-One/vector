@@ -1,0 +1,26 @@
+## Qodo configuration for vector — quiet-hardened Balanced preset
+## Reference: https://docs.qodo.ai/install-and-configure/configuration-overview/configuration-and-command-reference
+
+# Pilot feedback: full CI-log-dump comments add no signal beyond the check itself.
+[checks]
+enable_auto_checks_feedback = false
+
+[github_app]
+pr_commands = ["/agentic_review"]  # also disables Qodo's auto-describe comment (redundant with our own PR descriptions)
+handle_push_trigger = true
+push_commands = ["/agentic_review"]
+feedback_on_draft_pr = true
+
+[review_agent]
+comments_location_policy = "both"
+inline_comments_severity_threshold = 2
+demand_self_review = true
+approve_pr_on_self_review = false
+# TODO: VERIFY — pilot feedback recommended `prefer_single_line_comments = true` here to suppress
+# the GIF-placeholder comment noise Qodo posts on review start, but that key is not documented in
+# Qodo's own config reference (https://docs.qodo.ai/install-and-configure/configuration-overview/configuration-and-command-reference).
+# `persistent_comment_notification = false` is a real documented key that may be the actual mechanism —
+# confirm against Qodo support or real review behavior before enabling.
+
+[pr_code_suggestions]
+enable_chat_in_code_suggestions = true
