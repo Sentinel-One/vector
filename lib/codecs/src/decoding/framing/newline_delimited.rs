@@ -28,8 +28,13 @@ pub struct NewlineDelimitedDecoderOptions {
     ///
     /// Raise this if your source legitimately emits lines larger than 10 MiB — oversized lines are
     /// dropped, not truncated, so an undersized limit is silent data loss.
-    #[serde(skip_serializing_if = "vector_core::serde::is_default")]
+    #[serde(default = "default_max_length")]
+    #[derivative(Default(value = "default_max_length()"))]
     pub max_length: Option<usize>,
+}
+
+const fn default_max_length() -> Option<usize> {
+    Some(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH)
 }
 
 impl NewlineDelimitedDecoderOptions {
@@ -56,14 +61,16 @@ impl NewlineDelimitedDecoderConfig {
 
     /// Build the `NewlineDelimitedDecoder` from this configuration.
     ///
-    /// When no explicit `max_length` is configured, [`NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH`] is applied. The bound
-    /// lives here rather than in [`NewlineDelimitedDecoder::new`] so that callers constructing the
-    /// decoder directly keep full control over their own limit.
+    /// `None` means unbounded and is preserved as such. The default lives on
+    /// [`NewlineDelimitedDecoderOptions::max_length`] as a serde default, so a user who omits the
+    /// key gets [`NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH`] while a component that constructs `None`
+    /// in Rust — such as `aws_s3`, whose objects may be one newline-free JSON document — keeps the
+    /// unbounded behavior it asked for.
     pub const fn build(&self) -> NewlineDelimitedDecoder {
         if let Some(max_length) = self.newline_delimited.max_length {
             NewlineDelimitedDecoder::new_with_max_length(max_length)
         } else {
-            NewlineDelimitedDecoder::new_with_max_length(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH)
+            NewlineDelimitedDecoder::new()
         }
     }
 }
@@ -208,15 +215,27 @@ mod tests {
         );
     }
 
-    /// The bound belongs at the config layer, so a config with no explicit `max_length` still gets
-    /// a finite limit. This is what protects socket/exec/gcs/aws_s3 from unbounded buffering.
+    /// A config that omits `max_length` gets the default via serde. This is what protects
+    /// socket/exec/stdin from unbounded buffering.
     #[test]
-    fn config_build_applies_default_max_length_when_unset() {
-        let decoder = NewlineDelimitedDecoderConfig::new().build();
+    fn config_omitting_max_length_gets_the_default() {
+        let config: NewlineDelimitedDecoderConfig =
+            serde_json::from_str(r#"{"newline_delimited":{}}"#).unwrap();
         assert_eq!(
-            decoder.0.max_length(),
+            config.build().0.max_length(),
             NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH
         );
+    }
+
+    /// Regression: a component that constructs `max_length: None` in Rust means unbounded and must
+    /// keep it. `aws_s3` does exactly this, and its objects can be one newline-free JSON document
+    /// (CloudTrail `{"Records":[...]}`), which a per-line cap would drop wholesale.
+    #[test]
+    fn explicit_none_stays_unbounded() {
+        let config = NewlineDelimitedDecoderConfig {
+            newline_delimited: NewlineDelimitedDecoderOptions { max_length: None },
+        };
+        assert_eq!(config.build().0.max_length(), usize::MAX);
     }
 
     #[test]
@@ -245,7 +264,8 @@ mod tests {
         let at_limit = "a".repeat(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH);
         let over_limit = "b".repeat(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH + 1);
         let mut input = BytesMut::from(format!("{at_limit}\n{over_limit}\nok\n").as_str());
-        let mut decoder = NewlineDelimitedDecoderConfig::new().build();
+        let mut decoder =
+            NewlineDelimitedDecoder::new_with_max_length(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH);
 
         assert_eq!(
             decoder.decode(&mut input).unwrap().unwrap().len(),
@@ -264,7 +284,8 @@ mod tests {
         // Two oversized lines back to back must not desynchronize the framer.
         let over = "x".repeat(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH + 1);
         let mut input = BytesMut::from(format!("first\n{over}\n{over}\nlast\n").as_str());
-        let mut decoder = NewlineDelimitedDecoderConfig::new().build();
+        let mut decoder =
+            NewlineDelimitedDecoder::new_with_max_length(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH);
 
         assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "first");
         assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "last");
@@ -275,7 +296,8 @@ mod tests {
     fn config_default_oversized_line_dropped_at_eof() {
         let over = "x".repeat(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH + 1);
         let mut input = BytesMut::from(over.as_str());
-        let mut decoder = NewlineDelimitedDecoderConfig::new().build();
+        let mut decoder =
+            NewlineDelimitedDecoder::new_with_max_length(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH);
 
         // No trailing delimiter: decode_eof must drop it rather than emit an oversized frame.
         assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
