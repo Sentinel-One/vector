@@ -56,7 +56,7 @@ base: components: sources: logstash: configuration: {
 			"""
 		required: false
 		type: uint: {
-			default: 33554432
+			default: 268435456
 			unit:    "bytes"
 		}
 	}

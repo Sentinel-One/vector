@@ -23,10 +23,10 @@ pub struct NewlineDelimitedDecoderOptions {
     ///
     /// This length does *not* include the trailing delimiter.
     ///
-    /// Defaults to 1 MiB. Lines longer than this are discarded, which bounds the memory a
+    /// Defaults to 10 MiB. Lines longer than this are discarded, which bounds the memory a
     /// malformed or adversarial stream can force the decoder to buffer.
     ///
-    /// Raise this if your source legitimately emits lines larger than 1 MiB — oversized lines are
+    /// Raise this if your source legitimately emits lines larger than 10 MiB — oversized lines are
     /// dropped, not truncated, so an undersized limit is silent data loss.
     #[serde(skip_serializing_if = "vector_core::serde::is_default")]
     pub max_length: Option<usize>,
@@ -68,10 +68,10 @@ impl NewlineDelimitedDecoderConfig {
     }
 }
 
-/// Default maximum line length (1 MiB) applied by [`NewlineDelimitedDecoderConfig::build`] when no
+/// Default maximum line length (10 MiB) applied by [`NewlineDelimitedDecoderConfig::build`] when no
 /// explicit limit is configured. Guards against unbounded `BytesMut` growth from malformed or
-/// adversarial streams.
-pub const NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH: usize = 1024 * 1024;
+/// adversarial streams, while sitting far above any realistic single log line.
+pub const NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH: usize = 10 * 1024 * 1024;
 
 /// A codec for handling bytes that are delimited by (a) newline(s).
 #[derive(Debug, Clone)]
@@ -234,10 +234,10 @@ mod tests {
     }
 
     #[test]
-    fn config_default_max_length_is_one_mib() {
+    fn config_default_max_length_is_ten_mib() {
         // Pinned deliberately: this value is user-visible in docs and changing it is a breaking
         // change for anyone whose lines sit between the old and new limits.
-        assert_eq!(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH, 1024 * 1024);
+        assert_eq!(NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH, 10 * 1024 * 1024);
     }
 
     #[test]

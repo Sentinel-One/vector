@@ -37,11 +37,14 @@ use crate::{
 
 /// Cap on the inflated size of a single compressed frame.
 ///
-/// This is a per-frame bound, so total exposure is this value times the number of concurrent
-/// connections. Keep it small enough that the product stays survivable at the default
-/// `connection_limit`; 256 MiB was large enough that a handful of connections could still exhaust
-/// heap, which defeats the purpose of the bound.
-const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+/// One Beats `C` frame carries an entire window, so its inflated size scales with the sender's
+/// batch size (`bulk_max_size` defaults to 2048 events; go-lumber's `maxWindowSize` allows 10000)
+/// times the per-event size. 256 MiB sits above any such batch, so the bound only ever trips on a
+/// decompression bomb.
+///
+/// The bound is per frame, so peak memory is this value times the concurrent connection count.
+/// Set a finite `connection_limit` if that product matters for your deployment.
+const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
 fn default_max_decompressed_bytes() -> u64 {
     DEFAULT_MAX_DECOMPRESSED_BYTES
@@ -85,7 +88,7 @@ pub struct LogstashConfig {
     log_namespace: Option<bool>,
 
     /// Maximum size in bytes that a compressed frame payload is allowed to expand to.
-    /// Guards against decompression bomb (zip bomb) attacks. Defaults to 32 MiB.
+    /// Guards against decompression bomb (zip bomb) attacks. Defaults to 256 MiB.
     ///
     /// This bound applies per frame, so peak memory scales with the number of concurrent
     /// connections. Raise it only alongside a finite `connection_limit`.
@@ -909,10 +912,10 @@ mod test {
     }
 
     #[test]
-    fn default_max_decompressed_bytes_is_32_mib() {
+    fn default_max_decompressed_bytes_is_256_mib() {
         // Pinned deliberately: this bound is per-frame, so raising it multiplies peak memory by
         // the concurrent connection count.
-        assert_eq!(DEFAULT_MAX_DECOMPRESSED_BYTES, 32 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_DECOMPRESSED_BYTES, 256 * 1024 * 1024);
         assert_eq!(
             LogstashConfig::default().max_decompressed_bytes,
             DEFAULT_MAX_DECOMPRESSED_BYTES

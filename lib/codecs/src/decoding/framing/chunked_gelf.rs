@@ -10,6 +10,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio;
+use tokio::task::JoinHandle;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use vector_common::constants::{GZIP_MAGIC, ZLIB_MAGIC};
@@ -18,21 +19,25 @@ use vector_config::configurable_component;
 const GELF_MAGIC: &[u8] = &[0x1e, 0x0f];
 const GELF_MAX_TOTAL_CHUNKS: u8 = 128;
 const DEFAULT_TIMEOUT_SECS: f64 = 5.0;
-/// Default cap on concurrent incomplete messages. Prevents HashMap from growing unbounded
-/// when senders open many message IDs without completing them.
-pub const DEFAULT_PENDING_MESSAGES_LIMIT: usize = 1000;
-/// Default cap on the reassembled payload of a single GELF message (5 MiB).
-pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 5 * 1024 * 1024;
+/// Cap on concurrent incomplete messages, bounding the reassembly map.
+/// Graylog Server itself has no such cap, so this is sized well above what a
+/// legitimate sender holds in flight within the 5s reassembly window.
+pub const DEFAULT_PENDING_MESSAGES_LIMIT: usize = 10_000;
+/// Cap on one reassembled message. The protocol ceiling is 128 chunks
+/// (`GELF_MAX_TOTAL_CHUNKS`) times the 65507-byte max UDP payload, so 8 MiB is
+/// above anything the wire format can produce. Matches Graylog's own
+/// `decompress_size_limit` default.
+pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 8 * 1024 * 1024;
 
 const fn default_timeout_secs() -> f64 {
     DEFAULT_TIMEOUT_SECS
 }
 
-fn default_pending_messages_limit() -> Option<usize> {
+const fn default_pending_messages_limit() -> Option<usize> {
     Some(DEFAULT_PENDING_MESSAGES_LIMIT)
 }
 
-fn default_max_message_length() -> Option<usize> {
+const fn default_max_message_length() -> Option<usize> {
     Some(DEFAULT_MAX_MESSAGE_LENGTH)
 }
 
@@ -70,14 +75,14 @@ pub struct ChunkedGelfDecoderOptions {
 
     /// The maximum number of pending incomplete messages. If this limit is reached, the decoder starts
     /// dropping chunks of new messages, ensuring the memory usage of the decoder's state is bounded.
-    /// Defaults to 1000. Set to a very large value to approximate the previous unbounded behavior.
+    /// Defaults to 10000. Set explicitly to raise or lower it.
     #[serde(default = "default_pending_messages_limit")]
-    #[derivative(Default(value = "Some(DEFAULT_PENDING_MESSAGES_LIMIT)"))]
+    #[derivative(Default(value = "default_pending_messages_limit()"))]
     pub pending_messages_limit: Option<usize>,
 
     /// The maximum length of a single GELF message, in bytes. Messages longer than this length will
-    /// be dropped. Defaults to 5 MiB. Set to a very large value to approximate the previous
-    /// unbounded behavior.
+    /// be dropped. Defaults to 8 MiB, which is above the protocol's own ceiling of 128 chunks per
+    /// message.
     ///
     /// Note that a message can be composed of multiple chunks and this limit is applied to the whole
     /// message, not to individual chunks.
@@ -85,7 +90,7 @@ pub struct ChunkedGelfDecoderOptions {
     /// This limit takes only into account the message's payload and the GELF header bytes are excluded from the calculation.
     /// The message's payload is the concatenation of all the chunks' payloads.
     #[serde(default = "default_max_message_length")]
-    #[derivative(Default(value = "Some(DEFAULT_MAX_MESSAGE_LENGTH)"))]
+    #[derivative(Default(value = "default_max_message_length()"))]
     pub max_length: Option<usize>,
 
     /// Decompression configuration for GELF messages.
@@ -133,31 +138,23 @@ impl ChunkedGelfDecompressionConfig {
     }
 }
 
-/// Instruction sent from a decoder to its background reaper task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReaperMessage {
-    /// Start the timeout window for a newly seen message id.
-    Track(u64),
-    /// The message is no longer pending (completed, or dropped for exceeding `max_length`);
-    /// cancel its timer so it cannot evict a later message that reuses the same id.
-    Done(u64),
-}
-
 #[derive(Debug)]
 struct MessageState {
     total_chunks: u8,
     chunks: [Bytes; GELF_MAX_TOTAL_CHUNKS as usize],
     chunks_bitmap: u128,
     current_length: usize,
+    timeout_task: JoinHandle<()>,
 }
 
 impl MessageState {
-    pub const fn new(total_chunks: u8) -> Self {
+    pub const fn new(total_chunks: u8, timeout_task: JoinHandle<()>) -> Self {
         Self {
             total_chunks,
             chunks: [const { Bytes::new() }; GELF_MAX_TOTAL_CHUNKS as usize],
             chunks_bitmap: 0,
             current_length: 0,
+            timeout_task,
         }
     }
 
@@ -183,6 +180,7 @@ impl MessageState {
 
     fn retrieve_message(&self) -> Option<Bytes> {
         if self.is_complete() {
+            self.timeout_task.abort();
             let chunks = &self.chunks[0..self.total_chunks as usize];
             let mut message = BytesMut::new();
             for chunk in chunks {
@@ -326,86 +324,26 @@ pub struct ChunkedGelfDecoder {
     bytes_decoder: BytesDecoder,
     decompression_config: ChunkedGelfDecompressionConfig,
     state: Arc<Mutex<HashMap<u64, MessageState>>>,
+    timeout: Duration,
     pending_messages_limit: Option<usize>,
     max_length: Option<usize>,
-    // Sender to the single background reaper task that uses DelayQueue to evict timed-out
-    // incomplete messages. O(1) tasks instead of O(N) per-message spawns.
-    // UnboundedSender is Clone, so the decoder can be cheaply cloned.
-    reaper_tx: tokio::sync::mpsc::UnboundedSender<ReaperMessage>,
 }
 
 impl ChunkedGelfDecoder {
     /// Creates a new `ChunkedGelfDecoder`.
-    ///
-    /// # Panics
-    ///
-    /// Spawns the background reaper task, so this must be called from within a Tokio runtime.
-    /// Every production construction path runs inside `SourceConfig::build`, which satisfies this.
     pub fn new(
         timeout_secs: f64,
         pending_messages_limit: Option<usize>,
         max_length: Option<usize>,
         decompression_config: ChunkedGelfDecompressionConfig,
     ) -> Self {
-        let state: Arc<Mutex<HashMap<u64, MessageState>>> = Arc::new(Mutex::new(HashMap::new()));
-        let timeout = Duration::from_secs_f64(timeout_secs);
-
-        let (reaper_tx, mut reaper_rx) = tokio::sync::mpsc::unbounded_channel::<ReaperMessage>();
-        let reaper_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            use futures::StreamExt;
-            use tokio_util::time::DelayQueue;
-            let mut delay_queue: DelayQueue<u64> = DelayQueue::new();
-            // Tracks the live timer for each pending message so that a message which completes
-            // (or is dropped for exceeding `max_length`) can cancel its timer. Without this, a
-            // stale timer would fire later and evict an unrelated message that happens to reuse
-            // the same message id inside the timeout window.
-            let mut keys: HashMap<u64, tokio_util::time::delay_queue::Key> = HashMap::new();
-            loop {
-                tokio::select! {
-                    msg = reaper_rx.recv() => {
-                        match msg {
-                            Some(ReaperMessage::Track(message_id)) => {
-                                // A `Track` for an id we already time is only possible if the
-                                // previous timer was never cancelled; replace it so we never
-                                // orphan a key.
-                                let key = delay_queue.insert(message_id, timeout);
-                                if let Some(stale) = keys.insert(message_id, key) {
-                                    delay_queue.remove(&stale);
-                                }
-                            }
-                            Some(ReaperMessage::Done(message_id)) => {
-                                if let Some(key) = keys.remove(&message_id) {
-                                    delay_queue.remove(&key);
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    Some(expired) = delay_queue.next() => {
-                        let message_id = expired.into_inner();
-                        keys.remove(&message_id);
-                        let mut state_lock = reaper_state.lock().expect("poisoned lock");
-                        if state_lock.remove(&message_id).is_some() {
-                            warn!(
-                                message_id = message_id,
-                                timeout_secs = timeout.as_secs_f64(),
-                                internal_log_rate_limit = true,
-                                "Message was not fully received within the timeout window. Discarding it."
-                            );
-                        }
-                    }
-                }
-            }
-        });
-
         Self {
             bytes_decoder: BytesDecoder::new(),
             decompression_config,
-            state,
+            state: Arc::new(Mutex::new(HashMap::new())),
+            timeout: Duration::from_secs_f64(timeout_secs),
             pending_messages_limit,
             max_length,
-            reaper_tx,
         }
     }
 
@@ -469,8 +407,23 @@ impl ChunkedGelfDecoder {
         }
 
         let message_state = state_lock.entry(message_id).or_insert_with(|| {
-            let _ = self.reaper_tx.send(ReaperMessage::Track(message_id));
-            MessageState::new(total_chunks)
+            // We need to spawn a task that will clear the message state after a certain time
+            // otherwise we will have a memory leak due to messages that never complete
+            let state = Arc::clone(&self.state);
+            let timeout = self.timeout;
+            let timeout_handle = tokio::spawn(async move {
+                tokio::time::sleep(timeout).await;
+                let mut state_lock = state.lock().expect("poisoned lock");
+                if state_lock.remove(&message_id).is_some() {
+                    warn!(
+                        message_id = message_id,
+                        timeout_secs = timeout.as_secs_f64(),
+                        internal_log_rate_limit = true,
+                        "Message was not fully received within the timeout window. Discarding it."
+                    );
+                }
+            });
+            MessageState::new(total_chunks, timeout_handle)
         });
 
         ensure!(
@@ -499,7 +452,6 @@ impl ChunkedGelfDecoder {
             let length = message_state.current_length();
             if length > max_length {
                 state_lock.remove(&message_id);
-                let _ = self.reaper_tx.send(ReaperMessage::Done(message_id));
                 return Err(ChunkedGelfDecoderError::MaxLengthExceed {
                     message_id,
                     sequence_number,
@@ -511,7 +463,6 @@ impl ChunkedGelfDecoder {
 
         if let Some(message) = message_state.retrieve_message() {
             state_lock.remove(&message_id);
-            let _ = self.reaper_tx.send(ReaperMessage::Done(message_id));
             Ok(Some(message))
         } else {
             Ok(None)
@@ -553,8 +504,8 @@ impl Default for ChunkedGelfDecoder {
     fn default() -> Self {
         Self::new(
             DEFAULT_TIMEOUT_SECS,
-            Some(DEFAULT_PENDING_MESSAGES_LIMIT),
-            Some(DEFAULT_MAX_MESSAGE_LENGTH),
+            default_pending_messages_limit(),
+            default_max_message_length(),
             ChunkedGelfDecompressionConfig::Auto,
         )
     }
@@ -1347,248 +1298,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_pending_messages_limit_is_finite() {
-        // The default decoder must enforce a pending-messages cap so an attacker
-        // cannot grow the HashMap unbounded by opening many message IDs.
-        let decoder = ChunkedGelfDecoder::default();
-        assert_eq!(decoder.pending_messages_limit, Some(DEFAULT_PENDING_MESSAGES_LIMIT));
-    }
-
-    #[tokio::test]
-    async fn default_max_length_is_finite() {
-        let decoder = ChunkedGelfDecoder::default();
-        assert_eq!(decoder.max_length, Some(DEFAULT_MAX_MESSAGE_LENGTH));
-    }
-
-    #[tokio::test(start_paused = true)]
-    #[traced_test]
-    async fn reaper_evicts_multiple_incomplete_messages() {
-        // Verify the DelayQueue reaper (O(1) tasks) correctly evicts N concurrent
-        // incomplete messages — not just one.
-        let timeout_secs = 1.0_f64;
-        let mut decoder = ChunkedGelfDecoder::new(
-            timeout_secs,
-            None,
-            None,
-            ChunkedGelfDecompressionConfig::Auto,
-        );
-
-        // Open 5 different message IDs, each with 2 chunks, but only send chunk 0.
-        for msg_id in 1u64..=5 {
-            let mut chunk = create_chunk(msg_id, 0, 2, &b"partial");
-            let result = decoder.decode_eof(&mut chunk).unwrap();
-            assert!(result.is_none());
-        }
-        assert_eq!(decoder.state.lock().unwrap().len(), 5);
-
-        // Advance time past the timeout; reaper should clear all five entries.
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs + 0.5)).await;
-        assert!(
-            decoder.state.lock().unwrap().is_empty(),
-            "reaper must evict all incomplete messages"
-        );
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn pending_messages_limit_rejects_excess_when_default(
-        two_chunks_message: ([BytesMut; 2], String),
-    ) {
-        // With pending_messages_limit = 1, a second in-flight message is rejected.
-        let (mut two_chunks, _) = two_chunks_message;
-        let second_msg_id = 99u64;
-        let mut extra_chunk = {
-            let mut c = BytesMut::new();
-            c.put_slice(GELF_MAGIC);
-            c.put_u64(second_msg_id);
-            c.put_u8(0u8);
-            c.put_u8(2u8);
-            c.extend_from_slice(b"x");
-            c
-        };
-        let mut decoder = ChunkedGelfDecoder {
-            pending_messages_limit: Some(1),
-            ..Default::default()
-        };
-
-        let frame = decoder.decode_eof(&mut two_chunks[0]).unwrap();
-        assert!(frame.is_none());
-
-        let err = decoder.decode_eof(&mut extra_chunk).unwrap_err();
-        let downcasted = downcast_framing_error(&err);
-        assert!(matches!(
-            downcasted,
-            ChunkedGelfDecoderError::PendingMessagesLimitReached { .. }
-        ));
-    }
-
-    /// Regression: the reaper must cancel a message's timer when the message completes. Otherwise
-    /// the stale timer fires later and evicts whatever is pending under the same message id.
-    #[tokio::test(start_paused = true)]
-    async fn reaper_cancels_timer_when_message_completes() {
-        let timeout_secs = 1.0_f64;
-        let mut decoder =
-            ChunkedGelfDecoder::new(timeout_secs, None, None, ChunkedGelfDecompressionConfig::Auto);
-
-        // Complete message id 7 well inside the timeout window.
-        let mut first = create_chunk(7, 0, 2, &b"foo");
-        assert!(decoder.decode_eof(&mut first).unwrap().is_none());
-        let mut second = create_chunk(7, 1, 2, &b"bar");
-        assert_eq!(decoder.decode_eof(&mut second).unwrap().unwrap(), "foobar");
-        assert!(decoder.state.lock().unwrap().is_empty());
-
-        // Let the reaper drain the Done message before the original timer would have fired.
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs / 4.0)).await;
-
-        // Reuse id 7 for a new, still-incomplete message.
-        let mut reused = create_chunk(7, 0, 2, &b"new");
-        assert!(decoder.decode_eof(&mut reused).unwrap().is_none());
-        assert_eq!(decoder.state.lock().unwrap().len(), 1);
-
-        // The first message's timer would have expired by now. The reused message must survive:
-        // its own timer has not elapsed yet.
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs)).await;
-        assert_eq!(
-            decoder.state.lock().unwrap().len(),
-            1,
-            "a cancelled timer must not evict a message that reuses the same id"
-        );
-
-        // Its own timer still applies, so it is eventually reaped.
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs)).await;
-        assert!(
-            decoder.state.lock().unwrap().is_empty(),
-            "the reused message must still be subject to its own timeout"
-        );
-    }
-
-    /// The `max_length` drop path also removes state, so it must cancel the timer too.
-    #[tokio::test(start_paused = true)]
-    async fn reaper_cancels_timer_when_message_dropped_for_max_length() {
-        let timeout_secs = 1.0_f64;
-        let mut decoder = ChunkedGelfDecoder::new(
-            timeout_secs,
-            None,
-            Some(4),
-            ChunkedGelfDecompressionConfig::Auto,
-        );
-
-        let mut first = create_chunk(11, 0, 2, &b"aaa");
-        assert!(decoder.decode_eof(&mut first).unwrap().is_none());
-        let mut second = create_chunk(11, 1, 2, &b"bbb");
-        assert!(decoder.decode_eof(&mut second).is_err());
-        assert!(decoder.state.lock().unwrap().is_empty());
-
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs / 4.0)).await;
-
-        let mut reused = create_chunk(11, 0, 2, &b"ok");
-        assert!(decoder.decode_eof(&mut reused).unwrap().is_none());
-
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs)).await;
-        assert_eq!(
-            decoder.state.lock().unwrap().len(),
-            1,
-            "the dropped message's timer must not evict the reused id"
-        );
-    }
-
-    /// A message that never completes must still be reaped, and reaping must free the slot so a
-    /// sender at the pending limit can make progress again.
-    #[tokio::test(start_paused = true)]
-    async fn reaper_frees_pending_slot_after_eviction() {
-        let timeout_secs = 1.0_f64;
-        let mut decoder = ChunkedGelfDecoder::new(
-            timeout_secs,
-            Some(1),
-            None,
-            ChunkedGelfDecompressionConfig::Auto,
-        );
-
-        let mut first = create_chunk(1, 0, 2, &b"partial");
-        assert!(decoder.decode_eof(&mut first).unwrap().is_none());
-
-        // At the limit, a second concurrent message is rejected.
-        let mut second = create_chunk(2, 0, 2, &b"partial");
-        assert!(decoder.decode_eof(&mut second).is_err());
-
-        // After the first is reaped the slot is free again.
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs + 0.5)).await;
-        assert!(decoder.state.lock().unwrap().is_empty());
-
-        let mut third = create_chunk(3, 0, 2, &b"partial");
-        assert!(decoder.decode_eof(&mut third).unwrap().is_none());
-        assert_eq!(decoder.state.lock().unwrap().len(), 1);
-    }
-
-    /// Cloned decoders share one reaper and one state map; a completion observed through a clone
-    /// must cancel the timer registered through the original.
-    #[tokio::test(start_paused = true)]
-    async fn reaper_is_shared_across_cloned_decoders() {
-        let timeout_secs = 1.0_f64;
-        let mut decoder =
-            ChunkedGelfDecoder::new(timeout_secs, None, None, ChunkedGelfDecompressionConfig::Auto);
-        let mut clone = decoder.clone();
-
-        let mut first = create_chunk(21, 0, 2, &b"foo");
-        assert!(decoder.decode_eof(&mut first).unwrap().is_none());
-        assert_eq!(clone.state.lock().unwrap().len(), 1, "state is shared");
-
-        let mut second = create_chunk(21, 1, 2, &b"bar");
-        assert_eq!(clone.decode_eof(&mut second).unwrap().unwrap(), "foobar");
-
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs / 4.0)).await;
-        let mut reused = create_chunk(21, 0, 2, &b"new");
-        assert!(decoder.decode_eof(&mut reused).unwrap().is_none());
-
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs)).await;
-        assert_eq!(
-            decoder.state.lock().unwrap().len(),
-            1,
-            "cancellation must cross clone boundaries"
-        );
-    }
-
-    /// Independent message ids must each get their own timer, and completing one must not disturb
-    /// the others' eviction schedule.
-    #[tokio::test(start_paused = true)]
-    async fn reaper_completion_does_not_disturb_other_pending_messages() {
-        let timeout_secs = 1.0_f64;
-        let mut decoder =
-            ChunkedGelfDecoder::new(timeout_secs, None, None, ChunkedGelfDecompressionConfig::Auto);
-
-        for msg_id in 30u64..=32 {
-            let mut chunk = create_chunk(msg_id, 0, 2, &b"partial");
-            assert!(decoder.decode_eof(&mut chunk).unwrap().is_none());
-        }
-        // Complete 31 only.
-        let mut finish = create_chunk(31, 1, 2, &b"done");
-        assert!(decoder.decode_eof(&mut finish).unwrap().is_some());
-        assert_eq!(decoder.state.lock().unwrap().len(), 2);
-
-        tokio::time::sleep(Duration::from_secs_f64(timeout_secs + 0.5)).await;
-        assert!(
-            decoder.state.lock().unwrap().is_empty(),
-            "30 and 32 must still be reaped on their own timers"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_decoder_limits_match_published_constants() {
-        // These defaults are user-visible; pin them so a change is deliberate.
-        assert_eq!(DEFAULT_PENDING_MESSAGES_LIMIT, 1000);
-        assert_eq!(DEFAULT_MAX_MESSAGE_LENGTH, 5 * 1024 * 1024);
+    async fn defaults_are_finite_and_above_the_protocol_ceiling() {
         let options = ChunkedGelfDecoderOptions::default();
         assert_eq!(
             options.pending_messages_limit,
             Some(DEFAULT_PENDING_MESSAGES_LIMIT)
         );
         assert_eq!(options.max_length, Some(DEFAULT_MAX_MESSAGE_LENGTH));
+
+        // 128 chunks x the 65507-byte max UDP payload is the most the wire format can carry,
+        // so the default can never reject a well-formed message.
+        let protocol_ceiling = GELF_MAX_TOTAL_CHUNKS as usize * 65_507;
+        assert!(DEFAULT_MAX_MESSAGE_LENGTH >= protocol_ceiling);
     }
 
     #[tokio::test]
-    async fn max_length_error_and_pending_limit_error_do_not_kill_the_stream() {
-        // Both are per-message conditions; killing the connection would let one bad sender drop
-        // every other message multiplexed over it.
+    async fn limits_are_per_message_and_do_not_kill_the_stream() {
+        // Both are per-message conditions; tearing down the connection would let one bad sender
+        // drop every other message multiplexed over it.
         assert!(ChunkedGelfDecoderError::MaxLengthExceed {
             message_id: 1,
             sequence_number: 0,

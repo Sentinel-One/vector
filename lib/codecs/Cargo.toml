@@ -37,7 +37,7 @@ smallvec = { version = "1", default-features = false, features = ["union"] }
 snap = { version = "1.1", default-features = false }
 snafu.workspace = true
 syslog_loose = { version = "0.21", default-features = false, optional = true }
-tokio-util = { version = "0.7", default-features = false, features = ["codec", "time"] }
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
 tokio.workspace = true
 tracing = { version = "0.1", default-features = false }
 vrl.workspace = true

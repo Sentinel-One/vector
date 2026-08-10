@@ -434,10 +434,10 @@ base: components: sources: demo_logs: configuration: {
 
 						This length does *not* include the trailing delimiter.
 
-						Defaults to 1 MiB. Lines longer than this are discarded, which bounds the memory a
+						Defaults to 10 MiB. Lines longer than this are discarded, which bounds the memory a
 						malformed or adversarial stream can force the decoder to buffer.
 
-						Raise this if your source legitimately emits lines larger than 1 MiB — oversized lines are
+						Raise this if your source legitimately emits lines larger than 10 MiB — oversized lines are
 						dropped, not truncated, so an undersized limit is silent data loss.
 						"""
 					required: false
