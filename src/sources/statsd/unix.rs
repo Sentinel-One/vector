@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use vector_lib::codecs::{
     decoding::{Deserializer, Framer},
-    NewlineDelimitedDecoder, NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH,
+    NewlineDelimitedDecoder,
 };
 use vector_lib::configurable::configurable_component;
 
@@ -35,9 +35,7 @@ pub fn statsd_unix(
     out: SourceSender,
 ) -> crate::Result<Source> {
     let decoder = Decoder::new(
-        Framer::NewlineDelimited(NewlineDelimitedDecoder::new_with_max_length(
-                NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH,
-            )),
+        Framer::NewlineDelimited(NewlineDelimitedDecoder::new()),
         Deserializer::Boxed(Box::new(StatsdDeserializer::unix(config.sanitize))),
     );
 

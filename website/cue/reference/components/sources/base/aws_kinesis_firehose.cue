@@ -441,11 +441,13 @@ base: components: sources: aws_kinesis_firehose: configuration: {
 
 						This length does *not* include the trailing delimiter.
 
-						Defaults to 10 MiB. Lines longer than this are discarded, which bounds the memory a
-						malformed or adversarial stream can force the decoder to buffer.
+						By default, there is no maximum length enforced. If events are malformed, this can lead to
+						additional resource usage as events continue to be buffered in memory, and can potentially
+						lead to memory exhaustion in extreme cases.
 
-						Raise this if your source legitimately emits lines larger than 10 MiB — oversized lines are
-						dropped, not truncated, so an undersized limit is silent data loss.
+						If there is a risk of processing malformed data, such as logs with user-controlled input,
+						consider setting the maximum length to a reasonably large value as a safety net. This
+						ensures that processing is not actually unbounded.
 						"""
 					required: false
 					type: uint: {}
