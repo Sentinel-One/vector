@@ -9,7 +9,7 @@ use listenfd::ListenFd;
 use smallvec::SmallVec;
 use socket2::SockRef;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::sleep,
 };
@@ -384,17 +384,17 @@ async fn handle_stream<T>(
                                 let _ = permit.take();
                                 if let Some(ack_bytes) = acker.build_ack(ack){
                                     let stream = reader.get_mut().get_mut();
-                                    match tokio::time::timeout(
-                                        Duration::from_secs(30),
-                                        stream.write_all(&ack_bytes),
-                                    ).await {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(error)) => {
+                                    match write_ack(stream, &ack_bytes, ACK_WRITE_TIMEOUT).await {
+                                        AckWriteOutcome::Written => {}
+                                        AckWriteOutcome::Failed(error) => {
                                             emit!(TcpSendAckError{ error });
                                             break;
                                         }
-                                        Err(_elapsed) => {
-                                            warn!("Ack write timeout; dropping connection");
+                                        AckWriteOutcome::TimedOut => {
+                                            warn!(
+                                                timeout_secs = ACK_WRITE_TIMEOUT.as_secs(),
+                                                "Ack write timed out; dropping connection."
+                                            );
                                             break;
                                         }
                                     }
@@ -430,23 +430,140 @@ async fn handle_stream<T>(
 
 #[cfg(test)]
 mod tests {
-    /// Invariant: RequestLimiterPermit is released BEFORE the ack write_all, so
-    /// a zero-window peer cannot exhaust the semaphore and starve other connections.
-    ///
-    /// The fix (OBE-11555) calls `permit.take()` immediately after `receiver.await`
-    /// completes and BEFORE `stream.write_all(&ack_bytes)` is invoked.
-    ///
-    /// TODO: full integration test — wire up a mock TcpStream (e.g. via
-    /// `tokio::io::duplex`) that never reads its receive window, confirm that the
-    /// `RequestLimiter` semaphore is replenished before `write_all` blocks, and
-    /// that a second connection can still acquire a permit while the first is
-    /// stuck in the ack write.
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn write_ack_succeeds_when_peer_reads() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        let write = tokio::spawn(async move {
+            write_ack(&mut server, b"ack", ACK_WRITE_TIMEOUT).await
+        });
+
+        let mut buf = [0u8; 3];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ack");
+        assert!(matches!(write.await.unwrap(), AckWriteOutcome::Written));
+    }
+
+    /// A peer that never drains its receive window must not block the ack write forever. Before
+    /// the timeout existed, this write parked indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn write_ack_times_out_against_a_peer_that_never_reads() {
+        // A 1-byte duplex fills immediately and `client` is never read from, so the write stalls.
+        let (_client, mut server) = tokio::io::duplex(1);
+        let payload = vec![0u8; 1024];
+
+        let outcome = write_ack(&mut server, &payload, ACK_WRITE_TIMEOUT).await;
+        assert!(
+            matches!(outcome, AckWriteOutcome::TimedOut),
+            "expected TimedOut, got {outcome:?}"
+        );
+    }
+
+    /// The timeout must not fire early for a peer that is merely slow rather than stuck.
+    #[tokio::test(start_paused = true)]
+    async fn write_ack_tolerates_a_slow_but_progressing_peer() {
+        let (mut client, mut server) = tokio::io::duplex(4);
+        let payload = vec![7u8; 32];
+        let expected = payload.clone();
+
+        let write =
+            tokio::spawn(async move { write_ack(&mut server, &payload, ACK_WRITE_TIMEOUT).await });
+
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            // Drain in small sips, pausing well inside the timeout each round.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut chunk = [0u8; 4];
+            let n = client.read(&mut chunk).await.unwrap();
+            received.extend_from_slice(&chunk[..n]);
+        }
+
+        assert_eq!(received, expected);
+        assert!(matches!(write.await.unwrap(), AckWriteOutcome::Written));
+    }
+
+    #[tokio::test]
+    async fn write_ack_reports_failure_when_peer_hangs_up() {
+        let (client, mut server) = tokio::io::duplex(64);
+        drop(client);
+
+        let outcome = write_ack(&mut server, &vec![0u8; 4096], ACK_WRITE_TIMEOUT).await;
+        assert!(
+            matches!(outcome, AckWriteOutcome::Failed(_)),
+            "expected Failed, got {outcome:?}"
+        );
+    }
+
+    /// The permit must be released before the ack write, so a stuck peer cannot hold a
+    /// `RequestLimiter` slot and starve other connections (OBE-11555). This models the ordering
+    /// `handle_stream` uses: take the permit, then perform the (stalling) write.
+    #[tokio::test(start_paused = true)]
+    async fn permit_is_released_before_a_stalled_ack_write() {
+        let limiter = RequestLimiter::new(1, 1);
+        // The limiter starts at its floor of 2 permits; hold every one so the next acquire blocks.
+        let held = limiter.acquire().await;
+        let mut permit = Some(limiter.acquire().await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), limiter.acquire())
+                .await
+                .is_err(),
+            "all permits are held, so a further acquire must block"
+        );
+
+        // Ordering under test: release, then write to a peer that never reads.
+        let _ = permit.take();
+
+        let (_client, mut server) = tokio::io::duplex(1);
+        let write = tokio::spawn(async move {
+            write_ack(&mut server, &vec![0u8; 1024], ACK_WRITE_TIMEOUT).await
+        });
+
+        // While the write is stalled, another connection must still get a permit.
+        let second = tokio::time::timeout(Duration::from_secs(1), limiter.acquire()).await;
+        assert!(
+            second.is_ok(),
+            "permit must be available while the ack write is stalled"
+        );
+
+        assert!(matches!(write.await.unwrap(), AckWriteOutcome::TimedOut));
+        drop(held);
+    }
+
     #[test]
-    fn test_permit_released_before_ack_write() {
-        // Verified by code inspection: `permit.take()` is called at the top of
-        // the ack-write block in `handle_stream`, before `stream.write_all`.
-        // The `drop(permit)` at the end of the loop is now a no-op for the ack
-        // path (permit is already None) but still covers error / framing paths.
+    fn ack_write_timeout_is_thirty_seconds() {
+        assert_eq!(ACK_WRITE_TIMEOUT, Duration::from_secs(30));
+    }
+}
+
+/// How long to wait for an ack to reach the peer before giving up on the connection.
+const ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Result of attempting to write an ack back to the peer.
+#[derive(Debug)]
+enum AckWriteOutcome {
+    Written,
+    /// The write failed; the connection should be torn down.
+    Failed(std::io::Error),
+    /// The peer never drained its receive window within the timeout.
+    TimedOut,
+}
+
+/// Writes `ack_bytes` to `stream`, bounded by `timeout`.
+///
+/// Without the timeout a peer that stops reading parks this write forever. That matters because
+/// the caller has already released its `RequestLimiterPermit` by this point (OBE-11555) — the
+/// connection itself still needs to be reclaimed.
+async fn write_ack<S>(stream: &mut S, ack_bytes: &[u8], timeout: Duration) -> AckWriteOutcome
+where
+    S: AsyncWrite + Unpin + ?Sized,
+{
+    match tokio::time::timeout(timeout, stream.write_all(ack_bytes)).await {
+        Ok(Ok(())) => AckWriteOutcome::Written,
+        Ok(Err(error)) => AckWriteOutcome::Failed(error),
+        Err(_elapsed) => AckWriteOutcome::TimedOut,
     }
 }
 

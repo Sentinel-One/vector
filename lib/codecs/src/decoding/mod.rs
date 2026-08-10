@@ -29,6 +29,7 @@ pub use framing::{
     NewlineDelimitedDecoder, NewlineDelimitedDecoderConfig, NewlineDelimitedDecoderOptions,
     OctetCountingDecoder, OctetCountingDecoderConfig, OctetCountingDecoderOptions,
     StrataSnappyDecoder, StrataSnappyDecoderConfig, StrataSnappyDecoderOptions,
+    NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH,
 };
 use smallvec::SmallVec;
 use std::fmt::Debug;

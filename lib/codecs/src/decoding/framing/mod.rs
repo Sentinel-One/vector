@@ -23,6 +23,7 @@ use dyn_clone::DynClone;
 pub use length_delimited::{LengthDelimitedDecoder, LengthDelimitedDecoderConfig};
 pub use newline_delimited::{
     NewlineDelimitedDecoder, NewlineDelimitedDecoderConfig, NewlineDelimitedDecoderOptions,
+    NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH,
 };
 pub use octet_counting::{
     OctetCountingDecoder, OctetCountingDecoderConfig, OctetCountingDecoderOptions,

@@ -407,13 +407,11 @@ base: components: sources: socket: configuration: {
 
 						This length does *not* include the trailing delimiter.
 
-						By default, there is no maximum length enforced. If events are malformed, this can lead to
-						additional resource usage as events continue to be buffered in memory, and can potentially
-						lead to memory exhaustion in extreme cases.
+						Defaults to 1 MiB. Lines longer than this are discarded, which bounds the memory a
+						malformed or adversarial stream can force the decoder to buffer.
 
-						If there is a risk of processing malformed data, such as logs with user-controlled input,
-						consider setting the maximum length to a reasonably large value as a safety net. This
-						ensures that processing is not actually unbounded.
+						Raise this if your source legitimately emits lines larger than 1 MiB — oversized lines are
+						dropped, not truncated, so an undersized limit is silent data loss.
 						"""
 					required: false
 					type: uint: {}

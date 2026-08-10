@@ -12,7 +12,7 @@ use smallvec::{smallvec, SmallVec};
 use tokio_util::udp::UdpFramed;
 use vector_lib::codecs::{
     decoding::{self, Deserializer, Framer},
-    NewlineDelimitedDecoder,
+    NewlineDelimitedDecoder, NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH,
 };
 use vector_lib::configurable::configurable_component;
 use vector_lib::internal_event::{CountByteSize, InternalEventHandle as _, Registered};
@@ -320,7 +320,9 @@ async fn statsd_udp(
     );
 
     let codec = Decoder::new(
-        Framer::NewlineDelimited(NewlineDelimitedDecoder::new()),
+        Framer::NewlineDelimited(NewlineDelimitedDecoder::new_with_max_length(
+                NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH,
+            )),
         Deserializer::Boxed(Box::new(StatsdDeserializer::udp(config.sanitize))),
     );
     let mut stream = UdpFramed::new(socket, codec).take_until(shutdown);
@@ -357,7 +359,9 @@ impl TcpSource for StatsdTcpSource {
 
     fn decoder(&self) -> Self::Decoder {
         Decoder::new(
-            Framer::NewlineDelimited(NewlineDelimitedDecoder::new()),
+            Framer::NewlineDelimited(NewlineDelimitedDecoder::new_with_max_length(
+                NEWLINE_DELIMITED_DEFAULT_MAX_LENGTH,
+            )),
             Deserializer::Boxed(Box::new(StatsdDeserializer::tcp(self.sanitize))),
         )
     }
