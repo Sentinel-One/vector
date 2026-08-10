@@ -130,6 +130,38 @@ impl VrlTarget {
         )
     }
 
+    /// Turn the target back into exactly one event, never fanning out.
+    ///
+    /// [`Self::into_events`] chooses its variant from the *root value type*, so an array root
+    /// becomes a multi-event fan-out whether or not anything was assigned. That is right for
+    /// `remap`, but wrong for a read-only caller such as a condition, which must get back the
+    /// event it was given - and an event can legitimately *arrive* array-rooted (the native
+    /// protobuf codec accepts one). Callers that assumed `One` and treated anything else as
+    /// unreachable could be panicked by input shape alone, including by an empty array.
+    ///
+    /// Here an array root stays a single event with an array root, so the round-trip is
+    /// shape-preserving for every possible input.
+    pub fn into_event(self, log_namespace: LogNamespace) -> Event {
+        match self {
+            VrlTarget::LogEvent(value, metadata) => match value {
+                value @ (Value::Object(_) | Value::Array(_)) => {
+                    LogEvent::from_parts(value, metadata).into()
+                }
+                v => match log_namespace {
+                    LogNamespace::Vector => LogEvent::from_parts(v, metadata).into(),
+                    LogNamespace::Legacy => create_log_event(v, metadata).into(),
+                },
+            },
+            VrlTarget::Trace(value, metadata) => match value {
+                value @ (Value::Object(_) | Value::Array(_)) => {
+                    TraceEvent::from(LogEvent::from_parts(value, metadata)).into()
+                }
+                v => TraceEvent::from(create_log_event(v, metadata)).into(),
+            },
+            VrlTarget::Metric { metric, .. } => Event::Metric(metric),
+        }
+    }
+
     /// Turn the target back into events.
     ///
     /// This returns an iterator of events as one event can be turned into multiple by assigning an
@@ -1346,5 +1378,101 @@ mod test {
 
         // get single value (should be the last one)
         assert_eq!(metric.tag_value("foo"), Some("b".into()));
+    }
+
+    // OBE-11558: `into_events` picks its variant from the root value type, so an array-rooted
+    // event became a multi-event fan-out even though nothing was assigned. Read-only callers
+    // (conditions) treated anything but `One` as unreachable and panicked on input shape alone.
+    // A log event can legitimately arrive array-rooted over the native protobuf codec.
+
+    fn empty_program_info() -> ProgramInfo {
+        ProgramInfo {
+            fallible: false,
+            abortable: false,
+            target_queries: vec![],
+            target_assignments: vec![],
+        }
+    }
+
+    fn array_rooted_log(values: Vec<Value>) -> LogEvent {
+        LogEvent::from_parts(Value::Array(values), EventMetadata::default())
+    }
+
+    #[test]
+    fn into_event_keeps_an_array_root_as_one_event() {
+        for log_namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            let log = array_rooted_log(vec![1.into(), 2.into()]);
+            let target = VrlTarget::new(Event::from(log), &empty_program_info(), false);
+
+            let event = target.into_event(log_namespace);
+
+            assert_eq!(
+                event.as_log().value(),
+                &Value::Array(vec![1.into(), 2.into()]),
+                "the array root must survive the round-trip intact ({log_namespace:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn into_event_keeps_an_empty_array_root_as_one_event() {
+        // The sharpest case: `into_events` turns this into a fan-out of *zero* events, which is
+        // why blaming the fan-out on the condition was wrong - it comes purely from the input.
+        for log_namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            let target = VrlTarget::new(
+                Event::from(array_rooted_log(vec![])),
+                &empty_program_info(),
+                false,
+            );
+
+            let event = target.into_event(log_namespace);
+
+            assert_eq!(event.as_log().value(), &Value::Array(vec![]));
+        }
+    }
+
+    #[test]
+    fn into_event_agrees_with_into_events_for_ordinary_roots() {
+        // Anything that was already `One` must be unaffected.
+        let roots = [
+            Value::from(btreemap! { "a" => 1 }),
+            Value::from("hi"),
+            Value::from(42),
+        ];
+
+        for root in roots {
+            for log_namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+                let build = || {
+                    VrlTarget::new(
+                        Event::from(LogEvent::from_parts(root.clone(), EventMetadata::default())),
+                        &empty_program_info(),
+                        false,
+                    )
+                };
+
+                let via_into_event = build().into_event(log_namespace);
+                let via_into_events = match build().into_events(log_namespace) {
+                    TargetEvents::One(event) => event,
+                    _ => panic!("expected One for root {root:?}"),
+                };
+
+                assert_eq!(via_into_event, via_into_events, "root {root:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn into_events_still_fans_out_an_array_root() {
+        // `remap` relies on this; the fix must not change it.
+        let target = VrlTarget::new(
+            Event::from(array_rooted_log(vec![1.into(), 2.into()])),
+            &empty_program_info(),
+            false,
+        );
+
+        match target.into_events(LogNamespace::Vector) {
+            TargetEvents::Logs(iter) => assert_eq!(iter.count(), 2),
+            _ => panic!("an array root must still fan out through into_events"),
+        }
     }
 }
