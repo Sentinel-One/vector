@@ -152,44 +152,68 @@ enum Context {
     Unknown,
 }
 
-/// The text between the start of the placeholder's line and the placeholder itself.
-fn line_prefix(input: &str, at: usize) -> &str {
-    let line_start = input[..at].rfind('\n').map_or(0, |i| i + 1);
-    &input[line_start..at]
+/// Bytes a string opener may follow.
+///
+/// A quote is only the start of a scalar in a value position: after a `=` or `:` (TOML and YAML
+/// assignment), after a `,`, `[` or `{` (flow collections), after a `-` (a YAML sequence entry),
+/// or at the start of a line. Anywhere else the quote is an ordinary character *inside* an
+/// unquoted scalar - a YAML plain scalar such as `prod"x` is a single value containing a quote,
+/// not the beginning of a string.
+const OPENER_PREDECESSORS: &[u8] = b"=:,[{-";
+
+/// Whether the quote at `at` is opening a scalar rather than sitting inside an unquoted one.
+fn opens_scalar(line: &[u8], at: usize) -> bool {
+    line[..at]
+        .iter()
+        .rev()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_none_or(|b| OPENER_PREDECESSORS.contains(b))
 }
 
-/// Establish the context of a placeholder from the text preceding it on its own line.
+/// Classify the position a placeholder occupies on its own line.
 ///
-/// Biased to return [`Context::Unknown`] whenever the answer is not certain. The two possible
-/// misreadings are not symmetric, and this is what makes the bias the safe one:
+/// Returns [`Context::DoubleQuoted`] only when the placeholder is enclosed by a **balanced,
+/// same-line** double-quoted scalar: a quote in an opening position before it, and a closing
+/// quote after it. Everything else is [`Context::Unknown`].
 ///
-/// - Guessing `Unknown` when actually double-quoted means the value is required to be inert
-///   instead of escaped. An inert value is equally harmless inside a string literal, so the
-///   result is at worst a rejected secret with an actionable error.
-/// - Guessing `DoubleQuoted` when actually unquoted would emit `\"`-style escapes into a bare
-///   position and break config loading outright.
-fn scan_context(prefix: &str) -> Context {
-    let bytes = prefix.as_bytes();
+/// Both halves of that test are load-bearing, and the reason is worth recording because the
+/// obvious weaker version is unsafe. It is tempting to argue that misclassifying an unquoted
+/// position as quoted is harmless because escaping would break parsing and so fail loudly. That
+/// argument is **false**: [`escape_double_quoted`] neutralises `"`, `\` and control characters,
+/// which is everything that matters *inside* a string, but it deliberately leaves `,`, `:`, `#`
+/// and brackets alone - and those are exactly what is structural *outside* one. So a wrong
+/// `DoubleQuoted` does not fail loudly, it silently skips the [`is_inert`] check and lets a value
+/// inject configuration. Requiring an opener position defeats a stray quote in a plain scalar
+/// (`{env: prod"x, region: SECRET[..]}`), and requiring a closer defeats an unbalanced one.
+///
+/// Misclassifying the other way is safe: an inert value is equally harmless inside a string, so
+/// the worst outcome is a rejected secret with an actionable error.
+fn classify(input: &str, start: usize, end: usize) -> Context {
+    let line_start = input[..start].rfind('\n').map_or(0, |i| i + 1);
+    let prefix = input[line_start..start].as_bytes();
+
     let mut in_double = false;
     let mut in_single = false;
     let mut i = 0;
 
-    while i < bytes.len() {
+    while i < prefix.len() {
         // A multi-line delimiter means state may have been carried in from an earlier line, so
         // line-local reasoning no longer holds.
-        if bytes[i..].starts_with(br#"""""#) || bytes[i..].starts_with(b"'''") {
+        if prefix[i..].starts_with(br#"""""#) || prefix[i..].starts_with(b"'''") {
             return Context::Unknown;
         }
 
-        match bytes[i] {
+        match prefix[i] {
             // Inside a double-quoted scalar a backslash escapes the next byte, so it cannot
             // close the string.
             b'\\' if in_double => {
                 i += 2;
                 continue;
             }
-            b'"' if !in_single => in_double = !in_double,
-            b'\'' if !in_double => in_single = !in_single,
+            b'"' if in_double => in_double = false,
+            b'\'' if in_single => in_single = false,
+            b'"' if !in_single && opens_scalar(prefix, i) => in_double = true,
+            b'\'' if !in_double && opens_scalar(prefix, i) => in_single = true,
             // A comment: the placeholder is not in a value position at all, but a newline in
             // the value would still escape the comment and become structure.
             b'#' if !in_double && !in_single => return Context::Unknown,
@@ -198,11 +222,30 @@ fn scan_context(prefix: &str) -> Context {
         i += 1;
     }
 
-    if in_double {
-        Context::DoubleQuoted
-    } else {
-        Context::Unknown
+    if !in_double {
+        return Context::Unknown;
     }
+
+    // The scalar must also close on this line. Without this a stray opener-positioned quote
+    // earlier in the line would make an unquoted placeholder look quoted.
+    let line_end = input[end..]
+        .find('\n')
+        .map_or(input.len(), |offset| end + offset);
+    let suffix = input[end..line_end].as_bytes();
+    let mut j = 0;
+    while j < suffix.len() {
+        match suffix[j] {
+            b'\\' => {
+                j += 2;
+                continue;
+            }
+            b'"' => return Context::DoubleQuoted,
+            _ => {}
+        }
+        j += 1;
+    }
+
+    Context::Unknown
 }
 
 /// Escape a value so it cannot terminate the double-quoted scalar it is being spliced into.
@@ -266,7 +309,7 @@ pub fn interpolate(input: &str, secrets: &HashMap<String, String>) -> Result<Str
 
             // The value is substituted into text that has not been parsed yet, so it must not be
             // able to close its scalar and introduce configuration of its own.
-            match scan_context(line_prefix(input, matched.start())) {
+            match classify(input, matched.start(), matched.end()) {
                 Context::DoubleQuoted => escape_double_quoted(value),
                 Context::Unknown if is_inert(value) => value.clone(),
                 Context::Unknown => {
@@ -376,6 +419,101 @@ mod tests {
                 .expect_err("a comma must not be accepted in an unquoted position");
 
             assert!(error[0].contains("could alter the configuration structure"));
+        }
+
+        #[test]
+        fn stray_quote_in_a_plain_scalar_does_not_enable_injection() {
+            // A single stray `"` inside a YAML plain scalar makes the line-local quote count odd.
+            // If that is read as "inside a double-quoted string" the value gets escaped instead of
+            // being required to be inert - and escaping does nothing to `,` or `:`, so structure
+            // is injected.
+            let config = interpolate(
+                r#"tags: {env: prod"x, region: SECRET[b.k]}"#,
+                &secrets("us, admin: true"),
+            );
+
+            if let Ok(rendered) = &config {
+                let parsed: serde_yaml::Value = serde_yaml::from_str(rendered).expect("valid YAML");
+                let tags = parsed["tags"].as_mapping().expect("a mapping");
+                assert!(
+                    !tags.contains_key(serde_yaml::Value::from("admin")),
+                    "secret injected an `admin` key: {rendered}"
+                );
+            }
+        }
+
+        #[test]
+        fn stray_quote_with_a_later_quote_on_the_line_is_still_rejected() {
+            // Requiring a closing quote is not sufficient on its own: here one exists further
+            // along the line, so only the opener-position test rules this out.
+            let error = interpolate(
+                r#"tags: {env: prod"x, region: SECRET[b.k], zone: "z"}"#,
+                &secrets("us, admin: true"),
+            )
+            .expect_err("a stray quote must not make this look like quoted context");
+
+            assert!(error[0].contains("could alter the configuration structure"));
+        }
+
+        #[test]
+        fn stray_quote_does_not_corrupt_the_secret_value() {
+            // The same misclassification also silently mangled values: the secret would be
+            // escaped as `has\"quote` in a position where nothing is escaped, so the config would
+            // receive a value the secret never contained. It must be rejected instead.
+            let error = interpolate(r#"key: a"b SECRET[b.k]"#, &secrets(r#"has"quote"#))
+                .expect_err("an unquoted position must not silently escape the value");
+
+            assert!(error[0].contains("could alter the configuration structure"));
+        }
+
+        #[test]
+        fn an_opener_quote_never_closed_on_the_line_requires_an_inert_value() {
+            let error = interpolate(r#"key: "unclosed SECRET[b.k]"#, &secrets(r#"has"quote"#))
+                .expect_err("an unbalanced scalar must fail closed");
+            assert!(error[0].contains("could alter the configuration structure"));
+
+            // An inert value is still fine there.
+            assert_eq!(
+                Ok(r#"key: "unclosed 8000"#.to_string()),
+                interpolate(r#"key: "unclosed SECRET[b.k]"#, &secrets("8000"))
+            );
+        }
+
+        #[test]
+        fn a_genuinely_quoted_scalar_in_a_flow_mapping_is_escaped() {
+            // The mirror of the rejection cases: when the placeholder really is inside a quoted
+            // scalar, a value full of structural characters must still be accepted.
+            let value = "us, admin: true";
+            let config = interpolate(
+                r#"tags: {env: prod, region: "SECRET[b.k]"}"#,
+                &secrets(value),
+            )
+            .expect("a properly quoted placeholder must accept any value");
+
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
+            let tags = parsed["tags"].as_mapping().unwrap();
+            assert_eq!(tags.len(), 2, "no key may have been injected");
+            assert_eq!(tags["region"].as_str(), Some(value));
+        }
+
+        #[test]
+        fn json_and_sequence_positions_are_recognised_as_quoted() {
+            let value = r#"a,b:c"d"#;
+
+            // JSON: the opener follows a `:`.
+            let json = interpolate(r#"{"password": "SECRET[b.k]"}"#, &secrets(value)).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            assert_eq!(parsed["password"].as_str(), Some(value));
+
+            // YAML sequence entry: the opener follows a `-`.
+            let yaml = interpolate(
+                r#"hosts:
+  - "SECRET[b.k]""#,
+                &secrets(value),
+            )
+            .unwrap();
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("valid YAML");
+            assert_eq!(parsed["hosts"][0].as_str(), Some(value));
         }
 
         #[test]
