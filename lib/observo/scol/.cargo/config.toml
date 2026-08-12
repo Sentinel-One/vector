@@ -1,0 +1,3 @@
+[alias]
+integration-test = "test -p scol --features integration-tests -- --test-threads=1 integration::"
+int-test = "test -p scol --features integration-tests -- --test-threads=1 integration::"

@@ -58,8 +58,17 @@ async-recursion = "1.1.1"
 inventory.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
+object_store = { workspace = true, features = ["aws", "azure"] }
+# Version-aligned with object_store's own reqwest so `object_store::Error::Generic`
+# sources downcast to `reqwest::Error` for retry classification (see objstore::is_retriable).
+reqwest = { version = "0.12", default-features = false }
 
 # Optional dependencies for testing (below)
+testcontainers = { version = "0.19", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+azure_storage = { version = "0.17", optional = true }
+azure_storage_blobs = { version = "0.17", optional = true }
+
 textwrap = { version = "0.16", optional = true }
 rstest = { version = "0.24.0", optional = true}
 oxide-auth = { version = "0.6", path = "../vendor/oxide-auth/oxide-auth", optional = true}
@@ -89,4 +98,5 @@ test-scenarios = ["vector-lib/test", "dep:textwrap", "dep:rstest", "dep:oxide-au
   "dep:oxide-auth-poem", "dep:tempfile", "dep:assert_matches", "sauth/test-support",
   "dep:pathsearch", "tokio/macros", "tokio/rt-multi-thread", "dep:stream-cancel", "dep:poem",
   "dep:vrl"]
+integration-tests = ["dep:testcontainers", "dep:aws-sdk-s3", "dep:azure_storage", "dep:azure_storage_blobs"]
 default = []
