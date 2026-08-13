@@ -67,6 +67,25 @@ pub struct InfluxdbDeserializerOptions {
     )]
     #[derivative(Default(value = "default_lossy()"))]
     pub lossy: bool,
+
+    /// The maximum number of (tag, value) pairs one line may materialise across all of its metrics.
+    ///
+    /// A line with T tags and F fields produces F metrics that each own a full copy of the T tags,
+    /// so its cost is T x F — quadratic in the length of a single line. The frame length cap does
+    /// not close this: a 100 KiB line still allows roughly 12k tags x 12k fields, on the order of
+    /// 10 GB once materialised. Real line protocol carries a handful of tags and at most a few
+    /// hundred fields, so the default sits far above legitimate traffic.
+    #[serde(
+        default = "default_max_tag_entries_per_line",
+        skip_serializing_if = "vector_core::serde::is_default"
+    )]
+    #[derivative(Default(value = "default_max_tag_entries_per_line()"))]
+    pub max_tag_entries_per_line: usize,
+}
+
+/// Default for [`InfluxdbDeserializerOptions::max_tag_entries_per_line`].
+const fn default_max_tag_entries_per_line() -> usize {
+    100_000
 }
 
 /// Deserializer for the influxdb line protocol
@@ -75,28 +94,19 @@ pub struct InfluxdbDeserializerOptions {
 pub struct InfluxdbDeserializer {
     #[derivative(Default(value = "default_lossy()"))]
     lossy: bool,
+    #[derivative(Default(value = "default_max_tag_entries_per_line()"))]
+    max_tag_entries_per_line: usize,
 }
 
 impl InfluxdbDeserializer {
     /// new constructs a new InfluxdbDeserializer
-    pub fn new(lossy: bool) -> Self {
-        Self { lossy }
+    pub fn new(lossy: bool, max_tag_entries_per_line: usize) -> Self {
+        Self {
+            lossy,
+            max_tag_entries_per_line,
+        }
     }
 }
-
-/// Maximum number of (tag, value) pairs one line may materialise across all of its metrics.
-///
-/// A line with T tags and F fields produces F metrics that each own a full copy of the T tags, so
-/// the memory it costs is T x F -- quadratic in the length of a single line. Hoisting the tag map
-/// out of the field loop removes the repeated string conversions but not this: `Metric::with_tags`
-/// takes `MetricTags` by value, so every metric genuinely owns its tags. Only a ceiling on the
-/// product bounds it.
-///
-/// The frame length cap bounds a line to 100 KiB by default, which still leaves room for roughly
-/// 12k tags x 12k fields -- on the order of 10 GB once materialised -- so the frame cap alone does
-/// not close this. Real line protocol carries a handful of tags and at most a few hundred fields,
-/// so this ceiling is far above legitimate traffic.
-const MAX_TAG_ENTRIES_PER_LINE: usize = 100_000;
 
 impl Deserializer for InfluxdbDeserializer {
     fn parse(
@@ -123,11 +133,12 @@ impl Deserializer for InfluxdbDeserializer {
             // quadratic amount in the first place.
             let tag_count = series.tag_set.as_ref().map_or(0, |ts| ts.len());
             let tag_entries = tag_count.saturating_mul(field_set.len());
-            if tag_entries > MAX_TAG_ENTRIES_PER_LINE {
+            if tag_entries > self.max_tag_entries_per_line {
                 return Err(format!(
                     "influxdb line would expand to {tag_entries} tag entries ({tag_count} tags \
-                     x {} fields), above the limit of {MAX_TAG_ENTRIES_PER_LINE}",
-                    field_set.len()
+                     x {} fields), above the limit of {}",
+                    field_set.len(),
+                    self.max_tag_entries_per_line
                 )
                 .into());
             }
@@ -175,6 +186,7 @@ impl From<&InfluxdbDeserializerConfig> for InfluxdbDeserializer {
     fn from(config: &InfluxdbDeserializerConfig) -> Self {
         Self {
             lossy: config.influxdb.lossy,
+            max_tag_entries_per_line: config.influxdb.max_tag_entries_per_line,
         }
     }
 }
@@ -187,11 +199,14 @@ mod tests {
         event::{Metric, MetricKind, MetricTags, MetricValue},
     };
 
+    use super::{
+        default_max_tag_entries_per_line, InfluxdbDeserializerConfig, InfluxdbDeserializerOptions,
+    };
     use crate::decoding::format::{Deserializer, InfluxdbDeserializer};
 
     #[test]
     fn deserialize_success() {
-        let deser = InfluxdbDeserializer::new(true);
+        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
         let now = chrono::Utc::now();
         let now_timestamp_nanos = now.timestamp_nanos_opt().unwrap();
         let buffer = Bytes::from(format!(
@@ -230,7 +245,7 @@ mod tests {
 
     #[test]
     fn deserialize_error() {
-        let deser = InfluxdbDeserializer::new(true);
+        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
         let buffer = Bytes::from("some invalid string");
         assert!(deser.parse(buffer, LogNamespace::default()).is_err());
     }
@@ -258,7 +273,7 @@ mod tests {
     /// materialised.
     #[test]
     fn line_over_the_tag_entry_limit_is_rejected() {
-        let deser = InfluxdbDeserializer::new(true);
+        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         // 400 x 400 = 160,000 entries, above the 100,000 ceiling.
         let error = deser
@@ -275,7 +290,7 @@ mod tests {
     /// The ceiling must sit far above real line protocol: a wide-but-ordinary line still decodes.
     #[test]
     fn ordinary_wide_line_is_still_accepted() {
-        let deser = InfluxdbDeserializer::new(true);
+        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         // 20 tags x 200 fields = 4,000 entries — generous for real telemetry, well under the cap.
         let events = deser
@@ -291,7 +306,7 @@ mod tests {
     /// drift into rejecting legitimate traffic.
     #[test]
     fn line_just_under_the_limit_is_accepted() {
-        let deser = InfluxdbDeserializer::new(true);
+        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         // 100 x 1000 = 100,000 entries, exactly the ceiling.
         let events = deser
@@ -300,11 +315,51 @@ mod tests {
         assert_eq!(events.len(), 1000);
     }
 
+    /// The ceiling is a config field, not a hardcoded constant: a deployment that knows its own
+    /// traffic can tighten it, and the tightened value is what the check enforces.
+    #[test]
+    fn a_configured_limit_overrides_the_default() {
+        // 20 x 200 = 4,000 entries — accepted at the default, refused once the cap is lowered.
+        let line = line_with(20, 200);
+
+        let default = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        assert!(default.parse(line.clone(), LogNamespace::default()).is_ok());
+
+        let strict = InfluxdbDeserializer::new(true, 1_000);
+        let error = strict
+            .parse(line, LogNamespace::default())
+            .expect_err("the configured ceiling must be the one enforced");
+        assert!(
+            error.to_string().contains("1000"),
+            "error should name the configured limit, got: {error}"
+        );
+    }
+
+    /// The config path must carry the field through to the deserializer; a `build()` that dropped
+    /// it would silently fall back to the default and leave the option inert.
+    #[test]
+    fn build_carries_the_configured_limit() {
+        let mut config = InfluxdbDeserializerConfig::new(InfluxdbDeserializerOptions {
+            lossy: true,
+            max_tag_entries_per_line: default_max_tag_entries_per_line(),
+        });
+        assert!(config
+            .build()
+            .parse(line_with(20, 200), LogNamespace::default())
+            .is_ok());
+
+        config.influxdb.max_tag_entries_per_line = 1_000;
+        config
+            .build()
+            .parse(line_with(20, 200), LogNamespace::default())
+            .expect_err("the value set on the config must reach the deserializer");
+    }
+
     /// Tags are built once per line and cloned into each metric, so every metric must still carry
     /// the complete tag set — the hoist must not have changed what is emitted.
     #[test]
     fn every_metric_carries_the_full_tag_set() {
-        let deser = InfluxdbDeserializer::new(true);
+        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         let events = deser
             .parse(
