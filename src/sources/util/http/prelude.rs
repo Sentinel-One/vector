@@ -47,6 +47,7 @@ use super::{
     encoding::{capped_body, decode},
     error::ErrorMessage,
 };
+use crate::sources::util::decompression::CompressionLimits;
 
 pub trait HttpSource: Clone + Send + Sync + 'static {
     // This function can be defined to enrich events with additional HTTP
@@ -70,8 +71,13 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
         path: &str,
     ) -> Result<Vec<Event>, ErrorMessage>;
 
-    fn decode(&self, encoding_header: Option<&str>, body: Bytes) -> Result<Bytes, ErrorMessage> {
-        decode(encoding_header, body)
+    fn decode(
+        &self,
+        encoding_header: Option<&str>,
+        body: Bytes,
+        limits: &CompressionLimits,
+    ) -> Result<Bytes, ErrorMessage> {
+        decode(encoding_header, body, limits)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -93,6 +99,9 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
         let protocol = tls.http_protocol_name();
         let auth = HttpSourceAuth::try_from(auth)?;
         let path = path.to_owned();
+        // Limits come from this component's context, so a deployment controls the cap.
+        // `CompressionLimits` is `Copy`, so it can simply be captured by the filter closures.
+        let compression_limits = cx.globals.limits.compression;
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
         let enable_source_ip = self.enable_source_ip();
 
@@ -132,7 +141,7 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
                 .and(warp::header::optional::<String>("authorization"))
                 .and(warp::header::optional::<String>("content-encoding"))
                 .and(warp::header::headers_cloned())
-                .and(capped_body())
+                .and(capped_body(&compression_limits))
                 .and(warp::query::<HashMap<String, String>>())
                 .and(warp::filters::ext::optional())
                 .and_then(
@@ -148,7 +157,7 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
 
                         let events = auth
                             .is_valid(&auth_header)
-                            .and_then(|()| self.decode(encoding_header.as_deref(), body))
+                            .and_then(|()| self.decode(encoding_header.as_deref(), body, &compression_limits))
                             .and_then(|body| {
                                 emit!(HttpBytesReceived {
                                     byte_size: body.len(),

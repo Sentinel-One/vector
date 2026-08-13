@@ -30,6 +30,7 @@ use warp::{
 
 use vector_lib::ipallowlist::IpAllowlistConfig;
 
+use crate::sources::util::decompression::CompressionLimits;
 use crate::http::{KeepaliveConfig, MaxConnectionAgeLayer};
 use crate::sources::http_server::HttpConfigParamKind;
 use crate::sources::util::add_headers;
@@ -102,6 +103,7 @@ pub(crate) fn build_warp_filter(
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
     headers: Vec<HttpConfigParamKind>,
+    compression_limits: CompressionLimits,
 ) -> BoxedFilter<(Response,)> {
     let log_filters = build_warp_log_filter(
         acknowledgements,
@@ -110,18 +112,21 @@ pub(crate) fn build_warp_filter(
         bytes_received.clone(),
         events_received.clone(),
         headers.clone(),
+        compression_limits,
     );
     let metrics_filters = build_warp_metrics_filter(
         acknowledgements,
         out.clone(),
         bytes_received.clone(),
         events_received.clone(),
+        compression_limits,
     );
     let trace_filters = build_warp_trace_filter(
         acknowledgements,
         out.clone(),
         bytes_received,
         events_received,
+        compression_limits,
     );
     log_filters
         .or(trace_filters)
@@ -153,6 +158,7 @@ fn build_warp_log_filter(
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
     headers: Vec<HttpConfigParamKind>,
+    compression_limits: CompressionLimits,
 ) -> BoxedFilter<(Response,)> {
     warp::post()
         .and(warp::path!("v1" / "logs"))
@@ -162,7 +168,7 @@ fn build_warp_log_filter(
         ))
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::headers_cloned())
-        .and(capped_body())
+        .and(capped_body(&compression_limits))
         .and_then(
             move |encoding_header: Option<String>, headers_config: HeaderMap, body: Bytes| {
                 let events = decode(encoding_header.as_deref(), body)
@@ -192,6 +198,7 @@ fn build_warp_metrics_filter(
     out: SourceSender,
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
+    compression_limits: CompressionLimits,
 ) -> BoxedFilter<(Response,)> {
     warp::post()
         .and(warp::path!("v1" / "metrics"))
@@ -200,7 +207,7 @@ fn build_warp_metrics_filter(
             "application/x-protobuf",
         ))
         .and(warp::header::optional::<String>("content-encoding"))
-        .and(capped_body())
+        .and(capped_body(&compression_limits))
         .and_then(move |encoding_header: Option<String>, body: Bytes| {
             let events = decode(encoding_header.as_deref(), body).and_then(|body| {
                 bytes_received.emit(ByteSize(body.len()));
@@ -223,6 +230,7 @@ fn build_warp_trace_filter(
     out: SourceSender,
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
+    compression_limits: CompressionLimits,
 ) -> BoxedFilter<(Response,)> {
     warp::post()
         .and(warp::path!("v1" / "traces"))
@@ -231,7 +239,7 @@ fn build_warp_trace_filter(
             "application/x-protobuf",
         ))
         .and(warp::header::optional::<String>("content-encoding"))
-        .and(capped_body())
+        .and(capped_body(&compression_limits))
         .and_then(move |encoding_header: Option<String>, body: Bytes| {
             let events = decode(encoding_header.as_deref(), body).and_then(|body| {
                 bytes_received.emit(ByteSize(body.len()));

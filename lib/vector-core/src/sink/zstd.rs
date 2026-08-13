@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::io;
 use std::io::{Read, Write};
-use vector_common::decompression::{CappedDecoder, CappedZstdReader};
+use vector_common::decompression::{CappedDecoder, CappedZstdReader, CompressionLimits};
 use crate::sink::compression::CompressionLevel;
 
 #[derive(Debug)]
@@ -78,9 +78,9 @@ pub struct ZstdDecoder<R: Read> {
 }
 
 impl<R: Read> ZstdDecoder<R> {
-    pub fn new(reader: R) -> io::Result<Self> {
+    pub fn new(reader: R, limits: &CompressionLimits) -> io::Result<Self> {
         Ok(Self {
-            inner: CappedDecoder::zstd(reader)?.into_reader(),
+            inner: CappedDecoder::zstd(reader, limits)?.into_reader(),
         })
     }
 }

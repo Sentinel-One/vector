@@ -7,7 +7,7 @@ use warp::{filters::BoxedFilter, Filter};
 use super::error::ErrorMessage;
 use crate::internal_events::HttpDecompressError;
 use crate::sources::util::decompression::{
-    max_decompressed_size_bytes, CappedDecoder, DecompressedSizeLimitExceeded,
+    CappedDecoder, CompressionLimits, DecompressedSizeLimitExceeded,
 };
 
 /// Collects a request body into [`Bytes`] while enforcing an in-memory size cap.
@@ -15,8 +15,8 @@ use crate::sources::util::decompression::{
 /// The cap is the global decompressed-size limit ([`max_decompressed_size_bytes`]): it bounds the
 /// raw (still-compressed) body a source buffers before decompression, so a large upload cannot
 /// drive unbounded allocation independently of the decompressed-size cap.
-pub(crate) fn capped_body() -> BoxedFilter<(Bytes,)> {
-    let max_body_size = max_decompressed_size_bytes();
+pub(crate) fn capped_body(limits: &CompressionLimits) -> BoxedFilter<(Bytes,)> {
+    let max_body_size = limits.max_decompressed_size_bytes;
     let max_body_size_header = u64::try_from(max_body_size).unwrap_or(u64::MAX);
 
     warp::header::optional::<u64>("content-length")
@@ -43,37 +43,36 @@ pub(crate) fn capped_body() -> BoxedFilter<(Bytes,)> {
 ///
 /// Supports gzip, deflate, snappy, zstd, and identity (no compression).
 ///
-/// Caps the decompressed output at the global limit to mitigate decompression-bomb DoS attacks.
-pub fn decode(header: Option<&str>, body: Bytes) -> Result<Bytes, ErrorMessage> {
-    decode_with_limit(header, body, max_decompressed_size_bytes())
-}
-
-/// Like [`decode`], but allows the caller to control the decompressed size cap.
-fn decode_with_limit(
+/// Caps the decompressed output at `limits` to mitigate decompression-bomb DoS attacks.
+///
+/// The cap is a parameter rather than process state so a caller passes the value from its own
+/// context, and a test can drive any cap it likes.
+pub fn decode(
     header: Option<&str>,
     mut body: Bytes,
-    max_decompressed_size: usize,
+    limits: &CompressionLimits,
 ) -> Result<Bytes, ErrorMessage> {
+    let max_decompressed_size = limits.max_decompressed_size_bytes;
     if let Some(encodings) = header {
         // Each round is capped, which also bounds a stacked `Content-Encoding: gzip,gzip,...`
         // chain, since every round's output is the next round's input.
         for encoding in encodings.rsplit(',').map(str::trim) {
             body = match encoding {
                 "identity" => body,
-                "gzip" => CappedDecoder::gzip_with_limit(body.reader(), max_decompressed_size)
+                "gzip" => CappedDecoder::gzip(body.reader(), limits)
                     .decompress()
                     .map(Bytes::from)
                     .map_err(|error| {
                         emit_decompress_error(encoding, error, max_decompressed_size)
                     })?,
-                "deflate" => CappedDecoder::zlib_with_limit(body.reader(), max_decompressed_size)
+                "deflate" => CappedDecoder::zlib(body.reader(), limits)
                     .decompress()
                     .map(Bytes::from)
                     .map_err(|error| {
                         emit_decompress_error(encoding, error, max_decompressed_size)
                     })?,
                 "snappy" => decompress_snappy(&body, max_decompressed_size)?,
-                "zstd" => CappedDecoder::zstd_http_with_limit(body.reader(), max_decompressed_size)
+                "zstd" => CappedDecoder::zstd_http(body.reader(), limits)
                     .map_err(|error| emit_decompress_error(encoding, error, max_decompressed_size))?
                     .decompress()
                     .map(Bytes::from)

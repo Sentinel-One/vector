@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use vector_common::constants::{GZIP_MAGIC, ZLIB_MAGIC};
-use vector_common::decompression::CappedDecoder;
+use vector_common::decompression::{CappedDecoder, CompressionLimits};
 use vector_config::configurable_component;
 
 const GELF_MAGIC: &[u8] = &[0x1e, 0x0f];
@@ -34,12 +34,13 @@ pub struct ChunkedGelfDecoderConfig {
 
 impl ChunkedGelfDecoderConfig {
     /// Build the `ChunkedGelfDecoder` from this configuration.
-    pub fn build(&self) -> ChunkedGelfDecoder {
+    pub fn build(&self, compression_limits: CompressionLimits) -> ChunkedGelfDecoder {
         ChunkedGelfDecoder::new(
             self.chunked_gelf.timeout_secs,
             self.chunked_gelf.pending_messages_limit,
             self.chunked_gelf.max_length,
             self.chunked_gelf.decompression,
+            compression_limits,
         )
     }
 }
@@ -207,13 +208,17 @@ impl ChunkedGelfDecompression {
         Self::None
     }
 
-    pub fn decompress(&self, data: Bytes) -> Result<Bytes, ChunkedGelfDecompressionError> {
+    pub fn decompress(
+        &self,
+        data: Bytes,
+        limits: &CompressionLimits,
+    ) -> Result<Bytes, ChunkedGelfDecompressionError> {
         let decompressed = match self {
-            Self::Gzip => CappedDecoder::gzip(data.reader())
+            Self::Gzip => CappedDecoder::gzip(data.reader(), limits)
                 .decompress()
                 .map(Bytes::from)
                 .context(GzipDecompressionSnafu)?,
-            Self::Zlib => CappedDecoder::zlib(data.reader())
+            Self::Zlib => CappedDecoder::zlib(data.reader(), limits)
                 .decompress()
                 .map(Bytes::from)
                 .context(ZlibDecompressionSnafu)?,
@@ -289,6 +294,8 @@ impl FramingError for ChunkedGelfDecoderError {
 /// and [Graylog's go-gelf library](https://github.com/Graylog2/go-gelf/blob/v1/gelf/reader.go).
 #[derive(Debug, Clone)]
 pub struct ChunkedGelfDecoder {
+    /// Limits to decompress a reassembled message under.
+    compression_limits: CompressionLimits,
     // We have to use this decoder to read all the bytes from the buffer first and don't let tokio
     // read it buffered, as tokio FramedRead will not always call the decode method with the
     // whole message. (see https://docs.rs/tokio-util/latest/src/tokio_util/codec/framed_impl.rs.html#26).
@@ -309,10 +316,12 @@ impl ChunkedGelfDecoder {
         pending_messages_limit: Option<usize>,
         max_length: Option<usize>,
         decompression_config: ChunkedGelfDecompressionConfig,
+        compression_limits: CompressionLimits,
     ) -> Self {
         Self {
             bytes_decoder: BytesDecoder::new(),
             decompression_config,
+            compression_limits,
             state: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs_f64(timeout_secs),
             pending_messages_limit,
@@ -466,7 +475,7 @@ impl ChunkedGelfDecoder {
             .map(|message| {
                 self.decompression_config
                     .get_decompression(&message)
-                    .decompress(message)
+                    .decompress(message, &self.compression_limits)
                     .context(DecompressionSnafu)
             })
             .transpose()
@@ -480,6 +489,7 @@ impl Default for ChunkedGelfDecoder {
             None,
             None,
             ChunkedGelfDecompressionConfig::Auto,
+            CompressionLimits::default(),
         )
     }
 }

@@ -1,11 +1,9 @@
 //! Re-export of the shared decompression limits.
 //!
-//! The implementation lives in [`vector_common::decompression`] so that both the source crate and
-//! `lib/codecs` can enforce the same global decompressed-size cap without duplicating it. This
-//! module mirrors upstream's `crate::sources::util::decompression` import path.
+//! The implementation lives in [`vector_common::decompression`] so that both this crate and
+//! `lib/codecs` enforce the same limits. Components take a [`CompressionLimits`] from their own
+//! context (`cx.globals.limits.compression`) rather than reading process state.
 pub use vector_common::decompression::{
-    http_zstd_window_log_max, max_decompressed_size_bytes,
-    max_zlib_compressed_frame_size_bytes, max_zstd_window_log, set_max_decompressed_size_bytes,
-    zstd_window_log_max, CappedDecoder, CappedReader, DecompressedSizeLimitExceeded,
-    DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES, HTTP_ZSTD_WINDOW_LOG_MAX,
+    CappedDecoder, CappedReader, CompressionLimits, DecompressedSizeLimitExceeded,
+    OperationalLimits, DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES, HTTP_ZSTD_WINDOW_LOG_MAX,
 };
