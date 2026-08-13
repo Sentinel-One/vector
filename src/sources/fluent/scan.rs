@@ -17,11 +17,12 @@
 
 use super::DecodeError;
 
-/// Maximum MessagePack nesting depth accepted from a peer.
+/// Default maximum MessagePack nesting depth accepted from a peer.
 ///
 /// Fluent records are shallow in practice — a tag, a timestamp and a flat map of fields. This
 /// leaves generous headroom for nested objects while keeping recursion far below any stack limit.
-pub(super) const MAX_MSGPACK_DEPTH: usize = 128;
+/// Configurable per source via `max_msgpack_depth`.
+pub(super) const DEFAULT_MAX_MSGPACK_DEPTH: usize = 128;
 
 /// Walks the MessagePack structure in `buf` without recursing, rejecting frames that are nested
 /// too deeply or that declare a length no legitimate frame could satisfy.
@@ -168,7 +169,7 @@ mod tests {
     const MAX_LEN: usize = 1024 * 1024;
 
     fn scan(buf: &[u8]) -> Result<(), DecodeError> {
-        scan_msgpack_frame(buf, MAX_MSGPACK_DEPTH, MAX_LEN)
+        scan_msgpack_frame(buf, DEFAULT_MAX_MSGPACK_DEPTH, MAX_LEN)
     }
 
     /// `0x91` is a one-element array, so each byte adds a nesting level.
@@ -195,7 +196,8 @@ mod tests {
 
     #[test]
     fn accepts_nesting_just_below_the_limit() {
-        scan(&nested(MAX_MSGPACK_DEPTH - 1)).expect("nesting within the limit must be accepted");
+        scan(&nested(DEFAULT_MAX_MSGPACK_DEPTH - 1))
+            .expect("nesting within the limit must be accepted");
     }
 
     #[test]
@@ -244,11 +246,11 @@ mod tests {
     /// OBE-10708: one byte per nesting level, so a byte-size cap cannot bound recursion depth.
     #[test]
     fn rejects_nesting_past_the_limit() {
-        let error = scan(&nested(MAX_MSGPACK_DEPTH + 1))
+        let error = scan(&nested(DEFAULT_MAX_MSGPACK_DEPTH + 1))
             .expect_err("nesting past the limit must be rejected");
 
         assert!(
-            matches!(error, DecodeError::FrameTooDeep { max, .. } if max == MAX_MSGPACK_DEPTH),
+            matches!(error, DecodeError::FrameTooDeep { max, .. } if max == DEFAULT_MAX_MSGPACK_DEPTH),
             "unexpected error: {error:?}"
         );
         assert!(
@@ -262,7 +264,7 @@ mod tests {
     fn rejects_deep_map_nesting() {
         // 0x81 is a one-pair fixmap: key, then a nested map as the value.
         let mut frame = Vec::new();
-        for _ in 0..=MAX_MSGPACK_DEPTH {
+        for _ in 0..=DEFAULT_MAX_MSGPACK_DEPTH {
             frame.push(0x81);
             frame.push(0xc0); // nil key
         }
