@@ -24,7 +24,7 @@ use vector_lib::internal_event::{
 
 use crate::internal_events::{GrpcError, GrpcInvalidCompressionSchemeError};
 use crate::sources::util::decompression::{
-    is_decompressed_size_limit_error, max_decompressed_size_bytes,
+    max_decompressed_size_bytes,
     max_zlib_compressed_frame_size_bytes, DecompressedSizeLimitExceeded,
 };
 
@@ -98,7 +98,7 @@ impl Default for State {
 /// `out_of_range` (a client fault, matching the existing >4GB handling) while anything else falls
 /// back to `internal` with `internal_msg`.
 fn decompressor_error_to_status(error: &io::Error, internal_msg: &'static str) -> Status {
-    if is_decompressed_size_limit_error(error) {
+    if DecompressedSizeLimitExceeded::is(error) {
         Status::out_of_range("decompressed message exceeds the maximum allowed size")
     } else {
         Status::internal(internal_msg)
@@ -496,7 +496,7 @@ mod tests {
             .expect_err("one byte past the limit must be rejected");
 
         assert!(
-            is_decompressed_size_limit_error(&error),
+            DecompressedSizeLimitExceeded::is(&error),
             "expected the size-limit marker, got {error}"
         );
     }
@@ -512,7 +512,7 @@ mod tests {
             .write_all(&bomb)
             .expect_err("a payload inflating past the cap must be rejected");
 
-        assert!(is_decompressed_size_limit_error(&error));
+        assert!(DecompressedSizeLimitExceeded::is(&error));
     }
 
     #[test]

@@ -1,3 +1,9 @@
+// Tests decode payloads this process just encoded, so there is no untrusted input and nothing to
+// cap. They deliberately keep using the raw decoders: leaving them untouched means they stay an
+// independent regression check on the capped wrappers, rather than testing those wrappers against
+// themselves.
+#![allow(clippy::disallowed_types)]
+
 use std::{
     io::{BufRead, BufReader},
     num::NonZeroU32,
@@ -6,9 +12,9 @@ use std::{
 use azure_core::{error::HttpError, prelude::Range};
 use azure_storage_blobs::prelude::*;
 use bytes::{Buf, BytesMut};
+use flate2::read::GzDecoder;
 use futures::{stream, Stream, StreamExt};
 use http::StatusCode;
-use vector_common::decompression::CappedDecoder;
 use vector_lib::codecs::{
     encoding::FramingConfig, JsonSerializerConfig, NewlineDelimitedEncoderConfig,
     TextSerializerConfig,
@@ -320,7 +326,7 @@ impl AzureBlobSinkConfig {
         if self.compression == Compression::None {
             BufReader::new(body).lines().map(|l| l.unwrap()).collect()
         } else {
-            BufReader::new(CappedDecoder::gzip(body).into_reader())
+            BufReader::new(GzDecoder::new(body))
                 .lines()
                 .map(|l| l.unwrap())
                 .collect()

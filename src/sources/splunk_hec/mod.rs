@@ -3067,6 +3067,7 @@ mod tests {
     /// test catches a systematic regression (a stall waiting on end-of-stream would cost hundreds
     /// of ms) without tripping on CI scheduling noise. The median is used so one stalled sample
     /// cannot fail the run.
+    #[cfg(feature = "performance-tests")]
     #[tokio::test]
     async fn capped_body_does_not_add_request_latency() {
         const SAMPLES: usize = 9;

@@ -7,7 +7,7 @@ use warp::{filters::BoxedFilter, Filter};
 use super::error::ErrorMessage;
 use crate::internal_events::HttpDecompressError;
 use crate::sources::util::decompression::{
-    is_decompressed_size_limit_error, max_decompressed_size_bytes, CappedDecoder,
+    max_decompressed_size_bytes, CappedDecoder, DecompressedSizeLimitExceeded,
 };
 
 /// Collects a request body into [`Bytes`] while enforcing an in-memory size cap.
@@ -219,7 +219,7 @@ fn emit_decompress_error(
     error: std::io::Error,
     max_decompressed_size: usize,
 ) -> ErrorMessage {
-    if is_decompressed_size_limit_error(&error) {
+    if DecompressedSizeLimitExceeded::is(&error) {
         return decompressed_too_large_error(encoding, max_decompressed_size);
     }
     emit!(HttpDecompressError {

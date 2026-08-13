@@ -890,6 +890,11 @@ sinks-webhdfs = ["dep:opendal"]
 # Identifies that the build is a nightly build
 nightly = []
 
+# Timing-sensitive tests. Kept out of the default suite so CI scheduling noise cannot fail a run;
+# enable explicitly (dataplane-build does) to exercise them, and eventually in a dedicated fork of
+# the test workflow.
+performance-tests = []
+
 # Integration testing-related features
 all-integration-tests = [
   "amqp-integration-tests",

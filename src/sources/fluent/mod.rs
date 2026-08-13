@@ -1091,6 +1091,23 @@ mod tests {
             error.can_continue(),
             "an unknown message shape must not drop the connection"
         );
+
+        // Recoverable is only safe if the frame was consumed. serde buffers an untagged enum
+        // whole before choosing a variant, so the deserializer advances past the message even
+        // when no variant matches; without that this would re-decode the same byte forever, the
+        // livelock OBE-11559 describes for logstash.
+        assert!(
+            buf.is_empty(),
+            "the refused message must still be consumed, or the decoder livelocks"
+        );
+
+        // And the stream keeps working: the next well-formed message decodes normally.
+        buf.extend_from_slice(&[0xc0u8]); // nil heartbeat
+        assert!(
+            matches!(decoder.decode(&mut buf), Ok(None)),
+            "the decoder should carry on after refusing an unknown message"
+        );
+        assert!(buf.is_empty());
     }
 
     /// OBE-10708: a deeply nested frame must be refused by our pre-scan *before* `rmp_serde`

@@ -981,16 +981,25 @@ fn write_payload_footer(
 
 #[cfg(test)]
 mod tests {
-    use std::{io, num::NonZeroU32, sync::Arc};
+    // Tests decode payloads this process just encoded, so there is no untrusted input and nothing
+    // to cap. They deliberately keep using the raw decoders: leaving them untouched means they
+    // stay an independent regression check on the capped wrappers.
+    #![allow(clippy::disallowed_types)]
 
-    use bytes::{BufMut, Bytes};
+    use std::{
+        io::{self, copy},
+        num::NonZeroU32,
+        sync::Arc,
+    };
+
+    use bytes::{BufMut, Bytes, BytesMut};
     use chrono::{DateTime, TimeZone, Timelike, Utc};
+    use flate2::read::ZlibDecoder;
     use proptest::{
         arbitrary::any, collection::btree_map, num::f64::POSITIVE as ARB_POSITIVE_F64, prop_assert,
         proptest, strategy::Strategy, string::string_regex,
     };
     use prost::Message;
-    use vector_common::decompression::CappedDecoder;
     use vector_lib::{
         config::{log_schema, LogSchema},
         event::{
@@ -1064,9 +1073,10 @@ mod tests {
     }
 
     fn decompress_payload(payload: Bytes) -> io::Result<Bytes> {
-        CappedDecoder::zlib(&payload[..])
-            .decompress()
-            .map(Bytes::from)
+        let mut decompressor = ZlibDecoder::new(&payload[..]);
+        let mut decompressed = BytesMut::new().writer();
+        let result = copy(&mut decompressor, &mut decompressed);
+        result.map(|_| decompressed.into_inner().freeze())
     }
 
     fn ts() -> DateTime<Utc> {

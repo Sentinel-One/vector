@@ -1,4 +1,16 @@
 #![allow(missing_docs)]
+// Tests decode payloads this process just encoded, so there is no untrusted input and nothing to
+// cap. They deliberately keep using the raw decoders: leaving them untouched means they stay an
+// independent regression check on the capped wrappers, rather than testing those wrappers against
+// themselves.
+//
+// Caveat: unlike the other test modules this one is declared as a plain `pub mod test_util` with
+// no `cfg`, so it compiles into the library and this allow is broader than it looks. The helpers
+// below only read files this process wrote, so nothing here touches untrusted input — but if a
+// caller outside the tests ever uses them, the disallowed-types lint will not object. Gate the
+// module (as `inet_test_util` above it is) if that becomes a concern.
+#![allow(clippy::disallowed_types)]
+
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -21,6 +33,7 @@ use crate::event::EventContainer;
 use crate::event::{BatchNotifier, Event, EventArray, LogEvent, MetricTags, MetricValue};
 use crate::event::{Metric, MetricKind};
 use chrono::{DateTime, SubsecRound, Utc};
+use flate2::read::MultiGzDecoder;
 use futures::{stream, task::noop_waker_ref, FutureExt, SinkExt, Stream, StreamExt, TryStreamExt};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
 use rand::{thread_rng, Rng};
@@ -38,8 +51,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::codec::{Encoder, FramedRead, FramedWrite, LinesCodec};
 use vector_buffers::topology::channel::LimitedReceiver;
-use vector_common::decompression::CappedDecoder;
 use vector_config::component::GenerateConfig;
+use zstd::Decoder as ZstdDecoder;
 
 #[cfg(test)]
 pub(crate) fn open_fixture(path: impl AsRef<Path>) -> crate::Result<serde_json::Value> {
@@ -433,23 +446,22 @@ pub fn lines_from_gzip_file<P: AsRef<Path>>(path: P) -> Vec<String> {
     let mut file = File::open(path).unwrap();
     let mut gzip_bytes = Vec::new();
     file.read_to_end(&mut gzip_bytes).unwrap();
-    let output = CappedDecoder::gzip(&gzip_bytes[..]).decompress().unwrap();
-    String::from_utf8(output)
-        .unwrap()
-        .lines()
-        .map(|s| s.to_owned())
-        .collect()
+    let mut output = String::new();
+    MultiGzDecoder::new(&gzip_bytes[..])
+        .read_to_string(&mut output)
+        .unwrap();
+    output.lines().map(|s| s.to_owned()).collect()
 }
 
 pub fn lines_from_zstd_file<P: AsRef<Path>>(path: P) -> Vec<String> {
     trace!(message = "Reading zstd file.", path = %path.as_ref().display());
     let file = File::open(path).unwrap();
-    let output = CappedDecoder::zstd(file).unwrap().decompress().unwrap();
-    String::from_utf8(output)
+    let mut output = String::new();
+    ZstdDecoder::new(file)
         .unwrap()
-        .lines()
-        .map(|s| s.to_owned())
-        .collect()
+        .read_to_string(&mut output)
+        .unwrap();
+    output.lines().map(|s| s.to_owned()).collect()
 }
 
 pub fn runtime() -> runtime::Runtime {

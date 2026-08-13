@@ -10,6 +10,9 @@ disallowed-methods = [
   { path = "warp::body::bytes", reason = "Reads the whole request body into memory unbounded. Use `crate::sources::util::http::capped_body()` to cap the compressed body size at the global decompressed-size limit." },
 ]
 
+# Decompression limits are per-component configuration, not process state: take them from the
+# component's context (`SourceContext` / `SinkContext` / `TransformContext` -> `GlobalOptions`)
+# and pass them into the capped wrapper, rather than reading a global.
 disallowed-types = [
   { path = "once_cell::sync::OnceCell", reason = "Use `std::sync::OnceLock` instead." },
   { path = "once_cell::unsync::OnceCell", reason = "Use `std::cell::OnceCell` instead." },

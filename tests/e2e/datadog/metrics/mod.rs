@@ -1,6 +1,13 @@
+// Tests decode payloads this process just encoded, so there is no untrusted input and nothing to
+// cap. They deliberately keep using the raw decoders: leaving them untouched means they stay an
+// independent regression check on the capped wrappers, rather than testing those wrappers against
+// themselves.
+#![allow(clippy::disallowed_types)]
+
 use base64::{prelude::BASE64_STANDARD, Engine};
 use bytes::Bytes;
-use vector_common::decompression::CappedDecoder;
+use flate2::read::ZlibDecoder;
+use std::io::Read;
 
 use vector::test_util::trace_init;
 
@@ -10,7 +17,10 @@ mod sketches;
 use super::*;
 
 fn decompress_payload(payload: Vec<u8>) -> std::io::Result<Vec<u8>> {
-    CappedDecoder::zlib(&payload[..]).decompress()
+    let mut decompressor = ZlibDecoder::new(&payload[..]);
+    let mut decompressed = Vec::new();
+    let result = decompressor.read_to_end(&mut decompressed);
+    result.map(|_| decompressed)
 }
 
 fn unpack_proto_payloads<T>(in_payloads: &FakeIntakeResponseRaw) -> Vec<T>

@@ -35,7 +35,7 @@ use crate::{
     },
     sources::{
         aws_kinesis_firehose::AwsKinesisFirehoseConfig,
-        util::decompression::{is_decompressed_size_limit_error, CappedDecoder},
+        util::decompression::{CappedDecoder, DecompressedSizeLimitExceeded},
     },
     SourceSender,
 };
@@ -225,7 +225,7 @@ fn decode_record(
                     // An exceeded size cap means the magic bytes really were gzip and the payload
                     // is oversized, so reject it. Only fall back to forwarding the raw bytes when
                     // auto-detection guessed wrong (valid-looking magic, but not actually gzip).
-                    if is_decompressed_size_limit_error(&error) {
+                    if DecompressedSizeLimitExceeded::is(&error) {
                         return Err(error).with_context(|_| DecompressionSnafu {
                             compression: Compression::Gzip,
                         });

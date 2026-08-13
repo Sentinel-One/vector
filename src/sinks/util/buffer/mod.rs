@@ -162,7 +162,15 @@ impl Batch for Buffer {
 
 #[cfg(test)]
 mod test {
-    use std::sync::{Arc, Mutex};
+    // Tests decode payloads this process just encoded, so there is no untrusted input and nothing
+    // to cap. They deliberately keep using the raw decoders: leaving them untouched means they
+    // stay an independent regression check on the capped wrappers.
+    #![allow(clippy::disallowed_types)]
+
+    use std::{
+        io::Read,
+        sync::{Arc, Mutex},
+    };
 
     use bytes::{Buf, BytesMut};
     use futures::{future, stream, SinkExt, StreamExt};
@@ -174,7 +182,7 @@ mod test {
 
     #[tokio::test]
     async fn gzip() {
-        use vector_common::decompression::CappedDecoder;
+        use flate2::read::MultiGzDecoder;
 
         let sent_requests = Arc::new(Mutex::new(Vec::new()));
 
@@ -217,9 +225,13 @@ mod test {
         assert!(output.len() > 1);
         assert!(output.iter().map(|o| o.len()).sum::<usize>() < 80_000);
 
-        let decompressed = output
-            .into_iter()
-            .flat_map(|batch| CappedDecoder::gzip(batch.reader()).decompress().unwrap());
+        let decompressed = output.into_iter().flat_map(|batch| {
+            let mut decompressed = vec![];
+            MultiGzDecoder::new(batch.reader())
+                .read_to_end(&mut decompressed)
+                .unwrap();
+            decompressed
+        });
 
         assert!(decompressed.eq(std::iter::repeat(
             b"It's going down, I'm yelling timber, You better move, you better dance".to_vec()

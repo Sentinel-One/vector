@@ -166,7 +166,7 @@ pub fn max_zstd_window_log() -> Option<u32> {
 /// Error raised when a decompressed payload would exceed the configured size cap.
 ///
 /// Surfaced (wrapped in [`io::Error`]) by [`CappedDecoder::decompress`] and the [`CappedReader`]
-/// returned by [`CappedDecoder::into_reader`]. Use [`is_decompressed_size_limit_error`] to detect
+/// returned by [`CappedDecoder::into_reader`]. Use [`DecompressedSizeLimitExceeded::is`] to detect
 /// it and distinguish an oversized-input fault from an unrelated I/O error.
 #[derive(Debug)]
 pub struct DecompressedSizeLimitExceeded;
@@ -179,15 +179,16 @@ impl fmt::Display for DecompressedSizeLimitExceeded {
 
 impl std::error::Error for DecompressedSizeLimitExceeded {}
 
-/// Returns whether `error` was raised because decompression hit the size cap (see
-/// [`DecompressedSizeLimitExceeded`]).
-#[must_use]
-pub fn is_decompressed_size_limit_error(error: &io::Error) -> bool {
-    fn is_marker(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-        source.is::<DecompressedSizeLimitExceeded>()
-    }
+impl DecompressedSizeLimitExceeded {
+    /// Returns whether `error` was raised because decompression hit the size cap.
+    #[must_use]
+    pub fn is(error: &io::Error) -> bool {
+        fn is_marker(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+            source.is::<DecompressedSizeLimitExceeded>()
+        }
 
-    error.get_ref().is_some_and(is_marker)
+        error.get_ref().is_some_and(is_marker)
+    }
 }
 
 /// A size-capped decompression reader.
@@ -372,6 +373,18 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn gzip_compress(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zlib_compress(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn zlib_bomb(len: usize) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
         encoder.write_all(&vec![0u8; len]).unwrap();
@@ -394,7 +407,7 @@ mod tests {
             .decompress()
             .expect_err("payload over the limit must be rejected");
         assert!(
-            is_decompressed_size_limit_error(&error),
+            DecompressedSizeLimitExceeded::is(&error),
             "expected the size-limit marker, got {error}"
         );
     }
@@ -415,7 +428,7 @@ mod tests {
             .decompress()
             .expect_err("concatenated members must be capped in aggregate");
         assert!(
-            is_decompressed_size_limit_error(&error),
+            DecompressedSizeLimitExceeded::is(&error),
             "expected the size-limit marker, got {error}"
         );
     }
@@ -426,7 +439,7 @@ mod tests {
         let error = CappedDecoder::zlib_with_limit(payload.as_slice(), 1024)
             .decompress()
             .expect_err("payload over the limit must be rejected");
-        assert!(is_decompressed_size_limit_error(&error));
+        assert!(DecompressedSizeLimitExceeded::is(&error));
     }
 
     /// A single frame declaring a window larger than the cap is refused by the `window_log_max`
@@ -460,7 +473,7 @@ mod tests {
             .decompress()
             .expect_err("payload over the limit must be rejected");
         assert!(
-            is_decompressed_size_limit_error(&error),
+            DecompressedSizeLimitExceeded::is(&error),
             "expected the size-limit marker, got {error}"
         );
     }
@@ -474,7 +487,7 @@ mod tests {
         let mut sink = Vec::new();
         let error = std::io::copy(&mut reader, &mut sink)
             .expect_err("streaming past the limit must error, not silently truncate");
-        assert!(is_decompressed_size_limit_error(&error));
+        assert!(DecompressedSizeLimitExceeded::is(&error));
         assert!(
             sink.len() <= 1024,
             "must not hand more than the limit to the consumer, got {}",
@@ -488,7 +501,7 @@ mod tests {
         let error = CappedDecoder::gzip_with_limit(b"not gzip at all".as_slice(), 1024)
             .decompress()
             .expect_err("invalid gzip must fail");
-        assert!(!is_decompressed_size_limit_error(&error));
+        assert!(!DecompressedSizeLimitExceeded::is(&error));
     }
 
     #[test]
@@ -509,5 +522,81 @@ mod tests {
             max_decompressed_size_bytes(),
             DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
         );
+    }
+
+    /// Cross-check every capped decoder against the raw decoder it wraps.
+    ///
+    /// The rest of the suite exercises `CappedDecoder` against itself, and the codebase's other
+    /// tests decode with the raw decoders — so nothing else would notice if a capped wrapper
+    /// decoded *correctly-sized but wrong* output (a short read treated as EOF, an off-by-one in
+    /// the `Take` bound, a dropped final block). Using the raw decoder as the reference is the
+    /// point: if the two ever disagree, the wrapper is at fault.
+    #[test]
+    fn capped_decoders_agree_with_the_raw_decoders_they_wrap() {
+        // Sizes chosen to straddle the internal buffer boundaries a short read would expose:
+        // empty, sub-block, exactly 8 KiB, and a size that is not a multiple of any block.
+        for size in [0usize, 1, 100, 8 * 1024, 8 * 1024 + 1, 70_000] {
+            // Mixed content, not zeroes: a run of zeroes can hide a truncation that repeats.
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+            // gzip
+            let compressed = gzip_compress(&payload);
+            let mut expected = Vec::new();
+            MultiGzDecoder::new(&compressed[..])
+                .read_to_end(&mut expected)
+                .expect("raw gzip decode");
+            let actual = CappedDecoder::gzip(&compressed[..])
+                .decompress()
+                .expect("capped gzip decode");
+            assert_eq!(actual, expected, "gzip disagreed at {size} bytes");
+            assert_eq!(actual, payload, "gzip round-trip lost data at {size} bytes");
+
+            // zlib
+            let compressed = zlib_compress(&payload);
+            let mut expected = Vec::new();
+            ZlibDecoder::new(&compressed[..])
+                .read_to_end(&mut expected)
+                .expect("raw zlib decode");
+            let actual = CappedDecoder::zlib(&compressed[..])
+                .decompress()
+                .expect("capped zlib decode");
+            assert_eq!(actual, expected, "zlib disagreed at {size} bytes");
+            assert_eq!(actual, payload, "zlib round-trip lost data at {size} bytes");
+
+            // zstd
+            let compressed = zstd::stream::encode_all(&payload[..], 3).expect("zstd encode");
+            let mut expected = Vec::new();
+            zstd::stream::read::Decoder::new(&compressed[..])
+                .expect("raw zstd decoder")
+                .read_to_end(&mut expected)
+                .expect("raw zstd decode");
+            let actual = CappedDecoder::zstd(&compressed[..])
+                .expect("capped zstd decoder")
+                .decompress()
+                .expect("capped zstd decode");
+            assert_eq!(actual, expected, "zstd disagreed at {size} bytes");
+            assert_eq!(actual, payload, "zstd round-trip lost data at {size} bytes");
+        }
+    }
+
+    /// The streaming reader must agree with the buffered path, so a caller that streams through
+    /// `into_reader` cannot silently receive different bytes than one calling `decompress`.
+    #[test]
+    fn streaming_reader_agrees_with_the_buffered_path() {
+        let payload: Vec<u8> = (0..70_000).map(|i| (i % 251) as u8).collect();
+        let compressed = gzip_compress(&payload);
+
+        let buffered = CappedDecoder::gzip(&compressed[..])
+            .decompress()
+            .expect("buffered decode");
+
+        let mut streamed = Vec::new();
+        CappedDecoder::gzip(&compressed[..])
+            .into_reader()
+            .read_to_end(&mut streamed)
+            .expect("streamed decode");
+
+        assert_eq!(streamed, buffered);
+        assert_eq!(streamed, payload);
     }
 }

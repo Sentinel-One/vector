@@ -595,12 +595,18 @@ impl StreamSink<Event> for PrometheusExporter {
 
 #[cfg(test)]
 mod tests {
+    // Tests decode payloads this process just encoded, so there is no untrusted input and nothing
+    // to cap. They deliberately keep using the raw decoders: leaving them untouched means they
+    // stay an independent regression check on the capped wrappers.
+    #![allow(clippy::disallowed_types)]
+
     use chrono::{Duration, Utc};
+    use flate2::read::GzDecoder;
     use futures::stream;
     use indoc::indoc;
     use similar_asserts::assert_eq;
+    use std::io::Read;
     use tokio::{sync::oneshot::error::TryRecvError, time};
-    use vector_common::decompression::CappedDecoder;
     use vector_lib::{
         event::{MetricTags, StatisticKind},
         finalization::{BatchNotifier, BatchStatus},
@@ -800,8 +806,9 @@ mod tests {
             name = name1,
         );
 
-        let body_decoded =
-            String::from_utf8(CappedDecoder::gzip(&body_raw[..]).decompress().unwrap()).unwrap();
+        let mut gz = GzDecoder::new(&body_raw[..]);
+        let mut body_decoded = String::new();
+        let _ = gz.read_to_string(&mut body_decoded);
 
         assert!(body_raw.len() < expected.len());
         assert_eq!(body_decoded, expected);

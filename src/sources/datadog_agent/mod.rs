@@ -34,7 +34,7 @@ use tokio::net::TcpStream;
 use tower::ServiceBuilder;
 use tracing::Span;
 use crate::sources::util::decompression::{
-    is_decompressed_size_limit_error, max_decompressed_size_bytes, CappedDecoder,
+    max_decompressed_size_bytes, CappedDecoder, DecompressedSizeLimitExceeded,
 };
 use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
 use vector_lib::config::{LegacyKey, LogNamespace};
@@ -545,7 +545,7 @@ pub(crate) async fn handle_request(
 fn handle_decode_error(encoding: &str, error: std::io::Error) -> ErrorMessage {
     // A size-cap trip is an oversized-request client fault, so report it as 413 with the limit
     // that was enforced, matching the shared HTTP decoder. Anything else is malformed input (422).
-    if is_decompressed_size_limit_error(&error) {
+    if DecompressedSizeLimitExceeded::is(&error) {
         return ErrorMessage::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
