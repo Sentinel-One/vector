@@ -2,6 +2,7 @@ use std::{collections::HashMap, net::SocketAddr};
 
 use bytes::Bytes;
 use prost::Message;
+use crate::sources::util::decompression::CompressionLimits;
 use vector_lib::config::LogNamespace;
 use vector_lib::configurable::configurable_component;
 use vector_lib::ipallowlist::IpAllowlistConfig;
@@ -149,9 +150,14 @@ impl RemoteWriteSource {
 }
 
 impl HttpSource for RemoteWriteSource {
-    fn decode(&self, encoding_header: Option<&str>, body: Bytes) -> Result<Bytes, ErrorMessage> {
+    fn decode(
+        &self,
+        encoding_header: Option<&str>,
+        body: Bytes,
+        limits: &CompressionLimits,
+    ) -> Result<Bytes, ErrorMessage> {
         // Default to snappy decoding the request body.
-        decode(encoding_header.or(Some("snappy")), body)
+        decode(encoding_header.or(Some("snappy")), body, limits)
     }
 
     fn build_events(

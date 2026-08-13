@@ -49,7 +49,7 @@ fn build_trace_filter(
             "X-Datadog-Reported-Languages",
         ))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(capped_body())
+        .and(capped_body(&source.compression_limits))
         .and_then(
             move |path: FullPath,
                   encoding_header: Option<String>,

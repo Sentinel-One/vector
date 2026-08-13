@@ -54,7 +54,7 @@ use crate::{
     serde::bool_or_struct,
     source_sender::ClosedError,
     sources::util::{
-        decompression::CappedDecoder, handle_accept_error, http::capped_body, http::ErrorMessage,
+        decompression::{CappedDecoder, CompressionLimits}, handle_accept_error, http::capped_body, http::ErrorMessage,
     },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
     SourceSender,
@@ -299,6 +299,8 @@ impl SourceConfig for SplunkConfig {
 
 /// Shared data for responding to requests.
 struct SplunkSource {
+    /// Limits to decompress under, from this component's context.
+    compression_limits: CompressionLimits,
     valid_tokens: Arc<BTreeSet<String>>,
     protocol: &'static str,
     idx_ack: Option<Arc<IndexerAcknowledgement>>,
@@ -310,6 +312,7 @@ struct SplunkSource {
 impl SplunkSource {
     fn new(config: &SplunkConfig, protocol: &'static str, cx: SourceContext) -> Self {
         let log_namespace = cx.log_namespace(config.log_namespace);
+        let compression_limits = cx.globals.limits.compression;
         let acknowledgements = cx.do_acknowledgements(config.acknowledgements.enabled.into());
         let shutdown = cx.shutdown;
         let valid_tokens: BTreeSet<String> = config
@@ -328,6 +331,7 @@ impl SplunkSource {
         });
 
         SplunkSource {
+            compression_limits,
             valid_tokens: Arc::new(valid_tokens),
             protocol,
             idx_ack,
@@ -343,6 +347,7 @@ impl SplunkSource {
         let store_hec_token = self.store_hec_token;
         let log_namespace = self.log_namespace;
         let events_received = self.events_received.clone();
+        let compression_limits = self.compression_limits;
 
         warp::post()
             .and(
@@ -355,7 +360,7 @@ impl SplunkSource {
             .and(warp::addr::remote())
             .and(warp::header::optional::<String>("X-Forwarded-For"))
             .and(self.gzip())
-            .and(capped_body())
+            .and(capped_body(&self.compression_limits))
             .and(warp::path::full())
             .and_then(
                 move |_,
@@ -377,7 +382,7 @@ impl SplunkSource {
 
                         let data;
                         let (byte_size, body) = if gzip {
-                            data = CappedDecoder::gzip(body.reader())
+                            data = CappedDecoder::gzip(body.reader(), &compression_limits)
                                 .decompress()
                                 .map_err(|_| Rejection::from(ApiError::BadRequest))?;
                             (data.len(), String::from_utf8_lossy(data.as_slice()))
@@ -451,6 +456,7 @@ impl SplunkSource {
         let store_hec_token = self.store_hec_token;
         let events_received = self.events_received.clone();
         let log_namespace = self.log_namespace;
+        let compression_limits = self.compression_limits;
 
         warp::post()
             .and(path!("raw" / "1.0").or(path!("raw")))
@@ -459,7 +465,7 @@ impl SplunkSource {
             .and(warp::addr::remote())
             .and(warp::header::optional::<String>("X-Forwarded-For"))
             .and(self.gzip())
-            .and(capped_body())
+            .and(capped_body(&self.compression_limits))
             .and(warp::path::full())
             .and_then(
                 move |_,
@@ -498,6 +504,7 @@ impl SplunkSource {
                             batch,
                             log_namespace,
                             &events_received,
+                            &compression_limits,
                         )?;
                         if let Some(token) = token.filter(|_| store_hec_token) {
                             event.metadata_mut().set_splunk_hec_token(token.into());
@@ -540,7 +547,7 @@ impl SplunkSource {
             // `warp::body::json()` aggregates the whole body unbounded; cap it first and parse the
             // bytes ourselves. Token auth is optional in config, so this endpoint can be reached
             // unauthenticated.
-            .and(capped_body())
+            .and(capped_body(&self.compression_limits))
             .and_then(move |_, channel_id: String, body: Bytes| {
                 let idx_ack = idx_ack.clone();
                 async move {
@@ -1047,10 +1054,11 @@ fn raw_event(
     batch: Option<BatchNotifier>,
     log_namespace: LogNamespace,
     events_received: &Registered<EventsReceived>,
+    compression_limits: &CompressionLimits,
 ) -> Result<Event, Rejection> {
     // Process gzip
     let message: Value = if gzip {
-        match CappedDecoder::gzip(bytes.reader()).decompress() {
+        match CappedDecoder::gzip(bytes.reader(), compression_limits).decompress() {
             Ok(data) if data.is_empty() => return Err(ApiError::NoData.into()),
             Ok(data) => Value::from(Bytes::from(data)),
             Err(error) => {

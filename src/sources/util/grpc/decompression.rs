@@ -431,7 +431,14 @@ where
 
                 let inner = self.inner.call(mapped_req);
 
-                drive_request(req_body, destination, inner, self.bytes_received.clone()).boxed()
+                drive_request(
+                    req_body,
+                    destination,
+                    inner,
+                    self.bytes_received.clone(),
+                    self.compression_limits,
+                )
+                .boxed()
             }
         }
     }

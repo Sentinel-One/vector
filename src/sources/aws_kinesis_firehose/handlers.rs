@@ -35,7 +35,7 @@ use crate::{
     },
     sources::{
         aws_kinesis_firehose::AwsKinesisFirehoseConfig,
-        util::decompression::{CappedDecoder, DecompressedSizeLimitExceeded},
+        util::decompression::{CappedDecoder, CompressionLimits, DecompressedSizeLimitExceeded},
     },
     SourceSender,
 };
@@ -43,6 +43,8 @@ use crate::{
 #[derive(Clone)]
 pub(super) struct Context {
     pub(super) compression: Compression,
+    /// Limits to decompress records under, from this component's context.
+    pub(super) compression_limits: CompressionLimits,
     pub(super) store_access_key: bool,
     pub(super) decoder: Decoder,
     pub(super) acknowledgements: bool,
@@ -62,7 +64,7 @@ pub(super) async fn firehose(
     let events_received = register!(EventsReceived);
 
     for record in request.records {
-        let bytes = decode_record(&record, context.compression)
+        let bytes = decode_record(&record, context.compression, &context.compression_limits)
             .with_context(|_| ParseRecordsSnafu {
                 request_id: request_id.clone(),
             })
@@ -205,6 +207,7 @@ pub enum RecordDecodeError {
 fn decode_record(
     record: &EncodedFirehoseRecord,
     compression: Compression,
+    limits: &CompressionLimits,
 ) -> Result<Bytes, RecordDecodeError> {
     let buf = BASE64_STANDARD
         .decode(record.data.as_bytes())
@@ -216,12 +219,12 @@ fn decode_record(
 
     match compression {
         Compression::None => Ok(Bytes::from(buf)),
-        Compression::Gzip => decode_gzip(&buf[..]).with_context(|_| DecompressionSnafu {
+        Compression::Gzip => decode_gzip(&buf[..], limits).with_context(|_| DecompressionSnafu {
             compression: compression.to_owned(),
         }),
         Compression::Auto => {
             if is_gzip(&buf) {
-                decode_gzip(&buf[..]).or_else(|error| {
+                decode_gzip(&buf[..], limits).or_else(|error| {
                     // An exceeded size cap means the magic bytes really were gzip and the payload
                     // is oversized, so reject it. Only fall back to forwarding the raw bytes when
                     // auto-detection guessed wrong (valid-looking magic, but not actually gzip).
@@ -254,9 +257,9 @@ fn is_gzip(data: &[u8]) -> bool {
     data.starts_with(GZIP_MAGIC)
 }
 
-fn decode_gzip(data: &[u8]) -> std::io::Result<Bytes> {
+fn decode_gzip(data: &[u8], limits: &CompressionLimits) -> std::io::Result<Bytes> {
     // Cap the decompressed output so a gzip-bomb record cannot drive unbounded allocation.
-    CappedDecoder::gzip(data).decompress().map(Bytes::from)
+    CappedDecoder::gzip(data, limits).decompress().map(Bytes::from)
 }
 
 #[cfg(test)]

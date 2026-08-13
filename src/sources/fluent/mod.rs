@@ -521,9 +521,9 @@ impl FluentDecoder {
 
                 let mut events = smallvec![];
                 while let Some(FluentEntry(timestamp, record)) =
-                    FluentEntryStreamDecoder {
+                    (FluentEntryStreamDecoder {
                         max_frame_size: self.max_frame_size,
-                    }
+                    })
                     .decode(&mut buf)?
                 {
                     Self::ensure_entry_count(events.len() + 1)?;
@@ -553,9 +553,9 @@ impl FluentDecoder {
 
                 let mut events = smallvec![];
                 while let Some(FluentEntry(timestamp, record)) =
-                    FluentEntryStreamDecoder {
+                    (FluentEntryStreamDecoder {
                         max_frame_size: self.max_frame_size,
-                    }
+                    })
                     .decode(&mut buf)?
                 {
                     Self::ensure_entry_count(events.len() + 1)?;

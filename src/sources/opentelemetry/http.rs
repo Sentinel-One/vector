@@ -171,7 +171,7 @@ fn build_warp_log_filter(
         .and(capped_body(&compression_limits))
         .and_then(
             move |encoding_header: Option<String>, headers_config: HeaderMap, body: Bytes| {
-                let events = decode(encoding_header.as_deref(), body)
+                let events = decode(encoding_header.as_deref(), body, &compression_limits)
                     .and_then(|body| {
                         bytes_received.emit(ByteSize(body.len()));
                         decode_log_body(body, log_namespace, &events_received)
@@ -209,7 +209,7 @@ fn build_warp_metrics_filter(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(capped_body(&compression_limits))
         .and_then(move |encoding_header: Option<String>, body: Bytes| {
-            let events = decode(encoding_header.as_deref(), body).and_then(|body| {
+            let events = decode(encoding_header.as_deref(), body, &compression_limits).and_then(|body| {
                 bytes_received.emit(ByteSize(body.len()));
                 decode_metrics_body(body, &events_received)
             });
@@ -241,7 +241,7 @@ fn build_warp_trace_filter(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(capped_body(&compression_limits))
         .and_then(move |encoding_header: Option<String>, body: Bytes| {
-            let events = decode(encoding_header.as_deref(), body).and_then(|body| {
+            let events = decode(encoding_header.as_deref(), body, &compression_limits).and_then(|body| {
                 bytes_received.emit(ByteSize(body.len()));
                 decode_trace_body(body, &events_received)
             });

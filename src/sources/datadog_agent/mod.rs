@@ -34,7 +34,7 @@ use tokio::net::TcpStream;
 use tower::ServiceBuilder;
 use tracing::Span;
 use crate::sources::util::decompression::{
-    max_decompressed_size_bytes, CappedDecoder, DecompressedSizeLimitExceeded,
+    CappedDecoder, CompressionLimits, DecompressedSizeLimitExceeded,
 };
 use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
 use vector_lib::config::{LegacyKey, LogNamespace};
@@ -196,6 +196,7 @@ impl SourceConfig for DatadogAgentConfig {
             logs_schema_definition,
             log_namespace,
             self.parse_ddtags,
+            cx.globals.limits.compression,
         );
         let listener = tls.bind(&self.address).await?;
         let listener = listener
@@ -347,6 +348,8 @@ pub struct ApiKeyQueryParams {
 
 #[derive(Clone)]
 pub(crate) struct DatadogAgentSource {
+    /// Limits to decompress under, from this component's context.
+    pub(crate) compression_limits: CompressionLimits,
     pub(crate) api_key_extractor: ApiKeyExtractor,
     pub(crate) log_schema_host_key: OwnedTargetPath,
     pub(crate) log_schema_source_type_key: OwnedTargetPath,
@@ -393,8 +396,10 @@ impl DatadogAgentSource {
         logs_schema_definition: Option<schema::Definition>,
         log_namespace: LogNamespace,
         parse_ddtags: bool,
+        compression_limits: CompressionLimits,
     ) -> Self {
         Self {
+            compression_limits,
             api_key_extractor: ApiKeyExtractor {
                 store_api_key,
                 matcher: Regex::new(r"^/v1/input/(?P<api_key>[[:alnum:]]{32})/??")
@@ -473,17 +478,17 @@ impl DatadogAgentSource {
                     // allocation on this unauthenticated HTTP listener. Capping every round also
                     // bounds a stacked `Content-Encoding: gzip,gzip,...` chain, since each round's
                     // output is the next round's input.
-                    "gzip" | "x-gzip" => CappedDecoder::gzip(body.reader())
+                    "gzip" | "x-gzip" => CappedDecoder::gzip(body.reader(), &self.compression_limits)
                         .decompress()
-                        .map_err(|error| handle_decode_error(encoding, error))?
+                        .map_err(|error| handle_decode_error(encoding, error, &self.compression_limits))?
                         .into(),
-                    "zstd" => CappedDecoder::zstd_http(body.reader())
+                    "zstd" => CappedDecoder::zstd_http(body.reader(), &self.compression_limits)
                         .and_then(CappedDecoder::decompress)
-                        .map_err(|error| handle_decode_error(encoding, error))?
+                        .map_err(|error| handle_decode_error(encoding, error, &self.compression_limits))?
                         .into(),
-                    "deflate" | "x-deflate" => CappedDecoder::zlib(body.reader())
+                    "deflate" | "x-deflate" => CappedDecoder::zlib(body.reader(), &self.compression_limits)
                         .decompress()
-                        .map_err(|error| handle_decode_error(encoding, error))?
+                        .map_err(|error| handle_decode_error(encoding, error, &self.compression_limits))?
                         .into(),
                     encoding => {
                         return Err(ErrorMessage::new(
@@ -542,7 +547,11 @@ pub(crate) async fn handle_request(
     }
 }
 
-fn handle_decode_error(encoding: &str, error: std::io::Error) -> ErrorMessage {
+fn handle_decode_error(
+    encoding: &str,
+    error: std::io::Error,
+    limits: &CompressionLimits,
+) -> ErrorMessage {
     // A size-cap trip is an oversized-request client fault, so report it as 413 with the limit
     // that was enforced, matching the shared HTTP decoder. Anything else is malformed input (422).
     if DecompressedSizeLimitExceeded::is(&error) {
@@ -551,7 +560,7 @@ fn handle_decode_error(encoding: &str, error: std::io::Error) -> ErrorMessage {
             format!(
                 "Decompressed {} body exceeds limit of {} bytes.",
                 encoding,
-                max_decompressed_size_bytes()
+                limits.max_decompressed_size_bytes
             ),
         );
     }

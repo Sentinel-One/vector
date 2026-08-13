@@ -174,6 +174,8 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
             .flatten()
             .chain(self.access_key.iter());
 
+        // From this component's context, so the deployment controls the cap.
+        let compression_limits = cx.globals.limits.compression;
         let svc = filters::firehose(
             access_keys.map(|key| key.inner().to_string()).collect(),
             self.store_access_key,
@@ -182,6 +184,7 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
             acknowledgements,
             cx.out,
             log_namespace,
+            compression_limits,
         );
 
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;

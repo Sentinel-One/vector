@@ -30,6 +30,7 @@ use crate::{
         UriParseSnafu,
     },
 };
+use vector_common::decompression::CompressionLimits;
 
 pub struct HecRejectionContext {
     pub rejected: Counter,
@@ -57,6 +58,8 @@ impl RejectionContext for HecRejectionContext {
 }
 
 pub struct HecService<S> {
+    /// Limits used when logging a rejected request payload.
+    compression_limits: CompressionLimits,
     pub inner: S,
     ack_finalizer_tx: Option<mpsc::Sender<(u64, oneshot::Sender<EventStatus>)>>,
     ack_slots: PollSemaphore,
@@ -87,6 +90,7 @@ where
         rej_rpt: RejectionReport,
         compression: Compression,
         rej_ctx: Arc<HecRejectionContext>,
+        compression_limits: CompressionLimits,
     ) -> Self {
         let max_pending_acks = indexer_acknowledgements.max_pending_acks.get();
         let tx = if let Some(ack_client) = ack_client {
@@ -111,6 +115,7 @@ where
             rej_rpt,
             compression,
             rej_ctx,
+            compression_limits,
         }
     }
 }
@@ -150,6 +155,7 @@ where
         let rej_rpt = self.rej_rpt.clone();
         let compression = self.compression;
         let rej_ctx = Arc::clone(&self.rej_ctx);
+        let compression_limits = self.compression_limits;
         let req_for_rpt = if rej_rpt.needs_request() {
             Some((req.body.clone(), compression))
         } else {
@@ -202,10 +208,24 @@ where
                 } else {
                     rej_rpt
                 };
-                emit_rejection_error(rej_ctx.as_ref(), response.status_code(), response.body(), None, mode);
+                emit_rejection_error(
+                    rej_ctx.as_ref(),
+                    response.status_code(),
+                    response.body(),
+                    None,
+                    mode,
+                    compression_limits,
+                );
                 EventStatus::Errored
             } else {
-                emit_rejection_error(rej_ctx.as_ref(), response.status_code(), response.body(), req_for_rpt, rej_rpt);
+                emit_rejection_error(
+                    rej_ctx.as_ref(),
+                    response.status_code(),
+                    response.body(),
+                    req_for_rpt,
+                    rej_rpt,
+                    compression_limits,
+                );
                 EventStatus::Rejected
             };
 
