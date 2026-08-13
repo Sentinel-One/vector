@@ -20,7 +20,7 @@ use vector_lib::schema::Definition;
 use vrl::value::kind::Collection;
 use vrl::value::{Kind, Value};
 
-use super::util::decompression::{max_decompressed_size_bytes, CappedDecoder};
+use super::util::decompression::{CappedDecoder, CompressionLimits};
 use super::util::net::{SocketListenAddr, TcpSource, TcpSourceAck, TcpSourceAcker};
 use crate::{
     config::{
@@ -121,7 +121,11 @@ impl GenerateConfig for FluentConfig {
 impl SourceConfig for FluentConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
-        let source = FluentSource::new(log_namespace, self.max_frame_bytes);
+        let source = FluentSource::new(
+            log_namespace,
+            self.max_frame_bytes,
+            cx.globals.limits.compression,
+        );
         let shutdown_secs = Duration::from_secs(30);
         let tls_config = self.tls.as_ref().map(|tls| tls.tls_config.clone());
         let tls_client_metadata_key = self
@@ -237,14 +241,20 @@ impl FluentConfig {
 
 #[derive(Debug, Clone)]
 struct FluentSource {
+    compression_limits: CompressionLimits,
     log_namespace: LogNamespace,
     legacy_host_key_path: Option<OwnedValuePath>,
     max_frame_bytes: Option<usize>,
 }
 
 impl FluentSource {
-    fn new(log_namespace: LogNamespace, max_frame_bytes: Option<usize>) -> Self {
+    fn new(
+        log_namespace: LogNamespace,
+        max_frame_bytes: Option<usize>,
+        compression_limits: CompressionLimits,
+    ) -> Self {
         Self {
+            compression_limits,
             log_namespace,
             legacy_host_key_path: log_schema().host_key().cloned(),
             max_frame_bytes,
@@ -259,7 +269,11 @@ impl TcpSource for FluentSource {
     type Acker = FluentAcker;
 
     fn decoder(&self) -> Self::Decoder {
-        FluentDecoder::new(self.log_namespace, self.max_frame_bytes)
+        FluentDecoder::new(
+            self.log_namespace,
+            self.max_frame_bytes,
+            self.compression_limits,
+        )
     }
 
     fn handle_events(&self, events: &mut [Event], host: SocketAddr) {
@@ -395,6 +409,8 @@ impl From<decode::Error> for DecodeError {
 
 #[derive(Debug)]
 struct FluentDecoder {
+    /// Limits to decompress under, from this component's context.
+    compression_limits: CompressionLimits,
     log_namespace: LogNamespace,
     /// Maximum number of bytes that may be buffered while waiting for a complete frame. Bounds
     /// memory against a peer that declares an oversized msgpack structure and streams the bytes to
@@ -403,10 +419,16 @@ struct FluentDecoder {
 }
 
 impl FluentDecoder {
-    fn new(log_namespace: LogNamespace, max_frame_bytes: Option<usize>) -> Self {
+    fn new(
+        log_namespace: LogNamespace,
+        max_frame_bytes: Option<usize>,
+        compression_limits: CompressionLimits,
+    ) -> Self {
         Self {
             log_namespace,
-            max_frame_size: max_frame_bytes.unwrap_or_else(max_decompressed_size_bytes),
+            max_frame_size: max_frame_bytes
+                .unwrap_or(compression_limits.max_decompressed_size_bytes),
+            compression_limits,
         }
     }
 
@@ -499,7 +521,10 @@ impl FluentDecoder {
 
                 let mut events = smallvec![];
                 while let Some(FluentEntry(timestamp, record)) =
-                    FluentEntryStreamDecoder.decode(&mut buf)?
+                    FluentEntryStreamDecoder {
+                        max_frame_size: self.max_frame_size,
+                    }
+                    .decode(&mut buf)?
                 {
                     Self::ensure_entry_count(events.len() + 1)?;
                     events.push(Event::from(FluentEvent {
@@ -517,7 +542,7 @@ impl FluentDecoder {
             }
             FluentMessage::PackedForwardWithOptions(tag, bin, options) => {
                 let buf = match options.compressed.as_deref() {
-                    Some("gzip") => CappedDecoder::gzip(io::Cursor::new(bin.into_vec()))
+                    Some("gzip") => CappedDecoder::gzip(io::Cursor::new(bin.into_vec()), &self.compression_limits)
                         .decompress()
                         .map_err(Into::into),
                     Some("text") | None => Ok(bin.into_vec()),
@@ -528,7 +553,10 @@ impl FluentDecoder {
 
                 let mut events = smallvec![];
                 while let Some(FluentEntry(timestamp, record)) =
-                    FluentEntryStreamDecoder.decode(&mut buf)?
+                    FluentEntryStreamDecoder {
+                        max_frame_size: self.max_frame_size,
+                    }
+                    .decode(&mut buf)?
                 {
                     Self::ensure_entry_count(events.len() + 1)?;
                     events.push(Event::from(FluentEvent {
@@ -613,7 +641,10 @@ impl Decoder for FluentDecoder {
 
 /// Decoder for decoding MessagePackEventStream which are just a stream of Entries
 #[derive(Clone, Debug)]
-struct FluentEntryStreamDecoder;
+struct FluentEntryStreamDecoder {
+    /// Frame-size bound for the entries inside a decompressed payload.
+    max_frame_size: usize,
+}
 
 impl Decoder for FluentEntryStreamDecoder {
     type Item = FluentEntry;
@@ -626,7 +657,7 @@ impl Decoder for FluentEntryStreamDecoder {
 
         // The entries inside a `PackedForward` payload are attacker-controlled too — the gzip cap
         // bounds their size but not their nesting depth.
-        scan_msgpack_frame(&src[..], MAX_MSGPACK_DEPTH, max_decompressed_size_bytes())?;
+        scan_msgpack_frame(&src[..], MAX_MSGPACK_DEPTH, self.max_frame_size)?;
         let (byte_size, res) = {
             let mut des = Deserializer::new(io::Cursor::new(&src[..]));
 

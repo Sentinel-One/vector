@@ -223,6 +223,7 @@ impl SourceConfig for OpentelemetryConfig {
                 builder.routes(),
                 cx.shutdown.clone(),
                 self.permit_origin.clone(),
+                compression_limits,
             )
             .map_err(|error| {
                 error!(message = "Source future failed.", %error);

@@ -24,8 +24,8 @@ use vector_lib::internal_event::{
 
 use crate::internal_events::{GrpcError, GrpcInvalidCompressionSchemeError};
 use crate::sources::util::decompression::{
-    max_decompressed_size_bytes,
-    max_zlib_compressed_frame_size_bytes, DecompressedSizeLimitExceeded,
+    CompressionLimits,
+    DecompressedSizeLimitExceeded,
 };
 
 // Every gRPC message has a five byte header:
@@ -137,7 +137,7 @@ impl Write for LimitedWriter {
     }
 }
 
-fn new_decompressor() -> GzDecoder<LimitedWriter> {
+fn new_decompressor(limits: &CompressionLimits) -> GzDecoder<LimitedWriter> {
     // Create the backing buffer for the decompressor and set the compression flag to false (0) and pre-allocate
     // the space for the length prefix, which we'll fill out once we've finalized the decompressor.
     let buf = vec![0; GRPC_MESSAGE_HEADER_LEN];
@@ -147,13 +147,14 @@ fn new_decompressor() -> GzDecoder<LimitedWriter> {
     // may grow to the header plus the decompressed cap; anything larger errors mid-decompression.
     GzDecoder::new(LimitedWriter::new(
         buf,
-        GRPC_MESSAGE_HEADER_LEN.saturating_add(max_decompressed_size_bytes()),
+        GRPC_MESSAGE_HEADER_LEN.saturating_add(limits.max_decompressed_size_bytes),
     ))
 }
 
 async fn drive_body_decompression(
     mut source: Body,
     mut destination: Sender,
+    limits: &CompressionLimits,
 ) -> Result<usize, Status> {
     let mut state = State::default();
     let mut buf = BytesMut::new();
@@ -201,7 +202,7 @@ async fn drive_body_decompression(
                         // bound (decompressed cap plus zlib's worst-case expansion, shared with the
                         // logstash source) keeps a peer from advertising a huge length and
                         // slow-streaming bytes to grow the decompressor's input buffer unbounded.
-                        let compressed_frame_limit = max_zlib_compressed_frame_size_bytes()
+                        let compressed_frame_limit = limits.max_zlib_compressed_frame_size_bytes()
                             .saturating_add(GRPC_COMPRESSED_FRAME_OVERHEAD_SLACK);
                         if message_len > compressed_frame_limit {
                             return Err(Status::out_of_range(
@@ -220,7 +221,7 @@ async fn drive_body_decompression(
                         // Reject an identity (uncompressed) message larger than the cap before
                         // buffering it to `overall_len`, so a large declared length cannot drive
                         // unbounded buffering here ahead of tonic's own decode-size limit.
-                        if message_len > max_decompressed_size_bytes() {
+                        if message_len > limits.max_decompressed_size_bytes {
                             return Err(Status::out_of_range(
                                 "message length exceeds the maximum allowed size",
                             ));
@@ -257,7 +258,8 @@ async fn drive_body_decompression(
                             // the decompressor. This is _technically_ synchronous but there's really no way to do it
                             // asynchronously since we already have the data, and that's the only asynchronous part.
                             let to_take = cmp::min(available, *remaining);
-                            let decompressor = decompressor.get_or_insert_with(new_decompressor);
+                            let decompressor =
+                                decompressor.get_or_insert_with(|| new_decompressor(limits));
                             if let Err(error) = decompressor.write_all(&buf[..to_take]) {
                                 return Err(decompressor_error_to_status(
                                     &error,
@@ -336,12 +338,13 @@ async fn drive_request<F, E>(
     destination: Sender,
     inner: F,
     bytes_received: Registered<BytesReceived>,
+    compression_limits: CompressionLimits,
 ) -> Result<Response<BoxBody>, E>
 where
     F: Future<Output = Result<Response<BoxBody>, E>>,
     E: std::fmt::Display,
 {
-    let body_decompression = drive_body_decompression(source, destination);
+    let body_decompression = drive_body_decompression(source, destination, &compression_limits);
 
     pin!(inner);
     pin!(body_decompression);
@@ -391,6 +394,7 @@ where
 pub struct DecompressionAndMetrics<S> {
     inner: S,
     bytes_received: Registered<BytesReceived>,
+    compression_limits: CompressionLimits,
 }
 
 impl<S> Service<Request<Body>> for DecompressionAndMetrics<S>
@@ -453,8 +457,18 @@ where
 /// received _and_ processed correctly.
 ///
 /// The only supported compression scheme is gzip, which is also the only supported compression scheme in `tonic` itself.
-#[derive(Clone, Default)]
-pub struct DecompressionAndMetricsLayer;
+#[derive(Clone, Copy, Default)]
+pub struct DecompressionAndMetricsLayer {
+    compression_limits: CompressionLimits,
+}
+
+impl DecompressionAndMetricsLayer {
+    /// Builds the layer with the limits this listener should decompress under.
+    #[must_use]
+    pub const fn new(compression_limits: CompressionLimits) -> Self {
+        Self { compression_limits }
+    }
+}
 
 impl<S> Layer<S> for DecompressionAndMetricsLayer {
     type Service = DecompressionAndMetrics<S>;
@@ -463,6 +477,7 @@ impl<S> Layer<S> for DecompressionAndMetricsLayer {
         DecompressionAndMetrics {
             inner,
             bytes_received: register!(BytesReceived::from(Protocol::from("grpc"))),
+            compression_limits: self.compression_limits,
         }
     }
 }

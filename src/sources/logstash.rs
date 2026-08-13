@@ -22,7 +22,7 @@ use vrl::value::kind::Collection;
 use vrl::value::{KeyString, Kind};
 
 use super::util::decompression::{
-    max_decompressed_size_bytes, max_zlib_compressed_frame_size_bytes, CappedDecoder,
+    CappedDecoder, CompressionLimits,
 };
 use super::util::net::{SocketListenAddr, TcpSource, TcpSourceAck, TcpSourceAcker};
 use crate::{
@@ -145,6 +145,8 @@ impl SourceConfig for LogstashConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let source = LogstashSource {
+            // From this component's context, so the deployment controls the cap.
+            compression_limits: cx.globals.limits.compression,
             timestamp_converter: types::Conversion::Timestamp(cx.globals.timezone()),
             legacy_host_key_path: log_schema().host_key().cloned(),
             log_namespace,
@@ -195,6 +197,7 @@ impl SourceConfig for LogstashConfig {
 
 #[derive(Debug, Clone)]
 struct LogstashSource {
+    compression_limits: CompressionLimits,
     timestamp_converter: types::Conversion,
     log_namespace: LogNamespace,
     legacy_host_key_path: Option<OwnedValuePath>,
@@ -207,7 +210,7 @@ impl TcpSource for LogstashSource {
     type Acker = LogstashAcker;
 
     fn decoder(&self) -> Self::Decoder {
-        LogstashDecoder::new()
+        LogstashDecoder::new(self.compression_limits)
     }
 
     fn handle_events(&self, events: &mut [Event], host: SocketAddr) {
@@ -317,6 +320,8 @@ enum LogstashDecoderReadState {
 
 #[derive(Debug)]
 struct LogstashDecoder {
+    /// Limits to decompress under, from this component's context.
+    compression_limits: CompressionLimits,
     state: LogstashDecoderReadState,
     // Set for the decoder used to parse a decompressed payload. No known
     // Lumberjack/Beats client emits a compressed frame nested inside another,
@@ -328,17 +333,19 @@ struct LogstashDecoder {
 }
 
 impl LogstashDecoder {
-    const fn new() -> Self {
+    const fn new(compression_limits: CompressionLimits) -> Self {
         Self {
             state: LogstashDecoderReadState::ReadProtocol,
             nested: false,
+            compression_limits,
         }
     }
 
-    const fn new_nested() -> Self {
+    const fn new_nested(compression_limits: CompressionLimits) -> Self {
         Self {
             state: LogstashDecoderReadState::ReadProtocol,
             nested: true,
+            compression_limits,
         }
     }
 }
@@ -556,7 +563,7 @@ impl Decoder for LogstashDecoder {
                         return Err(DecodeError::NestedCompressedFrame);
                     }
 
-                    let Some(frames) = decode_compressed_frame(src)? else {
+                    let Some(frames) = decode_compressed_frame(src, &self.compression_limits)? else {
                         return Ok(None);
                     };
 
@@ -667,6 +674,7 @@ fn decode_json_frame(
 
 fn decode_compressed_frame(
     src: &mut BytesMut,
+    limits: &CompressionLimits,
 ) -> Result<Option<VecDeque<(LogstashEventFrame, usize)>>, DecodeError> {
     let mut rest = src.as_ref();
 
@@ -674,13 +682,12 @@ fn decode_compressed_frame(
         return Ok(None);
     }
     let payload_size = rest.get_u32() as usize;
-    let limit = max_decompressed_size_bytes();
 
     // Reject an oversized declared payload before buffering it, so a peer cannot force multi-GB
     // buffering by advertising a huge length and slow-streaming its bytes. The bound includes
     // zlib's worst-case expansion so a valid frame whose decompressed content is within `limit`
     // is never rejected here; the decompressed cap itself is still enforced below.
-    let compressed_limit = max_zlib_compressed_frame_size_bytes();
+    let compressed_limit = limits.max_zlib_compressed_frame_size_bytes();
     if payload_size > compressed_limit {
         return Err(DecodeError::DecompressionFailed {
             source: io::Error::other(format!(
@@ -697,7 +704,7 @@ fn decode_compressed_frame(
     let (slice, right) = rest.split_at(payload_size);
     rest = right;
 
-    let res = CappedDecoder::zlib_with_limit(io::Cursor::new(slice), limit)
+    let res = CappedDecoder::zlib(io::Cursor::new(slice), limits)
         .decompress()
         .map(|decompressed| BytesMut::from(decompressed.as_slice()))
         .context(DecompressionFailedSnafu);
@@ -707,7 +714,7 @@ fn decode_compressed_frame(
 
     let mut buf = res?;
 
-    let mut decoder = LogstashDecoder::new_nested();
+    let mut decoder = LogstashDecoder::new_nested(*limits);
 
     let mut frames = VecDeque::new();
 
