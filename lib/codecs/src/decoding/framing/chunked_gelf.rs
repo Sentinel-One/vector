@@ -1304,7 +1304,7 @@ mod tests {
         );
 
         let error = ChunkedGelfDecompression::Gzip
-            .decompress(bomb)
+            .decompress(bomb, &CompressionLimits::default())
             .expect_err("a payload inflating past the cap must be rejected");
 
         assert!(matches!(
@@ -1336,7 +1336,7 @@ mod tests {
         );
 
         let error = ChunkedGelfDecompression::Zlib
-            .decompress(bomb)
+            .decompress(bomb, &CompressionLimits::default())
             .expect_err("a payload inflating past the cap must be rejected");
 
         assert!(matches!(
@@ -1355,7 +1355,7 @@ mod tests {
         let compressed = compression.compress(&payload);
 
         let decompressed = ChunkedGelfDecompression::from_magic(&compressed)
-            .decompress(compressed)
+            .decompress(compressed, &CompressionLimits::default())
             .expect("a payload within the cap must decompress");
 
         assert_eq!(decompressed, Bytes::from(payload));

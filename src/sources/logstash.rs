@@ -21,9 +21,7 @@ use vector_lib::{
 use vrl::value::kind::Collection;
 use vrl::value::{KeyString, Kind};
 
-use super::util::decompression::{
-    CappedDecoder, CompressionLimits,
-};
+use super::util::decompression::{CappedDecoder, CompressionLimits};
 use super::util::net::{SocketListenAddr, TcpSource, TcpSourceAck, TcpSourceAcker};
 use crate::{
     config::{
@@ -563,7 +561,8 @@ impl Decoder for LogstashDecoder {
                         return Err(DecodeError::NestedCompressedFrame);
                     }
 
-                    let Some(frames) = decode_compressed_frame(src, &self.compression_limits)? else {
+                    let Some(frames) = decode_compressed_frame(src, &self.compression_limits)?
+                    else {
                         return Ok(None);
                     };
 
@@ -953,7 +952,7 @@ mod test {
         src.put_u32(u32::MAX);
         src.put_slice(b"partial");
 
-        let error = decode_compressed_frame(&mut src)
+        let error = decode_compressed_frame(&mut src, &CompressionLimits::default())
             .expect_err("a frame declaring more than the cap must be rejected");
 
         assert!(
@@ -978,7 +977,7 @@ mod test {
         let compressed = encoder.finish().unwrap();
 
         assert!(
-            compressed.len() < max_zlib_compressed_frame_size_bytes(),
+            compressed.len() < CompressionLimits::default().max_zlib_compressed_frame_size_bytes(),
             "the bomb must pass the declared-length guard so the decompressed cap is what fires"
         );
 
@@ -986,7 +985,7 @@ mod test {
         src.put_u32(compressed.len() as u32);
         src.put_slice(&compressed);
 
-        let error = decode_compressed_frame(&mut src)
+        let error = decode_compressed_frame(&mut src, &CompressionLimits::default())
             .expect_err("a frame inflating past the cap must be rejected");
 
         assert!(matches!(error, DecodeError::DecompressionFailed { .. }));
@@ -1006,7 +1005,7 @@ mod test {
         src.put_u32(compressed.len() as u32);
         src.put_slice(&compressed);
 
-        let frames = decode_compressed_frame(&mut src)
+        let frames = decode_compressed_frame(&mut src, &CompressionLimits::default())
             .expect("a well-formed frame within the caps must decode");
 
         assert!(frames.is_some_and(|frames| frames.is_empty()));
@@ -1020,7 +1019,7 @@ mod test {
         src.put_u32(64);
         src.put_slice(b"only a few bytes so far");
 
-        let result = decode_compressed_frame(&mut src)
+        let result = decode_compressed_frame(&mut src, &CompressionLimits::default())
             .expect("an incomplete but legitimate frame must not error");
 
         assert!(result.is_none(), "expected the decoder to await more bytes");
@@ -1053,7 +1052,7 @@ mod test {
 
     #[test]
     fn malformed_json_frame_is_a_fatal_decode_error() {
-        let mut decoder = LogstashDecoder::new();
+        let mut decoder = LogstashDecoder::new(CompressionLimits::default());
         let mut src = BytesMut::new();
         src.put_u8(b'2');
         src.put_u8(b'J');
@@ -1072,7 +1071,7 @@ mod test {
 
     #[test]
     fn malformed_compressed_frame_is_a_fatal_decode_error() {
-        let mut decoder = LogstashDecoder::new();
+        let mut decoder = LogstashDecoder::new(CompressionLimits::default());
         let mut src = BytesMut::new();
         src.put_u8(b'2');
         src.put_u8(b'C');
@@ -1098,7 +1097,7 @@ mod test {
         let mut req = BytesMut::new();
         push_compressed(&mut req, &middle);
 
-        let mut decoder = LogstashDecoder::new();
+        let mut decoder = LogstashDecoder::new(CompressionLimits::default());
         let err = decoder.decode(&mut req).unwrap_err();
         assert!(matches!(err, DecodeError::NestedCompressedFrame));
         assert!(!err.can_continue());
@@ -1114,7 +1113,7 @@ mod test {
         let mut req = BytesMut::new();
         push_compressed(&mut req, &inner);
 
-        let mut decoder = LogstashDecoder::new();
+        let mut decoder = LogstashDecoder::new(CompressionLimits::default());
         let frame = decoder
             .decode(&mut req)
             .expect("a singly-compressed frame must decode")

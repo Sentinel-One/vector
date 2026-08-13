@@ -1018,7 +1018,7 @@ mod tests {
         // 4 bytes provided: a valid, incomplete frame.
         let partial: Vec<u8> = vec![0x92, 0xb0, b't', b'a', b'g'];
         let mut buf = BytesMut::from(&partial[..]);
-        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None, CompressionLimits::default());
 
         assert!(matches!(decoder.decode(&mut buf), Ok(None)));
         // The buffer is retained so more bytes can complete the frame.
@@ -1038,6 +1038,7 @@ mod tests {
 
         let mut buf = BytesMut::from(&partial[..]);
         let mut decoder = FluentDecoder {
+            compression_limits: CompressionLimits::default(),
             log_namespace: LogNamespace::default(),
             max_frame_size,
         };
@@ -1058,11 +1059,14 @@ mod tests {
     /// OBE-11233: the report asks for a per-source frame cap rather than only a global one.
     #[test]
     fn max_frame_bytes_config_overrides_the_global_cap() {
-        let decoder = FluentDecoder::new(LogNamespace::default(), Some(4096));
+        let decoder = FluentDecoder::new(LogNamespace::default(), Some(4096), CompressionLimits::default());
         assert_eq!(decoder.max_frame_size, 4096);
 
-        let default = FluentDecoder::new(LogNamespace::default(), None);
-        assert_eq!(default.max_frame_size, max_decompressed_size_bytes());
+        let default = FluentDecoder::new(LogNamespace::default(), None, CompressionLimits::default());
+        assert_eq!(
+            default.max_frame_size,
+            CompressionLimits::default().max_decompressed_size_bytes
+        );
     }
 
     /// OBE-11233: the listener is unauthenticated, so an unlimited connection count multiplies
@@ -1094,7 +1098,7 @@ mod tests {
     #[test]
     fn nil_heartbeat_is_accepted() {
         let mut buf = BytesMut::from(&[0xc0u8][..]); // msgpack nil
-        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None, CompressionLimits::default());
 
         assert!(
             matches!(decoder.decode(&mut buf), Ok(None)),
@@ -1111,7 +1115,7 @@ mod tests {
     fn unrecognised_message_is_refused_without_materialising_it() {
         // A bare integer matches no variant: not a heartbeat, not a tagged message.
         let mut buf = BytesMut::from(&[0x2au8][..]);
-        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None, CompressionLimits::default());
 
         let error = match decoder.decode(&mut buf) {
             Err(error) => error,
@@ -1156,7 +1160,7 @@ mod tests {
         // 0x91 is a one-element array, so each byte adds a nesting level. 2,000 levels is enough
         // to abort the process if it ever reaches `rmp_serde`.
         let mut buf = BytesMut::from(&vec![0x91u8; 2_000][..]);
-        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None, CompressionLimits::default());
 
         let error = match decoder.decode(&mut buf) {
             Err(error) => error,
@@ -1179,7 +1183,7 @@ mod tests {
     fn deeply_nested_inner_entry_is_rejected() {
         let mut buf = BytesMut::from(&vec![0x91u8; 2_000][..]);
 
-        let error = match FluentEntryStreamDecoder.decode(&mut buf) {
+        let error = match (FluentEntryStreamDecoder { max_frame_size: usize::MAX }).decode(&mut buf) {
             Err(error) => error,
             Ok(_) => panic!("expected FrameTooDeep, got Ok"),
         };
@@ -1230,7 +1234,7 @@ mod tests {
     fn decode_all(message: Vec<u8>) -> Result<(SmallVec<[Event; 1]>, usize), DecodeError> {
         let mut buf = BytesMut::from(&message[..]);
 
-        let mut decoder = FluentDecoder::new(LogNamespace::default(), None);
+        let mut decoder = FluentDecoder::new(LogNamespace::default(), None, CompressionLimits::default());
 
         let (frame, byte_size) = decoder.decode(&mut buf)?.unwrap();
         Ok((frame.into(), byte_size))

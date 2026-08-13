@@ -310,7 +310,7 @@ mod tests {
     /// A gzip-bomb record must be refused rather than inflated.
     #[test]
     fn explicit_gzip_record_over_the_cap_is_rejected() {
-        let error = decode_record(&record(&gzip_bomb()), super::Compression::Gzip)
+        let error = decode_record(&record(&gzip_bomb()), super::Compression::Gzip, &CompressionLimits::default())
             .expect_err("a record inflating past the cap must be rejected");
 
         assert!(matches!(
@@ -323,7 +323,7 @@ mod tests {
     /// silently forwarded as raw bytes. The raw-bytes fallback exists only for a mis-detection.
     #[test]
     fn auto_detected_gzip_record_over_the_cap_is_rejected_not_forwarded() {
-        let error = decode_record(&record(&gzip_bomb()), super::Compression::Auto)
+        let error = decode_record(&record(&gzip_bomb()), super::Compression::Auto, &CompressionLimits::default())
             .expect_err("an oversized auto-detected gzip record must not fall back to raw bytes");
 
         assert!(matches!(
@@ -340,12 +340,12 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         for compression in [super::Compression::Gzip, super::Compression::Auto] {
-            let decoded = decode_record(&record(&compressed), compression)
+            let decoded = decode_record(&record(&compressed), compression, &CompressionLimits::default())
                 .expect("a record within the cap must decode");
             assert_eq!(decoded, Bytes::from_static(CONTENT));
         }
 
-        let plain = decode_record(&record(CONTENT), super::Compression::None)
+        let plain = decode_record(&record(CONTENT), super::Compression::None, &CompressionLimits::default())
             .expect("an uncompressed record must decode");
         assert_eq!(plain, Bytes::from_static(CONTENT));
     }
@@ -357,7 +357,7 @@ mod tests {
         let mut not_gzip = vector_common::constants::GZIP_MAGIC.to_vec();
         not_gzip.extend_from_slice(b"definitely not a gzip stream");
 
-        let decoded = decode_record(&record(&not_gzip), super::Compression::Auto)
+        let decoded = decode_record(&record(&not_gzip), super::Compression::Auto, &CompressionLimits::default())
             .expect("a mis-detected record must fall back to raw bytes");
 
         assert_eq!(decoded, Bytes::from(not_gzip));

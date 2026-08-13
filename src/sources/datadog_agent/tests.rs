@@ -14,6 +14,7 @@ use ordered_float::NotNan;
 use prost::Message;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use similar_asserts::assert_eq;
+use vector_common::decompression::CompressionLimits;
 use vector_lib::{
     codecs::{decoding::CharacterDelimitedDecoderOptions, CharacterDelimitedDecoderConfig},
     lookup::{owned_value_path, OwnedTargetPath},
@@ -103,6 +104,7 @@ fn test_decode_log_body() {
             Some(test_logs_schema_definition()),
             LogNamespace::Legacy,
             false,
+            CompressionLimits::default(),
         );
 
         let events = decode_log_body(body, api_key, &source).unwrap();
@@ -158,6 +160,7 @@ fn test_decode_log_body_parse_ddtags() {
         Some(test_logs_schema_definition()),
         LogNamespace::Legacy,
         true,
+        CompressionLimits::default(),
     );
 
     let events = decode_log_body(body, api_key, &source).unwrap();
@@ -194,6 +197,7 @@ fn test_decode_log_body_empty_object() {
         Some(test_logs_schema_definition()),
         LogNamespace::Legacy,
         false,
+        CompressionLimits::default(),
     );
 
     let events = decode_log_body(body, api_key, &source).unwrap();
@@ -2645,6 +2649,7 @@ mod decompression_caps {
     use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
     use super::*;
+    use vector_common::decompression::CompressionLimits;
     use crate::sources::datadog_agent::DatadogAgentSource;
 
     fn test_source() -> DatadogAgentSource {
@@ -2652,7 +2657,15 @@ mod decompression_caps {
             Framer::Bytes(BytesDecoder::new()),
             Deserializer::Bytes(BytesDeserializer),
         );
-        DatadogAgentSource::new(true, decoder, "http", None, LogNamespace::Legacy, false)
+        DatadogAgentSource::new(
+            true,
+            decoder,
+            "http",
+            None,
+            LogNamespace::Legacy,
+            false,
+            CompressionLimits::default(),
+        )
     }
 
     /// One cheap gzip member repeated past the cap. `MultiGzDecoder` walks every concatenated

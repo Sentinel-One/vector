@@ -572,7 +572,7 @@ mod tests {
 
     async fn drive(frame: Body) -> Result<usize, Status> {
         let (sender, _receiver) = Body::channel();
-        drive_body_decompression(frame, sender).await
+        drive_body_decompression(frame, sender, &CompressionLimits::default()).await
     }
 
     /// A compressed frame declaring more bytes than could legitimately decompress within the cap
@@ -582,7 +582,7 @@ mod tests {
         let declared = u32::MAX;
         assert!(
             declared as usize
-                > max_zlib_compressed_frame_size_bytes()
+                > CompressionLimits::default().max_zlib_compressed_frame_size_bytes()
                     .saturating_add(GRPC_COMPRESSED_FRAME_OVERHEAD_SLACK),
             "the declared length must exceed the prefilter for this test to mean anything"
         );
@@ -599,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_identity_frame_length_is_rejected_from_the_header() {
         let declared = u32::MAX;
-        assert!(declared as usize > max_decompressed_size_bytes());
+        assert!(declared as usize > CompressionLimits::default().max_decompressed_size_bytes);
 
         let status = drive(grpc_frame(false, declared))
             .await
@@ -625,7 +625,7 @@ mod tests {
     /// The new decompressor must carry the global cap, not an unbounded sink.
     #[test]
     fn new_decompressor_is_capped_at_the_global_limit() {
-        let decoder = new_decompressor();
+        let decoder = new_decompressor(&CompressionLimits::default());
         assert_eq!(
             decoder.get_ref().max_len,
             GRPC_MESSAGE_HEADER_LEN + DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES

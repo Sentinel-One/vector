@@ -169,21 +169,21 @@ mod tests {
         let body = Bytes::from("error body");
 
         let (ctx, count) = make_ctx();
-        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Stats);
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Stats, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         let (ctx, count) = make_ctx();
-        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Response);
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Response, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         let (ctx, count) = make_ctx();
         // RequestResponse without a request body falls back to response-only logging.
-        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::RequestResponse);
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::RequestResponse, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         let (ctx, count) = make_ctx();
         let req = Bytes::from("request body");
-        emit_rejection_error(&ctx, 400, &body, Some((req, Compression::None)), RejectionReport::RequestResponse);
+        emit_rejection_error(&ctx, 400, &body, Some((req, Compression::None)), RejectionReport::RequestResponse, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
@@ -198,6 +198,7 @@ mod tests {
             &response_body,
             Some((request_body, Compression::None)),
             RejectionReport::RequestResponse,
+            CompressionLimits::default(),
         );
     }
 

@@ -246,6 +246,7 @@ impl From<(Compression, CompressionLimits)> for Decompressor {
 
 #[cfg(test)]
 mod tests {
+    use vector_common::decompression::CompressionLimits;
     use std::io::Write;
 
     use crate::sink::compression::CompressionLevel;
@@ -272,7 +273,7 @@ mod tests {
             assert!(compressed_data.len() < data.len());
             assert_ne!(data, &compressed_data[..]);
         }
-        let decompressor = Decompressor::from(c);
+        let decompressor = Decompressor::from((c, CompressionLimits::default()));
         let decompressed_data = decompressor.decompress(compressed_data).unwrap();
         assert_eq!(data, &decompressed_data[..]);
     }

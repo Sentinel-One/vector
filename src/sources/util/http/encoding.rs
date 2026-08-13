@@ -233,6 +233,11 @@ fn emit_decompress_error(
 
 #[cfg(test)]
 mod tests {
+    /// Limits are a parameter now, so a test simply states the cap it wants.
+    fn limits(max_decompressed_size_bytes: usize) -> CompressionLimits {
+        CompressionLimits::with_max_decompressed_size_bytes(max_decompressed_size_bytes)
+    }
+
     use std::io::Write;
 
     use flate2::{write::GzEncoder, write::ZlibEncoder, Compression};
@@ -270,21 +275,21 @@ mod tests {
 
     #[test]
     fn gzip_within_limit_is_decoded() {
-        let decoded = decode_with_limit(Some("gzip"), gzip(b"hello"), LIMIT).expect("must decode");
+        let decoded = decode(Some("gzip"), gzip(b"hello"), &limits(LIMIT)).expect("must decode");
         assert_eq!(decoded, Bytes::from_static(b"hello"));
     }
 
     #[test]
     fn deflate_within_limit_is_decoded() {
         let decoded =
-            decode_with_limit(Some("deflate"), deflate(b"hello"), LIMIT).expect("must decode");
+            decode(Some("deflate"), deflate(b"hello"), &limits(LIMIT)).expect("must decode");
         assert_eq!(decoded, Bytes::from_static(b"hello"));
     }
 
     #[test]
     fn snappy_within_limit_is_decoded() {
         let body = Bytes::from(snap::raw::Encoder::new().compress_vec(b"hello").unwrap());
-        let decoded = decode_with_limit(Some("snappy"), body, LIMIT).expect("must decode");
+        let decoded = decode(Some("snappy"), body, &limits(LIMIT)).expect("must decode");
         assert_eq!(decoded, Bytes::from_static(b"hello"));
     }
 
@@ -297,14 +302,18 @@ mod tests {
     #[test]
     fn zstd_within_limit_is_decoded() {
         let body = Bytes::from(zstd::encode_all(&b"hello"[..], 1).unwrap());
-        let decoded = decode_with_limit(Some("zstd"), body, ZSTD_LIMIT).expect("must decode");
+        let decoded = decode(Some("zstd"), body, &limits(ZSTD_LIMIT)).expect("must decode");
         assert_eq!(decoded, Bytes::from_static(b"hello"));
     }
 
     #[test]
     fn identity_within_limit_passes_through() {
-        let decoded =
-            decode_with_limit(Some("identity"), Bytes::from_static(b"hello"), LIMIT).unwrap();
+        let decoded = decode(
+            Some("identity"),
+            Bytes::from_static(b"hello"),
+            &limits(LIMIT),
+        )
+        .unwrap();
         assert_eq!(decoded, Bytes::from_static(b"hello"));
     }
 
@@ -313,7 +322,7 @@ mod tests {
     #[test]
     fn gzip_exceeding_limit_returns_413() {
         let body = gzip(&vec![0u8; LIMIT + 1]);
-        let error = decode_with_limit(Some("gzip"), body, LIMIT).expect_err("must be rejected");
+        let error = decode(Some("gzip"), body, &limits(LIMIT)).expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_rejected_by_streaming_cap(&error, "gzip");
     }
@@ -321,7 +330,7 @@ mod tests {
     #[test]
     fn deflate_exceeding_limit_returns_413() {
         let body = deflate(&vec![0u8; LIMIT + 1]);
-        let error = decode_with_limit(Some("deflate"), body, LIMIT).expect_err("must be rejected");
+        let error = decode(Some("deflate"), body, &limits(LIMIT)).expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_rejected_by_streaming_cap(&error, "deflate");
     }
@@ -335,7 +344,7 @@ mod tests {
                 .compress_vec(&vec![0u8; LIMIT + 1])
                 .unwrap(),
         );
-        let error = decode_with_limit(Some("snappy"), body, LIMIT).expect_err("must be rejected");
+        let error = decode(Some("snappy"), body, &limits(LIMIT)).expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_rejected_by_streaming_cap(&error, "snappy");
     }
@@ -350,7 +359,7 @@ mod tests {
             bomb.extend_from_slice(&frame);
         }
 
-        let error = decode_with_limit(Some("zstd"), Bytes::from(bomb), ZSTD_LIMIT)
+        let error = decode(Some("zstd"), Bytes::from(bomb), &limits(ZSTD_LIMIT))
             .expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_rejected_by_streaming_cap(&error, "zstd");
@@ -361,14 +370,14 @@ mod tests {
     #[test]
     fn identity_exceeding_limit_returns_413() {
         let body = Bytes::from(vec![0u8; LIMIT + 1]);
-        let error = decode_with_limit(Some("identity"), body, LIMIT).expect_err("must be rejected");
+        let error = decode(Some("identity"), body, &limits(LIMIT)).expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn missing_content_encoding_exceeding_limit_returns_413() {
         let body = Bytes::from(vec![0u8; LIMIT + 1]);
-        let error = decode_with_limit(None, body, LIMIT).expect_err("must be rejected");
+        let error = decode(None, body, &limits(LIMIT)).expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -376,8 +385,7 @@ mod tests {
     #[test]
     fn stacked_encodings_are_capped_at_every_round() {
         let outer = gzip(&gzip(&vec![0u8; LIMIT + 1]));
-        let error =
-            decode_with_limit(Some("gzip,gzip"), outer, LIMIT).expect_err("must be rejected");
+        let error = decode(Some("gzip,gzip"), outer, &limits(LIMIT)).expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_rejected_by_streaming_cap(&error, "gzip");
     }
@@ -386,14 +394,18 @@ mod tests {
     /// size tests above could be passing for the wrong reason.
     #[test]
     fn malformed_payload_is_422_not_413() {
-        let error = decode_with_limit(Some("gzip"), Bytes::from_static(b"not gzip"), LIMIT)
-            .expect_err("must be rejected");
+        let error = decode(
+            Some("gzip"),
+            Bytes::from_static(b"not gzip"),
+            &limits(LIMIT),
+        )
+        .expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
     fn unsupported_encoding_is_415() {
-        let error = decode_with_limit(Some("br"), Bytes::from_static(b"x"), LIMIT)
+        let error = decode(Some("br"), Bytes::from_static(b"x"), &limits(LIMIT))
             .expect_err("must be rejected");
         assert_eq!(error.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }

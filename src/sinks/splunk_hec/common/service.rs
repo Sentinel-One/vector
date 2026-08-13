@@ -372,6 +372,8 @@ impl HttpRequestBuilder {
 
 #[cfg(test)]
 mod tests {
+    use vector_common::decompression::CompressionLimits;
+
     use std::{
         collections::HashMap,
         future::poll_fn,
@@ -443,6 +445,7 @@ mod tests {
             rej_rpt,
             Compression::default(),
             test_context(),
+            CompressionLimits::default(),
         )
     }
 
@@ -501,6 +504,7 @@ mod tests {
             RejectionReport::default(),
             Compression::default(),
             test_context(),
+            CompressionLimits::default(),
         )
     }
 
@@ -826,6 +830,7 @@ mod tests {
             RejectionReport::default(),
             Compression::default(),
             test_context(),
+            CompressionLimits::default(),
         );
 
         let request = get_hec_request();
@@ -876,6 +881,7 @@ mod tests {
             RejectionReport::default(),
             Compression::default(),
             test_context(),
+            CompressionLimits::default(),
         );
 
         let request = get_hec_request();
@@ -938,6 +944,7 @@ mod tests {
             RejectionReport::default(),
             Compression::default(),
             test_context(),
+            CompressionLimits::default(),
         );
 
         let request = get_hec_request();
