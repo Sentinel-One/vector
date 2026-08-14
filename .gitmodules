@@ -4,3 +4,4 @@
 [submodule "lib/observo/private"]
 	path = lib/observo/private
 	url = git@ghe.eng.sentinelone.tech:sentinel-one/dataplane-private.git
+	branch = OBE-11380-Add-jq-oauth-login-flow
