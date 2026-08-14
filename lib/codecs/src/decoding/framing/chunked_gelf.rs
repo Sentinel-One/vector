@@ -18,26 +18,9 @@ use vector_config::configurable_component;
 const GELF_MAGIC: &[u8] = &[0x1e, 0x0f];
 const GELF_MAX_TOTAL_CHUNKS: u8 = 128;
 const DEFAULT_TIMEOUT_SECS: f64 = 5.0;
-/// Cap on concurrent incomplete messages, bounding the reassembly map.
-/// Graylog Server itself has no such cap, so this is sized well above what a
-/// legitimate sender holds in flight within the 5s reassembly window.
-pub const DEFAULT_PENDING_MESSAGES_LIMIT: usize = 10_000;
-/// Cap on one reassembled message. The protocol ceiling is 128 chunks
-/// (`GELF_MAX_TOTAL_CHUNKS`) times the 65507-byte max UDP payload, so 8 MiB is
-/// above anything the wire format can produce. Matches Graylog's own
-/// `decompress_size_limit` default.
-pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 8 * 1024 * 1024;
 
 const fn default_timeout_secs() -> f64 {
     DEFAULT_TIMEOUT_SECS
-}
-
-const fn default_pending_messages_limit() -> Option<usize> {
-    Some(DEFAULT_PENDING_MESSAGES_LIMIT)
-}
-
-const fn default_max_message_length() -> Option<usize> {
-    Some(DEFAULT_MAX_MESSAGE_LENGTH)
 }
 
 /// Config used to build a `ChunkedGelfDecoder`.
@@ -75,22 +58,21 @@ pub struct ChunkedGelfDecoderOptions {
 
     /// The maximum number of pending incomplete messages. If this limit is reached, the decoder starts
     /// dropping chunks of new messages, ensuring the memory usage of the decoder's state is bounded.
-    /// Defaults to 10000. Set explicitly to raise or lower it.
-    #[serde(default = "default_pending_messages_limit")]
-    #[derivative(Default(value = "default_pending_messages_limit()"))]
+    /// If this option is not set, the decoder does not limit the number of pending messages and the memory usage
+    /// of its messages buffer can grow unbounded. This matches Graylog Server's behavior.
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub pending_messages_limit: Option<usize>,
 
     /// The maximum length of a single GELF message, in bytes. Messages longer than this length will
-    /// be dropped. Defaults to 8 MiB, which is above the protocol's own ceiling of 128 chunks per
-    /// message.
+    /// be dropped. If this option is not set, the decoder does not limit the length of messages and
+    /// the per-message memory is unbounded.
     ///
     /// Note that a message can be composed of multiple chunks and this limit is applied to the whole
     /// message, not to individual chunks.
     ///
     /// This limit takes only into account the message's payload and the GELF header bytes are excluded from the calculation.
     /// The message's payload is the concatenation of all the chunks' payloads.
-    #[serde(default = "default_max_message_length")]
-    #[derivative(Default(value = "default_max_message_length()"))]
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub max_length: Option<usize>,
 
     /// Decompression configuration for GELF messages.
@@ -504,8 +486,8 @@ impl Default for ChunkedGelfDecoder {
     fn default() -> Self {
         Self::new(
             DEFAULT_TIMEOUT_SECS,
-            default_pending_messages_limit(),
-            default_max_message_length(),
+            None,
+            None,
             ChunkedGelfDecompressionConfig::Auto,
             CompressionLimits::default(),
         )
