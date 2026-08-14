@@ -199,7 +199,7 @@ pub enum Decompressor {
     Gzip(CompressionLimits),
     Zlib(CompressionLimits),
     Zstd(CompressionLimits),
-    Snappy,
+    Snappy(CompressionLimits),
 }
 
 impl Decompressor {
@@ -218,8 +218,8 @@ impl Decompressor {
                 Read::read_to_end(&mut decoder, &mut buff)?;
                 Ok(buff.into())
             },
-            Decompressor::Snappy => {
-                let mut decoder = SnappyDecoder::new(bytes.reader());
+            Decompressor::Snappy(limits) => {
+                let mut decoder = SnappyDecoder::new(bytes.reader(), *limits);
                 let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
                 Read::read_to_end(&mut decoder, &mut buff)?;
                 Ok(buff.into())
@@ -239,7 +239,7 @@ impl From<(Compression, CompressionLimits)> for Decompressor {
             Compression::Gzip(_) => Decompressor::Gzip(limits),
             Compression::Zlib(_) => Decompressor::Zlib(limits),
             Compression::Zstd(_) => Decompressor::Zstd(limits),
-            Compression::Snappy => Decompressor::Snappy,
+            Compression::Snappy => Decompressor::Snappy(limits),
         }
     }
 }

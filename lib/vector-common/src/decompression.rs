@@ -94,6 +94,21 @@ impl CompressionLimits {
             .saturating_add(11) as usize
     }
 
+    /// Largest compressed frame that could legitimately decompress within the cap, using snappy's
+    /// worst-case expansion of `32 + n + n/6`.
+    ///
+    /// Snappy's raw API decompresses a whole buffer in one allocation, so there is nothing to
+    /// stream a cap against; the input has to be bounded before it is read. Mirrors
+    /// [`Self::max_zlib_compressed_frame_size_bytes`].
+    ///
+    /// See <https://github.com/google/snappy/blob/main/snappy.cc> (`MaxCompressedLength`).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // derives from a usize; saturating math keeps it in range
+    pub const fn max_snappy_compressed_frame_size_bytes(&self) -> usize {
+        let max = self.max_decompressed_size_bytes as u64;
+        max.saturating_add(max.saturating_div(6)).saturating_add(32) as usize
+    }
+
     /// Smallest zstd `window_log_max` capable of representing the cap.
     ///
     /// A zstd frame declares a window the decoder must allocate *before* producing output, so an
