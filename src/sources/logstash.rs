@@ -35,6 +35,21 @@ use crate::{
     types,
 };
 
+/// Cap on the inflated size of a single compressed frame.
+///
+/// One Beats `C` frame carries an entire window, so its inflated size scales with the sender's
+/// batch size (`bulk_max_size` defaults to 2048 events; go-lumber's `maxWindowSize` allows 10000)
+/// times the per-event size. 256 MiB sits above any such batch, so the bound only ever trips on a
+/// decompression bomb.
+///
+/// The bound is per frame, so peak memory is this value times the concurrent connection count.
+/// Set a finite `connection_limit` if that product matters for your deployment.
+const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
+fn default_max_decompressed_bytes() -> u64 {
+    DEFAULT_MAX_DECOMPRESSED_BYTES
+}
+
 /// Configuration for the `logstash` source.
 #[configurable_component(source("logstash", "Collect logs from a Logstash agent."))]
 #[derive(Clone, Debug)]
@@ -71,6 +86,16 @@ pub struct LogstashConfig {
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
     log_namespace: Option<bool>,
+
+    /// Maximum size in bytes that a compressed frame payload is allowed to expand to.
+    /// Guards against decompression bomb (zip bomb) attacks. Defaults to 256 MiB.
+    ///
+    /// This bound applies per frame, so peak memory scales with the number of concurrent
+    /// connections. Raise it only alongside a finite `connection_limit`.
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    #[configurable(metadata(docs::advanced))]
+    #[serde(default = "default_max_decompressed_bytes")]
+    max_decompressed_bytes: u64,
 }
 
 impl LogstashConfig {
@@ -127,6 +152,7 @@ impl Default for LogstashConfig {
             acknowledgements: Default::default(),
             connection_limit: None,
             log_namespace: None,
+            max_decompressed_bytes: default_max_decompressed_bytes(),
         }
     }
 }
@@ -146,6 +172,7 @@ impl SourceConfig for LogstashConfig {
             timestamp_converter: types::Conversion::Timestamp(cx.globals.timezone()),
             legacy_host_key_path: log_schema().host_key().cloned(),
             log_namespace,
+            max_decompressed_bytes: self.max_decompressed_bytes,
         };
         let shutdown_secs = Duration::from_secs(30);
         let tls_config = self.tls.as_ref().map(|tls| tls.tls_config.clone());
@@ -196,6 +223,7 @@ struct LogstashSource {
     timestamp_converter: types::Conversion,
     log_namespace: LogNamespace,
     legacy_host_key_path: Option<OwnedValuePath>,
+    max_decompressed_bytes: u64,
 }
 
 impl TcpSource for LogstashSource {
@@ -205,7 +233,7 @@ impl TcpSource for LogstashSource {
     type Acker = LogstashAcker;
 
     fn decoder(&self) -> Self::Decoder {
-        LogstashDecoder::new()
+        LogstashDecoder::new(self.max_decompressed_bytes)
     }
 
     fn handle_events(&self, events: &mut [Event], host: SocketAddr) {
@@ -316,12 +344,24 @@ enum LogstashDecoderReadState {
 #[derive(Debug)]
 struct LogstashDecoder {
     state: LogstashDecoderReadState,
+    inside_compressed: bool,
+    max_decompressed_bytes: u64,
 }
 
 impl LogstashDecoder {
-    const fn new() -> Self {
+    fn new(max_decompressed_bytes: u64) -> Self {
         Self {
             state: LogstashDecoderReadState::ReadProtocol,
+            inside_compressed: false,
+            max_decompressed_bytes,
+        }
+    }
+
+    fn new_inside_compressed(max_decompressed_bytes: u64) -> Self {
+        Self {
+            state: LogstashDecoderReadState::ReadProtocol,
+            inside_compressed: true,
+            max_decompressed_bytes,
         }
     }
 }
@@ -338,6 +378,8 @@ pub enum DecodeError {
     JsonFrameFailedDecode { source: serde_json::Error },
     #[snafu(display("Failed to decompress compressed frame: {}", source))]
     DecompressionFailed { source: io::Error },
+    #[snafu(display("Nested compressed frames are not allowed"))]
+    NestedCompressionRejected,
 }
 
 impl StreamDecodingError for DecodeError {
@@ -350,6 +392,7 @@ impl StreamDecodingError for DecodeError {
             UnknownFrameType { .. } => false,
             JsonFrameFailedDecode { .. } => true,
             DecompressionFailed { .. } => true,
+            NestedCompressionRejected => false,
         }
     }
 }
@@ -536,7 +579,10 @@ impl Decoder for LogstashDecoder {
                 }
                 // https://github.com/logstash-plugins/logstash-input-beats/blob/master/PROTOCOL.md#compressed-frame-type
                 LogstashDecoderReadState::ReadFrame(_protocol, LogstashFrameType::Compressed) => {
-                    let Some(frames) = decode_compressed_frame(src)? else {
+                    if self.inside_compressed {
+                        return Err(DecodeError::NestedCompressionRejected);
+                    }
+                    let Some(frames) = decode_compressed_frame(src, self.max_decompressed_bytes)? else {
                         return Ok(None);
                     };
 
@@ -647,6 +693,7 @@ fn decode_json_frame(
 
 fn decode_compressed_frame(
     src: &mut BytesMut,
+    max_decompressed_bytes: u64,
 ) -> Result<Option<VecDeque<(LogstashEventFrame, usize)>>, DecodeError> {
     let mut rest = src.as_ref();
 
@@ -665,17 +712,39 @@ fn decode_compressed_frame(
 
     let mut buf = Vec::new();
 
-    let res = ZlibDecoder::new(io::Cursor::new(slice))
+    // Cap output with `.take()` so a decompression bomb can never allocate without bound. Reading
+    // up to `max + 1` bytes lets us distinguish "exactly at the limit" (legal) from "truncated at
+    // the limit" (rejected) — capping at `max` alone makes those two cases indistinguishable and
+    // would reject a payload that is exactly `max_decompressed_bytes` long.
+    let res: Result<(), DecodeError> = ZlibDecoder::new(io::Cursor::new(slice))
+        .take(max_decompressed_bytes.saturating_add(1))
         .read_to_end(&mut buf)
         .context(DecompressionFailedSnafu)
-        .map(|_| BytesMut::from(&buf[..]));
+        .and_then(|_| {
+            if buf.len() as u64 > max_decompressed_bytes {
+                Err(DecodeError::DecompressionFailed {
+                    source: io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "decompressed size limit of {max_decompressed_bytes} bytes exceeded"
+                        ),
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        });
 
     let byte_size = bytes_remaining(src, rest);
     src.advance(byte_size);
 
-    let mut buf = res?;
+    res?;
 
-    let mut decoder = LogstashDecoder::new();
+    let mut buf = BytesMut::from(buf.as_slice());
+
+    // Use `new_inside_compressed` so that any nested C frame encountered while
+    // decoding the inflated bytes is rejected immediately.
+    let mut decoder = LogstashDecoder::new_inside_compressed(max_decompressed_bytes);
 
     let mut frames = VecDeque::new();
 
@@ -732,6 +801,145 @@ mod test {
         crate::test_util::test_generate_config::<LogstashConfig>();
     }
 
+    /// Wraps `payload` in the length-prefixed envelope `decode_compressed_frame` expects.
+    fn zlib_frame(payload: &[u8]) -> BytesMut {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut src = BytesMut::new();
+        src.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        src.extend_from_slice(&compressed);
+        src
+    }
+
+    #[test]
+    fn decompression_bomb_exceeds_limit() {
+        let mut src = zlib_frame(&vec![b'A'; 200]);
+
+        // A limit of 10 bytes is well below the 200-byte inflated output.
+        let result = decode_compressed_frame(&mut src, 10);
+        assert!(
+            matches!(result, Err(DecodeError::DecompressionFailed { .. })),
+            "expected DecompressionFailed, got {result:?}",
+        );
+    }
+
+    /// Boundary: a payload that inflates to exactly the limit is legal. Capping the reader at
+    /// `max` (rather than `max + 1`) made this case indistinguishable from a truncated bomb and
+    /// rejected it.
+    #[test]
+    fn decompression_at_exactly_the_limit_is_accepted() {
+        let plain = vec![b'A'; 200];
+        let mut src = zlib_frame(&plain);
+
+        let result = decode_compressed_frame(&mut src, plain.len() as u64);
+        assert!(
+            !matches!(result, Err(DecodeError::DecompressionFailed { .. })),
+            "a payload exactly at the limit must not be rejected as a bomb, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn decompression_one_byte_over_the_limit_is_rejected() {
+        let plain = vec![b'A'; 200];
+        let mut src = zlib_frame(&plain);
+
+        let result = decode_compressed_frame(&mut src, plain.len() as u64 - 1);
+        assert!(
+            matches!(result, Err(DecodeError::DecompressionFailed { .. })),
+            "one byte over the limit must be rejected, got {result:?}",
+        );
+    }
+
+    /// The source bytes must be consumed even when the frame is rejected, otherwise the same bomb
+    /// is re-decoded forever.
+    #[test]
+    fn rejected_bomb_still_advances_the_source_buffer() {
+        let mut src = zlib_frame(&vec![b'A'; 200]);
+        let original_len = src.len();
+
+        let _ = decode_compressed_frame(&mut src, 10);
+        assert!(
+            src.len() < original_len,
+            "the rejected frame's bytes must be drained from the buffer"
+        );
+    }
+
+    #[test]
+    fn nested_compressed_frame_rejected() {
+        // Inner payload: version=0x32, type=0x43 ('C'), payload_len=0x00000000.
+        // When the inside_compressed decoder encounters 'C' in ReadFrame state it returns
+        // NestedCompressionRejected before ever calling decode_compressed_frame again.
+        let mut src = zlib_frame(&[0x32, 0x43, 0, 0, 0, 0]);
+
+        let result = decode_compressed_frame(&mut src, 1024 * 1024);
+        assert!(
+            matches!(result, Err(DecodeError::NestedCompressionRejected)),
+            "expected NestedCompressionRejected, got {result:?}",
+        );
+    }
+
+    /// A nested compressed frame is unrecoverable: continuing would let the sender keep feeding
+    /// nested bombs down the same connection.
+    #[test]
+    fn nested_compression_error_terminates_the_stream() {
+        assert!(!DecodeError::NestedCompressionRejected.can_continue());
+    }
+
+    /// A single oversized frame is a per-frame condition, so the connection survives it.
+    #[test]
+    fn decompression_failure_does_not_terminate_the_stream() {
+        assert!(DecodeError::DecompressionFailed {
+            source: io::Error::new(io::ErrorKind::Other, "boom"),
+        }
+        .can_continue());
+    }
+
+    #[test]
+    fn top_level_decoder_is_not_marked_inside_compressed() {
+        // Only frames reached *through* a compressed frame may reject nesting; a plain 'C' frame
+        // at the top level is legal and must still decode.
+        assert!(!LogstashDecoder::new(DEFAULT_MAX_DECOMPRESSED_BYTES).inside_compressed);
+        assert!(
+            LogstashDecoder::new_inside_compressed(DEFAULT_MAX_DECOMPRESSED_BYTES)
+                .inside_compressed
+        );
+    }
+
+    #[test]
+    fn default_max_decompressed_bytes_is_256_mib() {
+        // Pinned deliberately: this bound is per-frame, so raising it multiplies peak memory by
+        // the concurrent connection count.
+        assert_eq!(DEFAULT_MAX_DECOMPRESSED_BYTES, 256 * 1024 * 1024);
+        assert_eq!(
+            LogstashConfig::default().max_decompressed_bytes,
+            DEFAULT_MAX_DECOMPRESSED_BYTES
+        );
+    }
+
+    #[test]
+    fn max_decompressed_bytes_round_trips_through_config() {
+        let config: LogstashConfig =
+            serde_json::from_str(r#"{"address":"0.0.0.0:5044","max_decompressed_bytes":1234}"#)
+                .unwrap();
+        assert_eq!(config.max_decompressed_bytes, 1234);
+    }
+
+    #[test]
+    fn max_decompressed_bytes_defaults_when_absent_from_config() {
+        let config: LogstashConfig =
+            serde_json::from_str(r#"{"address":"0.0.0.0:5044"}"#).unwrap();
+        assert_eq!(
+            config.max_decompressed_bytes,
+            DEFAULT_MAX_DECOMPRESSED_BYTES
+        );
+    }
+
     #[tokio::test]
     async fn test_delivered() {
         test_protocol(EventStatus::Delivered, true).await;
@@ -756,6 +964,7 @@ mod test {
             acknowledgements: true.into(),
             connection_limit: None,
             log_namespace: None,
+            max_decompressed_bytes: default_max_decompressed_bytes(),
         }
         .build(SourceContext::new_test(sender, None))
         .await
@@ -1012,6 +1221,7 @@ mod integration_tests {
                 acknowledgements: false.into(),
                 connection_limit: None,
                 log_namespace: None,
+                max_decompressed_bytes: default_max_decompressed_bytes(),
             }
             .build(SourceContext::new_test(sender, None))
             .await
@@ -1022,4 +1232,5 @@ mod integration_tests {
         wait_for_tcp(address).await;
         recv
     }
+
 }
