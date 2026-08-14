@@ -242,11 +242,7 @@ pub struct RootOpts {
     /// Without this, a component asking for a limit looser than `limits.*` is clamped back to the
     /// global value and a warning is logged. It is a start option rather than a config key so that
     /// a ceiling set by whoever runs Vector cannot be lifted by editing pipeline config.
-    #[arg(
-        long,
-        env = "VECTOR_ALLOW_COMPONENT_LIMIT_OVERRIDES",
-        default_value = "false"
-    )]
+    #[arg(long, env = "VECTOR_ALLOW_COMPONENT_LIMIT_OVERRIDES")]
     pub allow_component_limit_overrides: bool,
 }
 
@@ -412,7 +408,7 @@ pub fn handle_config_errors(errors: Vec<String>) -> exitcode::ExitCode {
 mod tests {
     use clap::Parser;
 
-    use super::Opts;
+    use super::{Opts, SubCommand};
 
     fn parse(args: &[&str]) -> Opts {
         Opts::try_parse_from(args).expect("args should parse")
@@ -432,5 +428,31 @@ mod tests {
                 .root
                 .allow_component_limit_overrides
         );
+    }
+
+    /// `validate` takes it as its own option, so it can be written after the subcommand the way
+    /// every other validate option is.
+    #[test]
+    fn validate_accepts_the_component_limit_override_flag() {
+        let opts = parse(&[
+            "vector",
+            "validate",
+            "--allow-component-limit-overrides",
+            "vector.yaml",
+        ]);
+
+        match opts.sub_command {
+            Some(SubCommand::Validate(v)) => assert!(v.allow_component_limit_overrides),
+            other => panic!("expected the validate subcommand, got {other:?}"),
+        }
+    }
+
+    /// And defaults to off there too, so `vector validate` describes a default run.
+    #[test]
+    fn validate_defaults_the_component_limit_override_flag_to_off() {
+        match parse(&["vector", "validate", "vector.yaml"]).sub_command {
+            Some(SubCommand::Validate(v)) => assert!(!v.allow_component_limit_overrides),
+            other => panic!("expected the validate subcommand, got {other:?}"),
+        }
     }
 }

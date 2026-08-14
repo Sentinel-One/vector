@@ -764,6 +764,77 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains(r#"Sink "out""#)));
     }
 
+    /// With the raise permitted, the warning must describe the run that will actually happen —
+    /// `validate --allow-component-limit-overrides` exists to predict exactly this.
+    #[tokio::test]
+    async fn a_permitted_raise_reports_that_it_was_granted() {
+        let toml = indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sources.in]
+            type = "test_basic"
+
+            [sources.in.limits.compression]
+            max_decompressed_size_bytes = 1048576
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["in"]
+            "#};
+
+        let mut builder: ConfigBuilder = format::deserialize(toml, Format::Toml).unwrap();
+        builder.allow_component_limit_overrides = true;
+        let (config, warnings) = builder.build_with_warnings().unwrap();
+
+        assert_eq!(warnings.len(), 1, "a granted raise is still reported");
+        assert!(
+            warnings[0].contains("permitted by --allow-component-limit-overrides"),
+            "got: {}",
+            warnings[0]
+        );
+        assert!(
+            !warnings[0].contains("clamped"),
+            "must not claim it was clamped, got: {}",
+            warnings[0]
+        );
+        assert!(config.allow_component_limit_overrides);
+    }
+
+    /// The same config without the flag says the opposite, so the two messages cannot be confused.
+    #[tokio::test]
+    async fn an_unpermitted_raise_reports_that_it_was_clamped() {
+        let toml = indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sources.in]
+            type = "test_basic"
+
+            [sources.in.limits.compression]
+            max_decompressed_size_bytes = 1048576
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["in"]
+            "#};
+
+        let builder: ConfigBuilder = format::deserialize(toml, Format::Toml).unwrap();
+        assert!(
+            !builder.allow_component_limit_overrides,
+            "the flag must default to off"
+        );
+        let (config, warnings) = builder.build_with_warnings().unwrap();
+
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("clamped to the global value"),
+            "got: {}",
+            warnings[0]
+        );
+        assert!(!config.allow_component_limit_overrides);
+    }
+
     #[tokio::test]
     async fn warnings() {
         let warnings = load(

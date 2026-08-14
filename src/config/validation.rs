@@ -375,9 +375,10 @@ pub fn warnings(config: &Config) -> Vec<String> {
 /// Reports every component asking for a limit looser than the global one.
 ///
 /// Emitted from [`warnings`] so the same message reaches startup, reload and `vector validate`
-/// (where `--deny-warnings` turns it into a failure). It is deliberately independent of
-/// `--allow-component-limit-overrides`: the start options are not known when the config is
-/// compiled, and the raise is worth reporting whether or not it ends up being granted.
+/// (where `--deny-warnings` turns it into a failure). A granted raise is still reported — the log
+/// should record that a component exceeded the fleet ceiling either way — but the message says
+/// which of the two happened, so `validate` describes the run it was asked about rather than the
+/// default one.
 fn component_limit_warnings(config: &Config) -> Vec<String> {
     let components = config
         .sources
@@ -401,13 +402,15 @@ fn component_limit_warnings(config: &Config) -> Vec<String> {
         if over.is_empty() {
             continue;
         }
-        // `allow_raise = false` so the reported raises are the ones a default run would clamp.
-        let (_, raises) = config.global.limits.resolve(over, false);
+        let allowed = config.allow_component_limit_overrides;
+        let (_, raises) = config.global.limits.resolve(over, allowed);
+        let outcome = if allowed {
+            "It is permitted by --allow-component-limit-overrides."
+        } else {
+            "It is clamped to the global value; pass --allow-component-limit-overrides to grant it."
+        };
         for raise in raises {
-            warnings.push(format!(
-                "{kind} \"{key}\" requests {raise}. Component limits are clamped to the global \
-                 value unless Vector is started with --allow-component-limit-overrides."
-            ));
+            warnings.push(format!("{kind} \"{key}\" requests {raise}. {outcome}"));
         }
     }
     warnings

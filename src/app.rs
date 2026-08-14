@@ -265,6 +265,7 @@ impl Application {
             signals,
             topology_controller,
             allow_empty_config: root_opts.allow_empty_config,
+            allow_component_limit_overrides: root_opts.allow_component_limit_overrides,
         })
     }
 }
@@ -276,6 +277,7 @@ pub struct StartedApplication {
     pub signals: SignalPair,
     pub topology_controller: SharedTopologyController,
     pub allow_empty_config: bool,
+    pub allow_component_limit_overrides: bool,
 }
 
 impl StartedApplication {
@@ -291,6 +293,7 @@ impl StartedApplication {
             topology_controller,
             internal_topologies,
             allow_empty_config,
+            allow_component_limit_overrides,
         } = self;
 
         let mut graceful_crash = UnboundedReceiverStream::new(graceful_crash_receiver);
@@ -307,6 +310,7 @@ impl StartedApplication {
                     &config_paths,
                     &mut signal_handler,
                     allow_empty_config,
+                    allow_component_limit_overrides,
                 ).await {
                     break signal;
                 },
@@ -335,6 +339,7 @@ async fn handle_signal(
     config_paths: &[ConfigPath],
     signal_handler: &mut SignalHandler,
     allow_empty_config: bool,
+    allow_component_limit_overrides: bool,
 ) -> Option<SignalTo> {
     match signal {
         Ok(SignalTo::ReloadFromConfigBuilder(config_builder)) => {
@@ -354,6 +359,7 @@ async fn handle_signal(
                 &topology_controller.config_paths,
                 signal_handler,
                 allow_empty_config,
+                allow_component_limit_overrides,
             )
             .await;
 
@@ -516,6 +522,7 @@ pub async fn load_configs(
         &config_paths,
         signal_handler,
         allow_empty_config,
+        allow_component_limit_overrides,
     )
     .await
     .map_err(handle_config_errors)?;
@@ -528,7 +535,6 @@ pub async fn load_configs(
     }
     config.healthchecks.set_require_healthy(require_healthy);
     config.graceful_shutdown_duration = graceful_shutdown_duration;
-    config.allow_component_limit_overrides = allow_component_limit_overrides;
 
     if allow_component_limit_overrides {
         // Worth a line of its own: the global limits stop being a ceiling for the rest of this
