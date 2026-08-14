@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Display};
+use std::{borrow::Cow, error::Error, fmt::Display};
 
 use async_trait::async_trait;
 use crate::id::ComponentKey;
@@ -22,6 +22,13 @@ pub struct Value {
     pub value: String,
     pub context: String,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ListEntry {
+    pub id: String,
+    pub updated_at: DateTime<Utc>,
+    pub value: Option<String>,
 }
 
 #[derive(Debug)]
@@ -49,8 +56,13 @@ impl Error for ChkptErr {
 
 #[async_trait]
 pub trait Accessor: Send + dyn_clone::DynClone + Sync {
-    async fn get(&self, id: String) -> Result<Value, ChkptErr>;
-    async fn set(&self, id: String, value: String, ctx: String) -> Result<(), ChkptErr>;
+    async fn get(&self, id: Cow<'_, str>) -> Result<Value, ChkptErr>;
+    async fn set(&self, id: Cow<'_, str>, value: Cow<'_, str>, ctx: Cow<'_, str>) -> Result<(), ChkptErr>;
+    async fn compare_and_set(&self, id: Cow<'_, str>, value: Cow<'_, str>, if_old: Cow<'_, str>, ctx: Cow<'_, str>) -> Result<(), ChkptErr>;
+    async fn del(&self, id: Cow<'_, str>) -> Result<(), ChkptErr>;
+    async fn compare_and_del(&self, id: Cow<'_, str>, if_old: Cow<'_, str>) -> Result<(), ChkptErr>;
+    async fn del_range(&self, from: Cow<'_, str>, to: Cow<'_, str>) -> Result<u64, ChkptErr>;
+    async fn list_range(&self, from: Cow<'_, str>, to: Cow<'_, str>, limit: u32, with_values: bool) -> Result<Vec<ListEntry>, ChkptErr>;
 }
 
 dyn_clone::clone_trait_object!(Accessor);
