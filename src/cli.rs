@@ -236,9 +236,7 @@ pub struct RootOpts {
     /// `--watch-config`.
     #[arg(long, env = "VECTOR_ALLOW_EMPTY_CONFIG", default_value = "false")]
     pub allow_empty_config: bool,
-
 }
-
 
 impl RootOpts {
     /// Return a list of config paths with the associated formats.
@@ -264,7 +262,6 @@ impl RootOpts {
         }
 
         crate::metrics::init_global().expect("metrics initialization failed");
-
     }
 }
 
