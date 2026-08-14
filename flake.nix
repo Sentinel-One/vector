@@ -38,7 +38,10 @@
             python3
             flex
             gh
-          ] ++ lib.optionals stdenv.isLinux [ mold ];
+            docker
+            docker-compose
+          ] ++ lib.optionals stdenv.isLinux [ mold krb5.dev gcc13 ]
+            ++ lib.optionals stdenv.isDarwin [ colima ];
           hardeningDisable = [ "fortify" ];
 
           RUSTC_VERSION = overrides.toolchain.channel;
@@ -54,6 +57,13 @@
             if [[ "${system}" == *"linux"* ]]; then
               export RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=mold'
               # fallback '-C link-arg=-fuse-ld=lld'
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              # krb5-src 0.3.4 bundles MIT Kerberos that uses K&R-style function
+              # pointer declarations incompatible with GCC 14's new C semantics.
+              # Force GCC 13 for all C build-script compilation.
+              export CC="${pkgs.gcc13}/bin/gcc"
+              export CXX="${pkgs.gcc13}/bin/g++"
+              ''}
             elif [[ "${system}" == *"darwin"* ]]; then
               export RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld'
               # rdkafka-sys builds librdkafka.dylib which links vendored libsasl2.a (with GSSAPI).
