@@ -304,7 +304,7 @@ mod tests {
         event::{Event, EventStatus},
         log_event,
         test_util::{
-            collect_ready,
+            collect_n,
             components::{assert_source_compliance, SOURCE_TAGS},
             next_addr, wait_for_tcp,
         },
@@ -675,7 +675,10 @@ mod tests {
             .await;
 
             if success {
-                let events = collect_ready(rx).await;
+                // collect_n drives the ack handshake: new_test_finalize only marks events
+                // acknowledged when they are polled, so the handler (which awaits the ack
+                // before returning 200) must see events drained here first.
+                let events = collect_n(rx, 1).await;
 
                 let res = res.await.unwrap().unwrap();
                 assert_eq!(200, res.status().as_u16());
@@ -775,7 +778,7 @@ mod tests {
             .await;
 
             if success {
-                let events = collect_ready(rx).await;
+                let events = collect_n(rx, 1).await;
 
                 let res = res.await.unwrap().unwrap();
                 assert_eq!(200, res.status().as_u16());
@@ -845,7 +848,7 @@ mod tests {
             )
             .await;
 
-            let events = collect_ready(rx).await;
+            let events = collect_n(rx, 1).await;
             let res = res.await.unwrap().unwrap();
             assert_eq!(200, res.status().as_u16());
 
@@ -1005,7 +1008,7 @@ mod tests {
         )
         .await;
 
-        let events = collect_ready(rx).await;
+        let events = collect_n(rx, 1).await;
 
         let res = res.await.unwrap().unwrap();
         assert_eq!(406, res.status().as_u16());
@@ -1049,7 +1052,7 @@ mod tests {
         )
         .await;
 
-        let events = collect_ready(rx).await;
+        let events = collect_n(rx, 1).await;
         let access_key = events[0]
             .metadata()
             .secrets()
@@ -1074,7 +1077,7 @@ mod tests {
         )
         .await;
 
-        let events = collect_ready(rx).await;
+        let events = collect_n(rx, 1).await;
 
         assert!(events[0]
             .metadata()
@@ -1132,7 +1135,6 @@ mod tests {
 
     #[tokio::test]
     async fn permit_origin_allows_matching_ip() {
-        use crate::test_util::collect_n;
         let (recv, address) = spawn_with_permit_origin(&["127.0.0.1"]).await;
         // Run concurrently: the server waits for event ack before sending the HTTP
         // response, so collecting must happen in parallel with the request.
