@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use vector_common::decompression::OperationalLimitsOverride;
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -80,6 +81,14 @@ where
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     proxy: ProxyConfig,
 
+    /// Overrides the global operational limits for this component.
+    ///
+    /// A limit looser than the global one is clamped back to the global value unless Vector runs
+    /// with `--allow-component-limit-overrides`; a stricter one always applies.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub limits: OperationalLimitsOverride,
+
     #[serde(flatten)]
     #[configurable(metadata(docs::hidden))]
     pub inner: BoxedSink,
@@ -101,6 +110,7 @@ where
             healthcheck_uri: None,
             inner: inner.into(),
             proxy: Default::default(),
+            limits: Default::default(),
             graph: Default::default(),
         }
     }
@@ -158,6 +168,7 @@ where
             healthcheck: self.healthcheck,
             healthcheck_uri: self.healthcheck_uri,
             proxy: self.proxy,
+            limits: self.limits,
             graph: self.graph,
         }
     }

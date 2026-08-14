@@ -11,7 +11,9 @@ use tokio::{
     time::{timeout, Duration},
 };
 use tracing::Instrument;
+use vector_common::decompression::OperationalLimitsOverride;
 use vector_config::NamedComponent;
+use vector_lib::config::GlobalOptions;
 use vector_lib::config::LogNamespace;
 use vector_lib::internal_event::{
     self, CountByteSize, EventsSent, InternalEventHandle as _, Registered,
@@ -176,6 +178,20 @@ impl<'a> Builder<'a> {
         }
         drop(store);
         CHECKPT_STORE.clone()
+    }
+
+    /// Global options for one component, with its `limits` override resolved against the global
+    /// ones.
+    ///
+    /// Handing components a pre-resolved `GlobalOptions` keeps every read site unchanged: they
+    /// still take `cx.globals.limits`, and never need to know an override existed. Raises are
+    /// reported to the user by `config::validation::warnings`, which runs before this.
+    fn globals_for(&self, over: &OperationalLimitsOverride) -> GlobalOptions {
+        resolve_globals(
+            &self.config.global,
+            over,
+            self.config.allow_component_limit_overrides,
+        )
     }
 
     /// Loads, or reloads the enrichment tables.
@@ -356,7 +372,7 @@ impl<'a> Builder<'a> {
 
             let context = SourceContext::new(
                 key.clone(),
-                self.config.global.clone(),
+                self.globals_for(&source.limits),
                 shutdown_signal,
                 pipeline,
                 ProxyConfig::merge_with_env(&self.config.global.proxy, &source.proxy),
@@ -493,7 +509,7 @@ impl<'a> Builder<'a> {
 
             let context = TransformContext {
                 key: Some(key.clone()),
-                globals: self.config.global.clone(),
+                globals: self.globals_for(&transform.limits),
                 enrichment_tables: enrichment_tables.clone(),
                 schema_definitions,
                 merged_schema_definition: merged_definition.clone(),
@@ -608,7 +624,7 @@ impl<'a> Builder<'a> {
 
             let cx = SinkContext {
                 healthcheck,
-                globals: self.config.global.clone(),
+                globals: self.globals_for(&sink.limits),
                 proxy: ProxyConfig::merge_with_env(&self.config.global.proxy, sink.proxy()),
                 schema: self.config.schema,
                 app_name: crate::get_app_name().to_string(),
@@ -1103,4 +1119,96 @@ fn build_task_transform(
     let task = Task::new(key.clone(), typetag, transform);
 
     (task, outputs)
+}
+
+/// Applies a component's `limits` override to the global options it will be built with.
+///
+/// Split out from [`Builder::globals_for`] so the resolution can be tested without standing up a
+/// whole topology.
+fn resolve_globals(
+    global: &GlobalOptions,
+    over: &OperationalLimitsOverride,
+    allow_raise: bool,
+) -> GlobalOptions {
+    let mut globals = global.clone();
+    if !over.is_empty() {
+        let (resolved, _raises) = global.limits.resolve(over, allow_raise);
+        globals.limits = resolved;
+    }
+    globals
+}
+
+#[cfg(test)]
+mod limit_override_tests {
+    use vector_common::decompression::{
+        CompressionLimits, CompressionLimitsOverride, OperationalLimits, OperationalLimitsOverride,
+    };
+
+    use super::{resolve_globals, GlobalOptions};
+
+    fn global_with(max: usize) -> GlobalOptions {
+        GlobalOptions {
+            limits: OperationalLimits {
+                compression: CompressionLimits::with_max_decompressed_size_bytes(max),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn asking(max: usize) -> OperationalLimitsOverride {
+        OperationalLimitsOverride {
+            compression: CompressionLimitsOverride {
+                max_decompressed_size_bytes: Some(max),
+            },
+        }
+    }
+
+    /// The override has to reach the component. Every component reads `cx.globals.limits`, so the
+    /// resolved value must be what lands there — not the untouched global.
+    #[test]
+    fn a_component_override_reaches_the_globals_it_is_built_with() {
+        let globals = resolve_globals(&global_with(4096), &asking(1024), false);
+
+        assert_eq!(globals.limits.compression.max_decompressed_size_bytes, 1024);
+    }
+
+    /// A component saying nothing must be handed the deployment's limits untouched.
+    #[test]
+    fn no_override_leaves_the_globals_alone() {
+        let global = global_with(4096);
+        let globals = resolve_globals(&global, &OperationalLimitsOverride::default(), false);
+
+        assert_eq!(globals.limits, global.limits);
+    }
+
+    /// Without the start option, a component cannot build itself a looser limit than the operator
+    /// allowed, however its config is written.
+    #[test]
+    fn a_raise_does_not_reach_the_component_unless_permitted() {
+        let clamped = resolve_globals(&global_with(4096), &asking(1 << 30), false);
+        assert_eq!(
+            clamped.limits.compression.max_decompressed_size_bytes, 4096,
+            "the global ceiling must survive"
+        );
+
+        let granted = resolve_globals(&global_with(4096), &asking(1 << 30), true);
+        assert_eq!(
+            granted.limits.compression.max_decompressed_size_bytes,
+            1 << 30,
+            "--allow-component-limit-overrides must actually grant the raise"
+        );
+    }
+
+    /// Resolution must touch only `limits`; anything else in `GlobalOptions` belongs to the
+    /// deployment and must pass through unchanged.
+    #[test]
+    fn resolution_changes_nothing_but_the_limits() {
+        let global = global_with(4096);
+        let resolved = resolve_globals(&global, &asking(1024), false);
+
+        assert_eq!(resolved.data_dir, global.data_dir);
+        assert_eq!(resolved.log_schema, global.log_schema);
+        assert_eq!(resolved.timezone, global.timezone);
+        assert_eq!(resolved.proxy, global.proxy);
+    }
 }

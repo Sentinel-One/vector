@@ -104,6 +104,9 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
             tests,
             secret,
             graceful_shutdown_duration,
+            // Comes from the start options, which the compiler does not see; `app` sets it once
+            // the config is loaded.
+            allow_component_limit_overrides: false,
         };
 
         config.propagate_acknowledgements()?;

@@ -37,9 +37,6 @@ use flate2::read::{MultiGzDecoder, ZlibDecoder};
 /// Default cap on the size of any decompressed payload.
 ///
 /// Prevents a compressed "bomb" from causing unbounded memory growth.
-/// Default cap on the size of any decompressed payload.
-///
-/// Prevents a compressed "bomb" from causing unbounded memory growth.
 pub const DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES: usize = 100 * 1024 * 1024;
 
 /// Limits applied wherever Vector decompresses data it did not produce.
@@ -148,6 +145,106 @@ pub struct OperationalLimits {
     #[configurable(derived)]
     #[serde(default)]
     pub compression: CompressionLimits,
+}
+
+/// Per-component override of [`CompressionLimits`].
+///
+/// Every field is optional so that "not set" stays distinct from "set to the default". Without
+/// that distinction a component that says nothing would look like it were asking for the default
+/// value, and could not be told apart from one that deliberately asked for it.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressionLimitsOverride {
+    /// Overrides [`CompressionLimits::max_decompressed_size_bytes`] for this component.
+    ///
+    /// A value below the global limit always applies. A value above it is clamped back to the
+    /// global limit unless Vector is started with `--allow-component-limit-overrides`, so that a
+    /// ceiling chosen by whoever runs the process cannot be lifted by editing pipeline config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_decompressed_size_bytes: Option<usize>,
+}
+
+/// Per-component override of [`OperationalLimits`].
+///
+/// Attached to every source, transform and sink. Unset fields inherit the global value.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationalLimitsOverride {
+    /// Overrides the global decompression limits for this component.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub compression: CompressionLimitsOverride,
+}
+
+impl OperationalLimitsOverride {
+    /// Whether this component asked for anything at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A component asking for a limit looser than the global one allows.
+///
+/// Reported so the same raise can be surfaced as a config warning (at startup, reload and
+/// `vector validate`) and acted on when the topology is built, without the two disagreeing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitRaise {
+    /// Config path of the limit, relative to the component, for use in messages.
+    pub field: &'static str,
+    /// What the component asked for.
+    pub requested: usize,
+    /// What the global limit permits.
+    pub allowed: usize,
+}
+
+impl fmt::Display for LimitRaise {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} = {}, above the global limit of {}",
+            self.field, self.requested, self.allowed
+        )
+    }
+}
+
+impl OperationalLimits {
+    /// Applies a component's override to these global limits.
+    ///
+    /// Returns the limits the component should actually run under, together with every raise it
+    /// asked for. A raise is granted only when `allow_raise` is set; otherwise it is clamped back
+    /// to the global value. Lowering is always granted — a component may be stricter than the
+    /// deployment, never looser than the operator permits.
+    ///
+    /// Raises are reported whether or not they were granted, so a caller can warn in both cases.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        over: &OperationalLimitsOverride,
+        allow_raise: bool,
+    ) -> (Self, Vec<LimitRaise>) {
+        let mut resolved = *self;
+        let mut raises = Vec::new();
+
+        if let Some(requested) = over.compression.max_decompressed_size_bytes {
+            let allowed = self.compression.max_decompressed_size_bytes;
+            if requested > allowed {
+                raises.push(LimitRaise {
+                    field: "limits.compression.max_decompressed_size_bytes",
+                    requested,
+                    allowed,
+                });
+            }
+            resolved.compression.max_decompressed_size_bytes =
+                if requested > allowed && !allow_raise {
+                    allowed
+                } else {
+                    requested
+                };
+        }
+
+        (resolved, raises)
+    }
 }
 
 /// RFC 9659 window ceiling for zstd under HTTP `Content-Encoding: zstd`: conformant senders use a
@@ -605,5 +702,111 @@ mod tests {
 
         assert_eq!(streamed, buffered);
         assert_eq!(streamed, payload);
+    }
+
+    // ---- component limit overrides ------------------------------------------------------------
+
+    fn global(max: usize) -> OperationalLimits {
+        OperationalLimits {
+            compression: CompressionLimits::with_max_decompressed_size_bytes(max),
+        }
+    }
+
+    fn asking(max: usize) -> OperationalLimitsOverride {
+        OperationalLimitsOverride {
+            compression: CompressionLimitsOverride {
+                max_decompressed_size_bytes: Some(max),
+            },
+        }
+    }
+
+    /// The common case: the component says nothing, so it runs under the deployment's limits and
+    /// there is nothing to warn about.
+    #[test]
+    fn an_empty_override_inherits_the_global_limits() {
+        let (resolved, raises) = global(1024).resolve(&OperationalLimitsOverride::default(), false);
+
+        assert_eq!(resolved, global(1024));
+        assert!(raises.is_empty());
+        assert!(OperationalLimitsOverride::default().is_empty());
+    }
+
+    /// A component may always be stricter than the deployment.
+    #[test]
+    fn lowering_is_always_granted() {
+        for allow_raise in [false, true] {
+            let (resolved, raises) = global(1024).resolve(&asking(512), allow_raise);
+
+            assert_eq!(resolved.compression.max_decompressed_size_bytes, 512);
+            assert!(raises.is_empty(), "lowering is not a raise");
+        }
+    }
+
+    /// The whole point of the clamp: pipeline config cannot lift a ceiling the operator set.
+    #[test]
+    fn raising_is_clamped_by_default() {
+        let (resolved, raises) = global(1024).resolve(&asking(4096), false);
+
+        assert_eq!(
+            resolved.compression.max_decompressed_size_bytes, 1024,
+            "the global limit must survive a component asking for more"
+        );
+        assert_eq!(
+            raises,
+            vec![LimitRaise {
+                field: "limits.compression.max_decompressed_size_bytes",
+                requested: 4096,
+                allowed: 1024,
+            }]
+        );
+    }
+
+    /// The escape hatch, which only whoever starts the process can open.
+    #[test]
+    fn raising_is_granted_when_explicitly_allowed() {
+        let (resolved, raises) = global(1024).resolve(&asking(4096), true);
+
+        assert_eq!(resolved.compression.max_decompressed_size_bytes, 4096);
+        assert_eq!(
+            raises.len(),
+            1,
+            "a granted raise is still reported, so it can be warned about"
+        );
+    }
+
+    /// Asking for exactly the global value is not a raise, so it must not warn.
+    #[test]
+    fn matching_the_global_limit_is_not_a_raise() {
+        let (resolved, raises) = global(1024).resolve(&asking(1024), false);
+
+        assert_eq!(resolved, global(1024));
+        assert!(raises.is_empty());
+    }
+
+    /// A component that omits the field must not be treated as having asked for the default. With
+    /// a global below the default, a naive merge would report a raise nobody requested.
+    #[test]
+    fn an_unset_field_is_not_read_as_a_request_for_the_default() {
+        let strict = global(1024);
+        assert!(
+            strict.compression.max_decompressed_size_bytes < DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
+        );
+
+        let (resolved, raises) = strict.resolve(&OperationalLimitsOverride::default(), false);
+
+        assert_eq!(resolved, strict);
+        assert!(raises.is_empty(), "silence is not a request");
+    }
+
+    /// An omitted override must deserialise to "unset", not to the default value.
+    #[test]
+    fn an_omitted_override_deserialises_as_unset() {
+        let empty: OperationalLimitsOverride = serde_json::from_str("{}").unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.compression.max_decompressed_size_bytes, None);
+
+        let set: OperationalLimitsOverride =
+            serde_json::from_str(r#"{"compression":{"max_decompressed_size_bytes":512}}"#).unwrap();
+        assert_eq!(set.compression.max_decompressed_size_bytes, Some(512));
     }
 }

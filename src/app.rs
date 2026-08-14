@@ -83,6 +83,7 @@ impl ApplicationConfig {
             opts.require_healthy,
             opts.allow_empty_config,
             graceful_shutdown_duration,
+            opts.allow_component_limit_overrides,
             signal_handler,
         )
         .await?;
@@ -487,6 +488,7 @@ pub async fn load_configs(
     require_healthy: Option<bool>,
     allow_empty_config: bool,
     graceful_shutdown_duration: Option<Duration>,
+    allow_component_limit_overrides: bool,
     signal_handler: &mut SignalHandler,
 ) -> Result<Config, ExitCode> {
     let config_paths = config::process_paths(config_paths).ok_or(exitcode::CONFIG)?;
@@ -526,6 +528,16 @@ pub async fn load_configs(
     }
     config.healthchecks.set_require_healthy(require_healthy);
     config.graceful_shutdown_duration = graceful_shutdown_duration;
+    config.allow_component_limit_overrides = allow_component_limit_overrides;
+
+    if allow_component_limit_overrides {
+        // Worth a line of its own: the global limits stop being a ceiling for the rest of this
+        // run, so the log should say so even when no component actually exceeds them.
+        info!(
+            "Component limit overrides are permitted; a component may raise a limit above the \
+             global value."
+        );
+    }
 
     Ok(config)
 }

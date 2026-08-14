@@ -94,6 +94,8 @@ impl From<Config> for ConfigBuilder {
             tests,
             secret,
             graceful_shutdown_duration,
+            // Set from the start options after loading, so it does not round-trip into a builder.
+            allow_component_limit_overrides: _,
         } = config;
 
         let transforms = transforms
