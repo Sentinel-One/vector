@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::io;
 use std::io::{Read, Write};
+use vector_common::decompression::{CappedDecoder, CappedZstdReader, CompressionLimits};
 use crate::sink::compression::CompressionLevel;
 
 #[derive(Debug)]
@@ -68,20 +69,24 @@ impl<W: Write + std::fmt::Debug> std::fmt::Debug for ZstdEncoder<W> {
 /// 2. Sharing only internal writer, which implements `Sync`
 unsafe impl<W: Write + Sync> Sync for ZstdEncoder<W> {}
 
+/// Streaming zstd decoder bounded by the global decompressed-size cap.
+///
+/// Delegates to [`CappedDecoder`], so a frame that expands past the cap fails with an error
+/// instead of being silently truncated or driving an unbounded allocation.
 pub struct ZstdDecoder<R: Read> {
-    inner: zstd::Decoder<'static, io::BufReader<R>>,
+    inner: CappedZstdReader<R>,
 }
 
 impl<R: Read> ZstdDecoder<R> {
-    pub fn new(reader: R) -> io::Result<Self> {
-        let decoder = zstd::Decoder::new(reader)?;
-        Ok(Self { inner: decoder })
+    pub fn new(reader: R, limits: &CompressionLimits) -> io::Result<Self> {
+        Ok(Self {
+            inner: CappedDecoder::zstd(reader, limits)?.into_reader(),
+        })
     }
 }
 
 impl<R: Read> Read for ZstdDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        #[allow(clippy::disallowed_methods)] // Caller handles the result of `read`.
         self.inner.read(buf)
     }
 }

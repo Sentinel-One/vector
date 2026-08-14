@@ -494,7 +494,7 @@ vrl.workspace = true
 rustls = "0.23"
 tokio-rustls = "0.26"
 wiremock = "0.6.2"
-zstd = { version = "0.13.0", default-features = false }
+zstd.workspace = true
 
 [patch.crates-io]
 mlua = { git = "https://github.com/janmejay-s1/mlua.git", branch = "mlua_0.10.2_list_iter_safety" }
@@ -656,10 +656,10 @@ sources-metrics = [
 sources-amqp = ["lapin"]
 sources-apache_metrics = ["sources-utils-http-client"]
 sources-aws_ecs_metrics = ["sources-utils-http-client"]
-sources-aws_kinesis_firehose = ["dep:base64"]
+sources-aws_kinesis_firehose = ["dep:base64", "sources-utils-http-encoding"]
 sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:semver", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
-sources-datadog_agent = ["sources-utils-http-error", "protobuf-build", "dep:prost"]
+sources-datadog_agent = ["sources-utils-http-encoding", "sources-utils-http-error", "protobuf-build", "dep:prost"]
 sources-demo_logs = ["dep:fakedata"]
 sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:hickory-proto", "dep:dnsmsg-parser", "dep:dnstap-parser", "protobuf-build", "dep:prost"]
 sources-docker_logs = ["docker"]
@@ -695,7 +695,7 @@ sources-prometheus-pushgateway = ["sinks-prometheus", "sources-utils-http", "vec
 sources-pulsar = ["dep:apache-avro", "dep:pulsar"]
 sources-redis = ["dep:redis"]
 sources-socket = ["sources-utils-net", "tokio-util/net"]
-sources-splunk_hec = ["dep:roaring"]
+sources-splunk_hec = ["dep:roaring", "sources-utils-http-encoding"]
 sources-statsd = ["sources-utils-net", "tokio-util/net"]
 sources-stdin = ["tokio-util/io"]
 sources-syslog = ["codecs-syslog", "sources-utils-net", "tokio-util/net"]
@@ -890,6 +890,11 @@ sinks-webhdfs = ["dep:opendal"]
 
 # Identifies that the build is a nightly build
 nightly = []
+
+# Timing-sensitive tests. Kept out of the default suite so CI scheduling noise cannot fail a run;
+# enable explicitly (dataplane-build does) to exercise them, and eventually in a dedicated fork of
+# the test workflow.
+performance-tests = []
 
 # Integration testing-related features
 all-integration-tests = [

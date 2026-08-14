@@ -13167,6 +13167,7 @@ dependencies = [
  "crossbeam-utils",
  "derivative",
  "dyn-clone",
+ "flate2",
  "futures 0.3.31",
  "hostname 0.4.0",
  "indexmap 2.7.0",
@@ -13190,6 +13191,7 @@ dependencies = [
  "tracing-test",
  "vector-config",
  "vrl",
+ "zstd 0.13.2",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    io::Write,
+    io::{self, Write},
     mem,
     pin::Pin,
     task::{Context, Poll},
@@ -23,11 +23,25 @@ use vector_lib::internal_event::{
 };
 
 use crate::internal_events::{GrpcError, GrpcInvalidCompressionSchemeError};
+use crate::sources::util::decompression::{
+    CompressionLimits,
+    DecompressedSizeLimitExceeded,
+};
 
 // Every gRPC message has a five byte header:
 // - a compressed flag (u8, 0/1 for compressed/decompressed)
 // - a length prefix, indicating the number of remaining bytes to read (u32)
 const GRPC_MESSAGE_HEADER_LEN: usize = mem::size_of::<u8>() + mem::size_of::<u32>();
+// Fixed container framing a valid frame adds on top of zlib's worst-case expansion. Added to the
+// compressed-frame pre-filter so a small cap does not reject a typical gzip frame whose
+// decompressed size is within the cap.
+//
+// gzip's mandatory framing is 18 bytes (10 header + 8 trailer), but its optional FNAME, FCOMMENT
+// and FEXTRA fields are unbounded (RFC 1952 section 2.3.1): a gzip frame carrying more than this
+// slack in those optional fields could still be rejected here. Encoders don't emit them in
+// practice, so 22 covers the realistic case; the prefilter is only a cheap wire-size guard and the
+// authoritative per-output cap is still enforced during decompression.
+const GRPC_COMPRESSED_FRAME_OVERHEAD_SLACK: usize = 22;
 const GRPC_ENCODING_HEADER: &str = "grpc-encoding";
 const GRPC_ACCEPT_ENCODING_HEADER: &str = "grpc-accept-encoding";
 
@@ -80,17 +94,67 @@ impl Default for State {
     }
 }
 
-fn new_decompressor() -> GzDecoder<Vec<u8>> {
+/// Maps a decompressor `io::Error` to a gRPC [`Status`]: an oversized payload becomes
+/// `out_of_range` (a client fault, matching the existing >4GB handling) while anything else falls
+/// back to `internal` with `internal_msg`.
+fn decompressor_error_to_status(error: &io::Error, internal_msg: &'static str) -> Status {
+    if DecompressedSizeLimitExceeded::is(error) {
+        Status::out_of_range("decompressed message exceeds the maximum allowed size")
+    } else {
+        Status::internal(internal_msg)
+    }
+}
+
+/// A `Write` sink that appends into a `Vec` but refuses to grow past `max_len`, so a streaming
+/// decompressor errors out *during* decompression rather than first materializing an oversized
+/// output and only then having its size checked.
+struct LimitedWriter {
+    buf: Vec<u8>,
+    max_len: usize,
+}
+
+impl LimitedWriter {
+    const fn new(buf: Vec<u8>, max_len: usize) -> Self {
+        Self { buf, max_len }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+impl Write for LimitedWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.max_len {
+            return Err(io::Error::other(DecompressedSizeLimitExceeded));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn new_decompressor(limits: &CompressionLimits) -> GzDecoder<LimitedWriter> {
     // Create the backing buffer for the decompressor and set the compression flag to false (0) and pre-allocate
     // the space for the length prefix, which we'll fill out once we've finalized the decompressor.
     let buf = vec![0; GRPC_MESSAGE_HEADER_LEN];
 
-    GzDecoder::new(buf)
+    // Cap the decompressed output so a compression bomb on this unauthenticated gRPC listener
+    // cannot drive unbounded allocation. The buffer already holds the 5-byte header, so the sink
+    // may grow to the header plus the decompressed cap; anything larger errors mid-decompression.
+    GzDecoder::new(LimitedWriter::new(
+        buf,
+        GRPC_MESSAGE_HEADER_LEN.saturating_add(limits.max_decompressed_size_bytes),
+    ))
 }
 
 async fn drive_body_decompression(
     mut source: Body,
     mut destination: Sender,
+    limits: &CompressionLimits,
 ) -> Result<usize, Status> {
     let mut state = State::default();
     let mut buf = BytesMut::new();
@@ -133,6 +197,19 @@ async fn drive_body_decompression(
                     // decompressor incrementally because there's no good reason to make both the internal buffer and
                     // the decompressor buffer expand if we don't have to.
                     if is_compressed {
+                        // Reject a compressed payload whose declared wire size could not
+                        // legitimately decompress within the cap, before we buffer any of it. The
+                        // bound (decompressed cap plus zlib's worst-case expansion, shared with the
+                        // logstash source) keeps a peer from advertising a huge length and
+                        // slow-streaming bytes to grow the decompressor's input buffer unbounded.
+                        let compressed_frame_limit = limits.max_zlib_compressed_frame_size_bytes()
+                            .saturating_add(GRPC_COMPRESSED_FRAME_OVERHEAD_SLACK);
+                        if message_len > compressed_frame_limit {
+                            return Err(Status::out_of_range(
+                                "compressed message length exceeds the maximum allowed size",
+                            ));
+                        }
+
                         // We skip the header in the buffer because it doesn't matter to the decompressor and we
                         // recreate it anyways.
                         buf.advance(GRPC_MESSAGE_HEADER_LEN);
@@ -141,6 +218,15 @@ async fn drive_body_decompression(
                             remaining: message_len,
                         };
                     } else {
+                        // Reject an identity (uncompressed) message larger than the cap before
+                        // buffering it to `overall_len`, so a large declared length cannot drive
+                        // unbounded buffering here ahead of tonic's own decode-size limit.
+                        if message_len > limits.max_decompressed_size_bytes {
+                            return Err(Status::out_of_range(
+                                "message length exceeds the maximum allowed size",
+                            ));
+                        }
+
                         let overall_len = GRPC_MESSAGE_HEADER_LEN + message_len;
                         state = State::Forward { overall_len };
                     }
@@ -172,9 +258,13 @@ async fn drive_body_decompression(
                             // the decompressor. This is _technically_ synchronous but there's really no way to do it
                             // asynchronously since we already have the data, and that's the only asynchronous part.
                             let to_take = cmp::min(available, *remaining);
-                            let decompressor = decompressor.get_or_insert_with(new_decompressor);
-                            if decompressor.write_all(&buf[..to_take]).is_err() {
-                                return Err(Status::internal("failed to write to decompressor"));
+                            let decompressor =
+                                decompressor.get_or_insert_with(|| new_decompressor(limits));
+                            if let Err(error) = decompressor.write_all(&buf[..to_take]) {
+                                return Err(decompressor_error_to_status(
+                                    &error,
+                                    "failed to write to decompressor",
+                                ));
                             }
 
                             *remaining -= to_take;
@@ -188,13 +278,16 @@ async fn drive_body_decompression(
                         let result = decompressor
                             .take()
                             .expect("consumed decompressor when no decompressor was present")
-                            .finish();
+                            .finish()
+                            .map(LimitedWriter::into_inner);
 
-                        // The only I/O errors that occur during `finish` should be I/O errors from writing to the internal
-                        // buffer, but `Vec<T>` is infallible in this regard, so this should be impossible without having
-                        // first panicked due to memory exhaustion.
-                        let mut buf = result.map_err(|_| {
-                            Status::internal(
+                        // Decompression can fail here either because the payload exceeded the size
+                        // cap (an oversized-request client fault) or, for malformed input, during
+                        // finalization; map the former to `out_of_range` and treat anything else as
+                        // an internal error.
+                        let mut buf = result.map_err(|error| {
+                            decompressor_error_to_status(
+                                &error,
                                 "reached impossible error during decompressor finalization",
                             )
                         })?;
@@ -245,12 +338,13 @@ async fn drive_request<F, E>(
     destination: Sender,
     inner: F,
     bytes_received: Registered<BytesReceived>,
+    compression_limits: CompressionLimits,
 ) -> Result<Response<BoxBody>, E>
 where
     F: Future<Output = Result<Response<BoxBody>, E>>,
     E: std::fmt::Display,
 {
-    let body_decompression = drive_body_decompression(source, destination);
+    let body_decompression = drive_body_decompression(source, destination, &compression_limits);
 
     pin!(inner);
     pin!(body_decompression);
@@ -300,6 +394,7 @@ where
 pub struct DecompressionAndMetrics<S> {
     inner: S,
     bytes_received: Registered<BytesReceived>,
+    compression_limits: CompressionLimits,
 }
 
 impl<S> Service<Request<Body>> for DecompressionAndMetrics<S>
@@ -336,7 +431,14 @@ where
 
                 let inner = self.inner.call(mapped_req);
 
-                drive_request(req_body, destination, inner, self.bytes_received.clone()).boxed()
+                drive_request(
+                    req_body,
+                    destination,
+                    inner,
+                    self.bytes_received.clone(),
+                    self.compression_limits,
+                )
+                .boxed()
             }
         }
     }
@@ -362,8 +464,18 @@ where
 /// received _and_ processed correctly.
 ///
 /// The only supported compression scheme is gzip, which is also the only supported compression scheme in `tonic` itself.
-#[derive(Clone, Default)]
-pub struct DecompressionAndMetricsLayer;
+#[derive(Clone, Copy, Default)]
+pub struct DecompressionAndMetricsLayer {
+    compression_limits: CompressionLimits,
+}
+
+impl DecompressionAndMetricsLayer {
+    /// Builds the layer with the limits this listener should decompress under.
+    #[must_use]
+    pub const fn new(compression_limits: CompressionLimits) -> Self {
+        Self { compression_limits }
+    }
+}
 
 impl<S> Layer<S> for DecompressionAndMetricsLayer {
     type Service = DecompressionAndMetrics<S>;
@@ -372,6 +484,151 @@ impl<S> Layer<S> for DecompressionAndMetricsLayer {
         DecompressionAndMetrics {
             inner,
             bytes_received: register!(BytesReceived::from(Protocol::from("grpc"))),
+            compression_limits: self.compression_limits,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::util::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+    fn gzip(payload: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn limited_writer_accepts_within_limit() {
+        let mut writer = LimitedWriter::new(Vec::new(), 8);
+        writer
+            .write_all(b"12345678")
+            .expect("exactly at the limit must be accepted");
+        assert_eq!(writer.into_inner(), b"12345678");
+    }
+
+    #[test]
+    fn limited_writer_rejects_past_limit() {
+        let mut writer = LimitedWriter::new(Vec::new(), 8);
+        let error = writer
+            .write_all(b"123456789")
+            .expect_err("one byte past the limit must be rejected");
+
+        assert!(
+            DecompressedSizeLimitExceeded::is(&error),
+            "expected the size-limit marker, got {error}"
+        );
+    }
+
+    /// The cap must fire *during* decompression rather than after materialising the whole output,
+    /// which is the entire point of the `LimitedWriter` sink.
+    #[test]
+    fn gzip_decompressor_rejects_bomb_mid_stream() {
+        let bomb = gzip(&vec![0u8; 1024 * 1024]);
+        let mut decoder = GzDecoder::new(LimitedWriter::new(Vec::new(), 4096));
+
+        let error = decoder
+            .write_all(&bomb)
+            .expect_err("a payload inflating past the cap must be rejected");
+
+        assert!(DecompressedSizeLimitExceeded::is(&error));
+    }
+
+    #[test]
+    fn gzip_decompressor_passes_ordinary_payload() {
+        let payload = b"hello grpc";
+        let mut decoder = GzDecoder::new(LimitedWriter::new(Vec::new(), 4096));
+        decoder.write_all(&gzip(payload)).expect("must decompress");
+        let out = decoder.finish().map(LimitedWriter::into_inner).unwrap();
+
+        assert_eq!(out, payload);
+    }
+
+    /// An oversized payload is a client fault, so it must surface as `out_of_range` rather than
+    /// being reported as an internal server error.
+    #[test]
+    fn size_limit_maps_to_out_of_range_other_errors_to_internal() {
+        let limit_error = io::Error::other(DecompressedSizeLimitExceeded);
+        assert_eq!(
+            decompressor_error_to_status(&limit_error, "internal").code(),
+            tonic::Code::OutOfRange
+        );
+
+        let other = io::Error::other("some unrelated failure");
+        assert_eq!(
+            decompressor_error_to_status(&other, "internal").code(),
+            tonic::Code::Internal
+        );
+    }
+
+    fn grpc_frame(compressed: bool, declared_len: u32) -> Body {
+        let mut frame = vec![u8::from(compressed)];
+        frame.extend_from_slice(&declared_len.to_be_bytes());
+        Body::from(frame)
+    }
+
+    async fn drive(frame: Body) -> Result<usize, Status> {
+        let (sender, _receiver) = Body::channel();
+        drive_body_decompression(frame, sender, &CompressionLimits::default()).await
+    }
+
+    /// A compressed frame declaring more bytes than could legitimately decompress within the cap
+    /// must be refused from its header alone, before any of the payload is buffered.
+    #[tokio::test]
+    async fn oversized_compressed_frame_length_is_rejected_from_the_header() {
+        let declared = u32::MAX;
+        assert!(
+            declared as usize
+                > CompressionLimits::default().max_zlib_compressed_frame_size_bytes()
+                    .saturating_add(GRPC_COMPRESSED_FRAME_OVERHEAD_SLACK),
+            "the declared length must exceed the prefilter for this test to mean anything"
+        );
+
+        let status = drive(grpc_frame(true, declared))
+            .await
+            .expect_err("an oversized declared length must be rejected");
+
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+    }
+
+    /// The same guard is needed on the identity path: an uncompressed message declaring a huge
+    /// length would otherwise be buffered to `overall_len` before tonic's own limit applied.
+    #[tokio::test]
+    async fn oversized_identity_frame_length_is_rejected_from_the_header() {
+        let declared = u32::MAX;
+        assert!(declared as usize > CompressionLimits::default().max_decompressed_size_bytes);
+
+        let status = drive(grpc_frame(false, declared))
+            .await
+            .expect_err("an oversized identity length must be rejected");
+
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+    }
+
+    /// A legitimate declared length must not be refused by either guard — the frame simply waits
+    /// for its payload.
+    #[tokio::test]
+    async fn ordinary_frame_length_is_accepted() {
+        for compressed in [true, false] {
+            let result = drive(grpc_frame(compressed, 64)).await;
+            assert!(
+                result.is_ok(),
+                "a small declared length must pass the guards (compressed={compressed}), got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// The new decompressor must carry the global cap, not an unbounded sink.
+    #[test]
+    fn new_decompressor_is_capped_at_the_global_limit() {
+        let decoder = new_decompressor(&CompressionLimits::default());
+        assert_eq!(
+            decoder.get_ref().max_len,
+            GRPC_MESSAGE_HEADER_LEN + DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
+        );
     }
 }

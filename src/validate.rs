@@ -30,6 +30,14 @@ pub struct Opts {
     #[arg(short, long)]
     pub deny_warnings: bool,
 
+    /// Validate as though Vector were started with `--allow-component-limit-overrides`.
+    ///
+    /// Without this, a component asking for a limit looser than `limits.*` is reported as being
+    /// clamped, because that is what a default run does. Pass it to describe the run you actually
+    /// intend to make.
+    #[arg(long, env = "VECTOR_ALLOW_COMPONENT_LIMIT_OVERRIDES")]
+    pub allow_component_limit_overrides: bool,
+
     /// Vector config files in TOML format to validate.
     #[arg(
         id = "config-toml",
@@ -150,9 +158,12 @@ pub fn validate_config(opts: &Opts, fmt: &mut Formatter) -> Option<Config> {
         fmt.title(format!("Failed to load {:?}", &paths_list));
         fmt.sub_error(errors);
     };
-    let builder = config::load_builder_from_paths(&paths)
+    let mut builder = config::load_builder_from_paths(&paths)
         .map_err(&mut report_error)
         .ok()?;
+    // Not a config key, so it has to be applied here rather than read from the file. Without it
+    // `validate` would describe a default run even when asked about a permissive one.
+    builder.allow_component_limit_overrides = opts.allow_component_limit_overrides;
     config::init_log_schema(builder.global.log_schema.clone(), true);
 
     // Build

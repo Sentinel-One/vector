@@ -105,6 +105,11 @@ pub struct Config {
     tests: Vec<TestDefinition>,
     secret: IndexMap<ComponentKey, SecretBackends>,
     pub graceful_shutdown_duration: Option<Duration>,
+    /// Whether a component may raise a limit above the global one.
+    ///
+    /// Settable only by whoever starts the process (`--allow-component-limit-overrides`), never
+    /// from config, so a ceiling cannot be lifted by editing a pipeline file.
+    pub allow_component_limit_overrides: bool,
 }
 
 impl Config {
@@ -622,6 +627,212 @@ mod tests {
 
         let expected = Ok(vec![]);
         assert_eq!(result, expected);
+    }
+
+    // ---- per-component limit overrides --------------------------------------------------------
+
+    /// A component asking for more than the global limit is reported, at startup, on reload and
+    /// under `vector validate`.
+    #[tokio::test]
+    async fn a_component_raising_a_limit_warns() {
+        let warnings = load(
+            indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sources.in]
+            type = "test_basic"
+
+            [sources.in.limits.compression]
+            max_decompressed_size_bytes = 1048576
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["in"]
+            "#},
+            Format::Toml,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        let warning = &warnings[0];
+        assert!(warning.contains(r#"Source "in""#), "got: {warning}");
+        assert!(
+            warning.contains("limits.compression.max_decompressed_size_bytes = 1048576"),
+            "the warning must name what was asked for, got: {warning}"
+        );
+        assert!(
+            warning.contains("above the global limit of 1024"),
+            "the warning must name the ceiling, got: {warning}"
+        );
+        assert!(
+            warning.contains("--allow-component-limit-overrides"),
+            "the warning must say how to grant it, got: {warning}"
+        );
+    }
+
+    /// Tightening is legitimate and must stay silent, or the warning becomes noise nobody reads.
+    #[tokio::test]
+    async fn a_component_lowering_a_limit_is_silent() {
+        let warnings = load(
+            indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1048576
+
+            [sources.in]
+            type = "test_basic"
+
+            [sources.in.limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["in"]
+            "#},
+            Format::Toml,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(warnings, Vec::<String>::new());
+    }
+
+    /// The global limit is below the built-in default here, so a component that says nothing would
+    /// look like it were asking for the default if "unset" were not tracked properly.
+    #[tokio::test]
+    async fn a_component_with_no_override_is_silent() {
+        let warnings = load(
+            indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sources.in]
+            type = "test_basic"
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["in"]
+            "#},
+            Format::Toml,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            warnings,
+            Vec::<String>::new(),
+            "a component that said nothing must not be reported as asking for the default"
+        );
+    }
+
+    /// Transforms and sinks carry the same field, and sinks in particular are rebuilt through
+    /// `map_inputs` on the way into the topology — a drop there would silently lose the override.
+    #[tokio::test]
+    async fn transforms_and_sinks_carry_the_override_too() {
+        let warnings = load(
+            indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sources.in]
+            type = "test_basic"
+
+            [transforms.mid]
+            type = "test_basic"
+            inputs = ["in"]
+            suffix = "foo"
+            increase = 1.25
+
+            [transforms.mid.limits.compression]
+            max_decompressed_size_bytes = 2048
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["mid"]
+
+            [sinks.out.limits.compression]
+            max_decompressed_size_bytes = 4096
+            "#},
+            Format::Toml,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(warnings.len(), 2, "got: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains(r#"Transform "mid""#)));
+        assert!(warnings.iter().any(|w| w.contains(r#"Sink "out""#)));
+    }
+
+    /// With the raise permitted, the warning must describe the run that will actually happen —
+    /// `validate --allow-component-limit-overrides` exists to predict exactly this.
+    #[tokio::test]
+    async fn a_permitted_raise_reports_that_it_was_granted() {
+        let toml = indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sources.in]
+            type = "test_basic"
+
+            [sources.in.limits.compression]
+            max_decompressed_size_bytes = 1048576
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["in"]
+            "#};
+
+        let mut builder: ConfigBuilder = format::deserialize(toml, Format::Toml).unwrap();
+        builder.allow_component_limit_overrides = true;
+        let (config, warnings) = builder.build_with_warnings().unwrap();
+
+        assert_eq!(warnings.len(), 1, "a granted raise is still reported");
+        assert!(
+            warnings[0].contains("permitted by --allow-component-limit-overrides"),
+            "got: {}",
+            warnings[0]
+        );
+        assert!(
+            !warnings[0].contains("clamped"),
+            "must not claim it was clamped, got: {}",
+            warnings[0]
+        );
+        assert!(config.allow_component_limit_overrides);
+    }
+
+    /// The same config without the flag says the opposite, so the two messages cannot be confused.
+    #[tokio::test]
+    async fn an_unpermitted_raise_reports_that_it_was_clamped() {
+        let toml = indoc! {r#"
+            [limits.compression]
+            max_decompressed_size_bytes = 1024
+
+            [sources.in]
+            type = "test_basic"
+
+            [sources.in.limits.compression]
+            max_decompressed_size_bytes = 1048576
+
+            [sinks.out]
+            type = "test_basic"
+            inputs = ["in"]
+            "#};
+
+        let builder: ConfigBuilder = format::deserialize(toml, Format::Toml).unwrap();
+        assert!(
+            !builder.allow_component_limit_overrides,
+            "the flag must default to off"
+        );
+        let (config, warnings) = builder.build_with_warnings().unwrap();
+
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("clamped to the global value"),
+            "got: {}",
+            warnings[0]
+        );
+        assert!(!config.allow_component_limit_overrides);
     }
 
     #[tokio::test]

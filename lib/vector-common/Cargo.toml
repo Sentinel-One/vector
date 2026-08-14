@@ -41,6 +41,7 @@ bytes = { version = "1.9.0", default-features = false }
 chrono.workspace = true
 crossbeam-utils = { version = "0.8.20", default-features = false }
 derivative = { version = "2.2.0", default-features = false }
+flate2.workspace = true
 futures.workspace = true
 indexmap.workspace = true
 metrics.workspace = true
@@ -60,6 +61,7 @@ snafu.workspace = true
 regex.workspace = true
 tokio-util.workspace = true
 serde_with.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 futures = { version = "0.3.31", default-features = false, features = ["async-await"] }

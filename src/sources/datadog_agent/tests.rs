@@ -14,6 +14,7 @@ use ordered_float::NotNan;
 use prost::Message;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use similar_asserts::assert_eq;
+use vector_common::decompression::CompressionLimits;
 use vector_lib::{
     codecs::{decoding::CharacterDelimitedDecoderOptions, CharacterDelimitedDecoderConfig},
     lookup::{owned_value_path, OwnedTargetPath},
@@ -103,6 +104,7 @@ fn test_decode_log_body() {
             Some(test_logs_schema_definition()),
             LogNamespace::Legacy,
             false,
+            CompressionLimits::default(),
         );
 
         let events = decode_log_body(body, api_key, &source).unwrap();
@@ -158,6 +160,7 @@ fn test_decode_log_body_parse_ddtags() {
         Some(test_logs_schema_definition()),
         LogNamespace::Legacy,
         true,
+        CompressionLimits::default(),
     );
 
     let events = decode_log_body(body, api_key, &source).unwrap();
@@ -194,6 +197,7 @@ fn test_decode_log_body_empty_object() {
         Some(test_logs_schema_definition()),
         LogNamespace::Legacy,
         false,
+        CompressionLimits::default(),
     );
 
     let events = decode_log_body(body, api_key, &source).unwrap();
@@ -2635,3 +2639,163 @@ async fn permit_origin_blocks_non_fatal_emits_bad_peer_metric() {
 }
 
 register_validatable_component!(DatadogAgentConfig);
+
+/// OBE-11237: every `Content-Encoding` branch inflated the request body with an unbounded
+/// `read_to_end`, so a small body on this unauthenticated listener could exhaust memory.
+mod decompression_caps {
+    use std::io::Write as _;
+
+    use similar_asserts::assert_eq;
+    use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+    use super::*;
+    use vector_common::decompression::CompressionLimits;
+    use crate::sources::datadog_agent::DatadogAgentSource;
+
+    fn test_source() -> DatadogAgentSource {
+        let decoder = crate::codecs::Decoder::new(
+            Framer::Bytes(BytesDecoder::new()),
+            Deserializer::Bytes(BytesDeserializer),
+        );
+        DatadogAgentSource::new(
+            true,
+            decoder,
+            "http",
+            None,
+            LogNamespace::Legacy,
+            false,
+            CompressionLimits::default(),
+        )
+    }
+
+    /// One cheap gzip member repeated past the cap. `MultiGzDecoder` walks every concatenated
+    /// member, so no single oversized member is required.
+    fn gzip_bomb() -> Bytes {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        let member = encoder.finish().unwrap();
+
+        let mut bomb = Vec::new();
+        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            bomb.extend_from_slice(&member);
+        }
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+            bomb.len()
+        );
+        Bytes::from(bomb)
+    }
+
+    fn zlib_bomb() -> Bytes {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![0u8; DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES + 1])
+            .unwrap();
+        Bytes::from(encoder.finish().unwrap())
+    }
+
+    #[test]
+    fn gzip_body_over_the_cap_is_rejected() {
+        let error = test_source()
+            .decode(&Some("gzip".to_owned()), gzip_bomb(), "/api/v2/logs")
+            .expect_err("a body inflating past the cap must be rejected");
+
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn deflate_body_over_the_cap_is_rejected() {
+        let error = test_source()
+            .decode(&Some("deflate".to_owned()), zlib_bomb(), "/api/v2/logs")
+            .expect_err("a body inflating past the cap must be rejected");
+
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Stacking encodings used to multiply the amplification. Capping each round bounds the chain,
+    /// because every round's output is the next round's input.
+    ///
+    /// The payload must be genuinely double-gzipped: handing a singly-gzipped body a `gzip,gzip`
+    /// header would fail the second round as malformed regardless of the cap, and pass for the
+    /// wrong reason. Here the outer round yields the (small) bomb and the inner round is what
+    /// exceeds the cap.
+    #[test]
+    fn stacked_encodings_are_capped_at_every_round() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&gzip_bomb()).unwrap();
+        let doubly_compressed = Bytes::from(encoder.finish().unwrap());
+
+        let error = test_source()
+            .decode(
+                &Some("gzip,gzip".to_owned()),
+                doubly_compressed,
+                "/api/v2/logs",
+            )
+            .expect_err("a stacked chain inflating past the cap must be rejected");
+
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Level 1 keeps each frame's declared window well under the RFC 9659 8 MiB ceiling that
+    /// `zstd_http` applies, so the window clamp stays out of the way and the size cap is what
+    /// rejects the payload. Concatenated frames are what push the aggregate past the cap.
+    #[test]
+    fn zstd_body_over_the_cap_is_rejected() {
+        let frame = zstd::encode_all(vec![0u8; 1024 * 1024].as_slice(), 1).unwrap();
+        let mut bomb = Vec::new();
+        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            bomb.extend_from_slice(&frame);
+        }
+
+        let error = test_source()
+            .decode(&Some("zstd".to_owned()), Bytes::from(bomb), "/api/v2/logs")
+            .expect_err("a body inflating past the cap must be rejected");
+
+        assert_eq!(error.status_code(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A realistic agent frame must still decode: the 8 MiB window clamp must not reject ordinary
+    /// zstd traffic.
+    #[test]
+    fn zstd_body_under_the_cap_is_unaffected() {
+        let payload = b"{\"message\":\"hello\"}";
+        let compressed = Bytes::from(zstd::encode_all(&payload[..], 3).unwrap());
+
+        let decoded = test_source()
+            .decode(&Some("zstd".to_owned()), compressed, "/api/v2/logs")
+            .expect("a body within the cap must decode");
+
+        assert_eq!(decoded, Bytes::from_static(payload));
+    }
+
+    /// Malformed input must stay a 422, distinct from the 413 the cap raises — otherwise the
+    /// size tests above could be passing for the wrong reason.
+    #[test]
+    fn malformed_payload_is_422_not_413() {
+        let error = test_source()
+            .decode(
+                &Some("gzip".to_owned()),
+                Bytes::from_static(b"not gzip at all"),
+                "/api/v2/logs",
+            )
+            .expect_err("malformed input must be rejected");
+
+        assert_eq!(error.status_code(), http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The cap must not disturb ordinary traffic.
+    #[test]
+    fn body_under_the_cap_is_unaffected() {
+        let payload = b"{\"message\":\"hello\"}";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = Bytes::from(encoder.finish().unwrap());
+
+        let decoded = test_source()
+            .decode(&Some("gzip".to_owned()), compressed, "/api/v2/logs")
+            .expect("a body within the cap must decode");
+
+        assert_eq!(decoded, Bytes::from_static(payload));
+    }
+}

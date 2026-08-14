@@ -24,8 +24,8 @@ use crate::{
     serde::bool_or_struct,
     sources::{
         util::{
-            add_auth_metadata, grpc::run_grpc_server, Auth, AuthConfig, AuthContext, AuthError,
-            AuthEventError, EventValidator,
+            add_auth_metadata, decompression::CompressionLimits, grpc::run_grpc_server,
+            Auth, AuthConfig, AuthContext, AuthError, AuthEventError, EventValidator,
         },
         Source,
     },
@@ -348,6 +348,8 @@ impl GenerateConfig for VectorConfig {
 #[typetag::serde(name = "vector")]
 impl SourceConfig for VectorConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
+        // From this component's context, so the deployment controls the cap.
+        let compression_limits: CompressionLimits = cx.globals.limits.compression;
         let tls_settings = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let log_namespace = cx.log_namespace(self.log_namespace);
@@ -366,11 +368,20 @@ impl SourceConfig for VectorConfig {
             auth_metrics,
         })
         .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        // Tonic added a default of 4MB in 0.9. This replaces the old behavior.
-        .max_decoding_message_size(usize::MAX);
+        // Tonic added a default of 4MB in 0.9. Bound this by the global decompressed-size cap
+        // rather than `usize::MAX` so a single oversized message cannot drive unbounded
+        // allocation on this unauthenticated listener.
+        .max_decoding_message_size(compression_limits.max_decompressed_size_bytes);
 
         let source =
-            run_grpc_server(self.address, tls_settings, service, cx.shutdown).map_err(|error| {
+            run_grpc_server(
+                self.address,
+                tls_settings,
+                service,
+                cx.shutdown,
+                compression_limits,
+            )
+            .map_err(|error| {
                 error!(message = "Source future failed.", %error);
             });
 

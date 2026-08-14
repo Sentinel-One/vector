@@ -19,11 +19,10 @@ pub(crate) mod ddtrace_proto {
 
 use std::convert::Infallible;
 use std::time::Duration;
-use std::{fmt::Debug, io::Read, net::SocketAddr, sync::Arc};
+use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 
 use bytes::{Buf, Bytes};
 use chrono::{serde::ts_milliseconds, DateTime, Utc};
-use flate2::read::{MultiGzDecoder, ZlibDecoder};
 use futures::{FutureExt, StreamExt};
 use http::StatusCode;
 use hyper::service::make_service_fn;
@@ -34,6 +33,9 @@ use snafu::Snafu;
 use tokio::net::TcpStream;
 use tower::ServiceBuilder;
 use tracing::Span;
+use crate::sources::util::decompression::{
+    CappedDecoder, CompressionLimits, DecompressedSizeLimitExceeded,
+};
 use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
 use vector_lib::config::{LegacyKey, LogNamespace};
 use vector_lib::configurable::configurable_component;
@@ -194,6 +196,7 @@ impl SourceConfig for DatadogAgentConfig {
             logs_schema_definition,
             log_namespace,
             self.parse_ddtags,
+            cx.globals.limits.compression,
         );
         let listener = tls.bind(&self.address).await?;
         let listener = listener
@@ -345,6 +348,8 @@ pub struct ApiKeyQueryParams {
 
 #[derive(Clone)]
 pub(crate) struct DatadogAgentSource {
+    /// Limits to decompress under, from this component's context.
+    pub(crate) compression_limits: CompressionLimits,
     pub(crate) api_key_extractor: ApiKeyExtractor,
     pub(crate) log_schema_host_key: OwnedTargetPath,
     pub(crate) log_schema_source_type_key: OwnedTargetPath,
@@ -391,8 +396,10 @@ impl DatadogAgentSource {
         logs_schema_definition: Option<schema::Definition>,
         log_namespace: LogNamespace,
         parse_ddtags: bool,
+        compression_limits: CompressionLimits,
     ) -> Self {
         Self {
+            compression_limits,
             api_key_extractor: ApiKeyExtractor {
                 store_api_key,
                 matcher: Regex::new(r"^/v1/input/(?P<api_key>[[:alnum:]]{32})/??")
@@ -467,26 +474,22 @@ impl DatadogAgentSource {
             for encoding in encodings.rsplit(',').map(str::trim) {
                 body = match encoding {
                     "identity" => body,
-                    "gzip" | "x-gzip" => {
-                        let mut decoded = Vec::new();
-                        MultiGzDecoder::new(body.reader())
-                            .read_to_end(&mut decoded)
-                            .map_err(|error| handle_decode_error(encoding, error))?;
-                        decoded.into()
-                    }
-                    "zstd" => {
-                        let mut decoded = Vec::new();
-                        zstd::stream::copy_decode(body.reader(), &mut decoded)
-                            .map_err(|error| handle_decode_error(encoding, error))?;
-                        decoded.into()
-                    }
-                    "deflate" | "x-deflate" => {
-                        let mut decoded = Vec::new();
-                        ZlibDecoder::new(body.reader())
-                            .read_to_end(&mut decoded)
-                            .map_err(|error| handle_decode_error(encoding, error))?;
-                        decoded.into()
-                    }
+                    // Cap each decompressed payload so a compression bomb cannot drive unbounded
+                    // allocation on this unauthenticated HTTP listener. Capping every round also
+                    // bounds a stacked `Content-Encoding: gzip,gzip,...` chain, since each round's
+                    // output is the next round's input.
+                    "gzip" | "x-gzip" => CappedDecoder::gzip(body.reader(), &self.compression_limits)
+                        .decompress()
+                        .map_err(|error| handle_decode_error(encoding, error, &self.compression_limits))?
+                        .into(),
+                    "zstd" => CappedDecoder::zstd_http(body.reader(), &self.compression_limits)
+                        .and_then(CappedDecoder::decompress)
+                        .map_err(|error| handle_decode_error(encoding, error, &self.compression_limits))?
+                        .into(),
+                    "deflate" | "x-deflate" => CappedDecoder::zlib(body.reader(), &self.compression_limits)
+                        .decompress()
+                        .map_err(|error| handle_decode_error(encoding, error, &self.compression_limits))?
+                        .into(),
                     encoding => {
                         return Err(ErrorMessage::new(
                             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -544,7 +547,23 @@ pub(crate) async fn handle_request(
     }
 }
 
-fn handle_decode_error(encoding: &str, error: impl std::error::Error) -> ErrorMessage {
+fn handle_decode_error(
+    encoding: &str,
+    error: std::io::Error,
+    limits: &CompressionLimits,
+) -> ErrorMessage {
+    // A size-cap trip is an oversized-request client fault, so report it as 413 with the limit
+    // that was enforced, matching the shared HTTP decoder. Anything else is malformed input (422).
+    if DecompressedSizeLimitExceeded::is(&error) {
+        return ErrorMessage::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Decompressed {} body exceeds limit of {} bytes.",
+                encoding,
+                limits.max_decompressed_size_bytes
+            ),
+        );
+    }
     emit!(HttpDecompressError {
         encoding,
         error: &error

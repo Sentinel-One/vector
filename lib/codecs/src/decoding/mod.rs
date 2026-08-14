@@ -32,6 +32,7 @@ pub use framing::{
 };
 use smallvec::SmallVec;
 use std::fmt::Debug;
+use vector_common::decompression::CompressionLimits;
 use vector_config::configurable_component;
 use vector_core::{
     config::{DataType, LogNamespace},
@@ -175,7 +176,10 @@ impl From<StrataSnappyDecoderConfig> for FramingConfig {
 
 impl FramingConfig {
     /// Build the `Framer` from this configuration.
-    pub fn build(&self) -> Framer {
+    ///
+    /// `compression_limits` is only consumed by framers that decompress (currently
+    /// `chunked_gelf`); it is threaded through here so no framer has to reach for process state.
+    pub fn build(&self, compression_limits: CompressionLimits) -> Framer {
         match self {
             FramingConfig::Bytes => Framer::Bytes(BytesDecoderConfig.build()),
             FramingConfig::CharacterDelimited(config) => Framer::CharacterDelimited(config.build()),
@@ -188,7 +192,9 @@ impl FramingConfig {
             ),
             FramingConfig::NewlineDelimited(config) => Framer::NewlineDelimited(config.build()),
             FramingConfig::OctetCounting(config) => Framer::OctetCounting(config.build()),
-            FramingConfig::ChunkedGelf(config) => Framer::ChunkedGelf(config.build()),
+            FramingConfig::ChunkedGelf(config) => {
+                Framer::ChunkedGelf(config.build(compression_limits))
+            }
             FramingConfig::StrataSnappy(config) => Framer::StrataSnappy(config.build()),
         }
     }

@@ -44,7 +44,10 @@ use crate::{
     },
     http::KeepaliveConfig,
     serde::bool_or_struct,
-    sources::{util::grpc::run_grpc_server_with_routes, Source},
+    sources::{
+        util::{decompression::CompressionLimits, grpc::run_grpc_server_with_routes},
+        Source,
+    },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
 
@@ -163,6 +166,9 @@ impl GenerateConfig for OpentelemetryConfig {
 #[typetag::serde(name = "opentelemetry")]
 impl SourceConfig for OpentelemetryConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
+        // Taken from this component's context rather than process state, so the deployment
+        // controls the cap. `CompressionLimits` is `Copy`, so it can be captured freely below.
+        let compression_limits: CompressionLimits = cx.globals.limits.compression;
 
         let grpc_config_exists = self.grpc.is_some();
         let http_config_exists = self.http.is_some();
@@ -182,7 +188,7 @@ impl SourceConfig for OpentelemetryConfig {
             events_received: events_received.clone(),
         })
         .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(usize::MAX);
+        .max_decoding_message_size(compression_limits.max_decompressed_size_bytes);
 
         let trace_service = TraceServiceServer::new(Service {
             pipeline: cx.out.clone(),
@@ -191,7 +197,7 @@ impl SourceConfig for OpentelemetryConfig {
             events_received: events_received.clone(),
         })
         .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(usize::MAX);
+        .max_decoding_message_size(compression_limits.max_decompressed_size_bytes);
 
         let metrics_service = MetricsServiceServer::new(Service {
             pipeline: cx.out.clone(),
@@ -200,7 +206,7 @@ impl SourceConfig for OpentelemetryConfig {
             events_received: events_received.clone(),
         })
         .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(usize::MAX);
+        .max_decoding_message_size(compression_limits.max_decompressed_size_bytes);
 
         let mut builder = RoutesBuilder::default();
         builder
@@ -217,6 +223,7 @@ impl SourceConfig for OpentelemetryConfig {
                 builder.routes(),
                 cx.shutdown.clone(),
                 self.permit_origin.clone(),
+                compression_limits,
             )
             .map_err(|error| {
                 error!(message = "Source future failed.", %error);
@@ -238,6 +245,7 @@ impl SourceConfig for OpentelemetryConfig {
                 bytes_received,
                 events_received,
                 headers,
+                compression_limits,
             );
             Some(run_http_server(
                 http_config.address,
