@@ -94,7 +94,10 @@ impl Parser {
                 {
                     parts[0].parse()?
                 } else {
-                    parts[0][1..].parse()?
+                    parts[0]
+                        .get(1..)
+                        .ok_or(ParseError::Malformed("invalid gauge prefix"))?
+                        .parse()?
                 };
 
                 match parse_direction(parts[0])? {
@@ -421,6 +424,16 @@ mod test {
                 MetricValue::Gauge { value: 10.0 },
             )),
         );
+    }
+
+    #[test]
+    fn gauge_with_multibyte_prefix_does_not_panic() {
+        // OBE-10714: a gauge value whose first character is a multi-byte UTF-8 codepoint (here
+        // `±`, U+00B1, 2 bytes) must not panic on a non-char-boundary byte slice.
+        assert!(matches!(
+            unsanitized_parse("x:\u{00B1}1|g"),
+            Err(ParseError::Malformed(_))
+        ));
     }
 
     #[test]
