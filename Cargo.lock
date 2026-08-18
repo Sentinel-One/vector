@@ -10550,6 +10550,7 @@ dependencies = [
  "futures-util",
  "http 0.2.9",
  "hyper 0.14.28",
+ "hyper 1.4.1",
  "inventory",
  "ipnet",
  "itertools 0.14.0",

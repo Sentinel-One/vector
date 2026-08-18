@@ -62,6 +62,10 @@ object_store = { workspace = true, features = ["aws", "azure"] }
 # Version-aligned with object_store's own reqwest so `object_store::Error::Generic`
 # sources downcast to `reqwest::Error` for retry classification (see objstore::is_retriable).
 reqwest = { version = "0.12", default-features = false }
+# object_store's reqwest 0.12 stack runs on hyper 1.x, but the workspace `hyper` is 0.14 (Vector
+# core). Pull hyper 1 under an alias so retry classification can downcast `object_store::Error`
+# sources to the *matching* `hyper::Error` type (see objstore::is_retriable).
+hyper1 = { package = "hyper", version = "1", default-features = false }
 
 # Optional dependencies for testing (below)
 testcontainers = { version = "0.19", optional = true }
