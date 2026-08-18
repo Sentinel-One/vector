@@ -24,6 +24,8 @@ pub mod config;
 
 pub mod constants;
 
+pub mod decompression;
+
 #[cfg(feature = "conversion")]
 pub use vrl::compiler::TimeZone;
 

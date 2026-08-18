@@ -2,6 +2,7 @@ use bytes::Bytes;
 use vector_lib::configurable::configurable_component;
 
 use super::{Compression, Decompressor};
+use vector_common::decompression::CompressionLimits;
 
 /// Controls how much detail is logged when a sink's HTTP request is rejected.
 #[configurable_component]
@@ -61,6 +62,7 @@ pub fn emit_rejection_error<C: RejectionContext>(
     response_body: &Bytes,
     request: Option<(Bytes, Compression)>,
     mode: RejectionReport,
+    limits: CompressionLimits,
 ) {
     context.record_rejection(status, response_body);
     let error_code = context.error_code(status);
@@ -69,7 +71,7 @@ pub fn emit_rejection_error<C: RejectionContext>(
 
     match (mode, request) {
         (RejectionReport::RequestResponse, Some((body, comp))) => {
-            let decomp = Decompressor::from(comp);
+            let decomp = Decompressor::from((comp, limits));
             let req_data = match decomp.decompress(body) {
                 Ok(data) => data,
                 Err(err) => format!("- decompression failed({comp}): '{err}' -").into(),
@@ -167,21 +169,21 @@ mod tests {
         let body = Bytes::from("error body");
 
         let (ctx, count) = make_ctx();
-        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Stats);
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Stats, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         let (ctx, count) = make_ctx();
-        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Response);
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::Response, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         let (ctx, count) = make_ctx();
         // RequestResponse without a request body falls back to response-only logging.
-        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::RequestResponse);
+        emit_rejection_error(&ctx, 400, &body, None, RejectionReport::RequestResponse, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         let (ctx, count) = make_ctx();
         let req = Bytes::from("request body");
-        emit_rejection_error(&ctx, 400, &body, Some((req, Compression::None)), RejectionReport::RequestResponse);
+        emit_rejection_error(&ctx, 400, &body, Some((req, Compression::None)), RejectionReport::RequestResponse, CompressionLimits::default());
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
@@ -196,6 +198,7 @@ mod tests {
             &response_body,
             Some((request_body, Compression::None)),
             RejectionReport::RequestResponse,
+            CompressionLimits::default(),
         );
     }
 

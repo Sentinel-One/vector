@@ -595,6 +595,11 @@ impl StreamSink<Event> for PrometheusExporter {
 
 #[cfg(test)]
 mod tests {
+    // Tests decode payloads this process just encoded, so there is no untrusted input and nothing
+    // to cap. They deliberately keep using the raw decoders: leaving them untouched means they
+    // stay an independent regression check on the capped wrappers.
+    #![allow(clippy::disallowed_types)]
+
     use chrono::{Duration, Utc};
     use flate2::read::GzDecoder;
     use futures::stream;

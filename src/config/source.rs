@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use vector_common::decompression::OperationalLimitsOverride;
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -55,6 +56,14 @@ pub struct SourceOuter {
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub proxy: ProxyConfig,
 
+    /// Overrides the global operational limits for this component.
+    ///
+    /// A limit looser than the global one is clamped back to the global value unless Vector runs
+    /// with `--allow-component-limit-overrides`; a stricter one always applies.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub limits: OperationalLimitsOverride,
+
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub graph: GraphConfig,
@@ -71,6 +80,7 @@ impl SourceOuter {
     pub(crate) fn new<I: Into<BoxedSource>>(inner: I) -> Self {
         Self {
             proxy: Default::default(),
+            limits: Default::default(),
             graph: Default::default(),
             sink_acknowledgements: false,
             inner: inner.into(),

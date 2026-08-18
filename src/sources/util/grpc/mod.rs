@@ -19,6 +19,7 @@ use tower_http::{
 use tracing::Span;
 
 mod decompression;
+use crate::sources::util::decompression::CompressionLimits;
 pub use self::decompression::{DecompressionAndMetrics, DecompressionAndMetricsLayer};
 
 pub async fn run_grpc_server<S>(
@@ -26,6 +27,7 @@ pub async fn run_grpc_server<S>(
     tls_settings: MaybeTlsSettings,
     service: S,
     shutdown: ShutdownSignal,
+    compression_limits: CompressionLimits,
 ) -> crate::Result<()>
 where
     S: Service<Request<Body>, Response = Response<BoxBody>, Error = Infallible>
@@ -53,7 +55,7 @@ where
         // use independent `tower` layers when the request body itself (the body type, not the actual bytes) must be
         // modified or wrapped.. so instead of a cleaner design, we're opting here to bake it all together until the
         // crates are sufficiently flexible for us to craft a better design.
-        .layer(DecompressionAndMetricsLayer)
+        .layer(DecompressionAndMetricsLayer::new(compression_limits))
         .add_service(service)
         .serve_with_incoming_shutdown(stream, shutdown.map(|token| tx.send(token).unwrap()))
         .await?;
@@ -71,6 +73,7 @@ pub async fn run_grpc_server_with_routes(
     routes: Routes,
     shutdown: ShutdownSignal,
     permit_origin: Option<IpAllowlistConfig>,
+    compression_limits: CompressionLimits,
 ) -> crate::Result<()> {
     let span = Span::current();
     let (tx, rx) = tokio::sync::oneshot::channel::<ShutdownSignalToken>();
@@ -83,7 +86,7 @@ pub async fn run_grpc_server_with_routes(
 
     Server::builder()
         .layer(build_grpc_trace_layer(span.clone()))
-        .layer(DecompressionAndMetricsLayer)
+        .layer(DecompressionAndMetricsLayer::new(compression_limits))
         .add_routes(routes)
         .serve_with_incoming_shutdown(stream, shutdown.map(|token| tx.send(token).unwrap()))
         .await?;

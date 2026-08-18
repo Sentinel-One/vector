@@ -4,7 +4,7 @@ use std::{io, io::Read, io::BufWriter};
 
 use bytes::{BufMut, BytesMut, Bytes, Buf};
 use flate2::write::{GzEncoder, ZlibEncoder};
-use flate2::read::{GzDecoder, ZlibDecoder};
+use vector_common::decompression::{CappedDecoder, CompressionLimits};
 use crate::sink::compression::Compression;
 use super::{
     snappy::SnappyEncoder, snappy::SnappyDecoder,
@@ -196,36 +196,30 @@ impl From<Compression> for Compressor {
 
 pub enum Decompressor {
     Plain,
-    Gzip,
-    Zlib,
-    Zstd,
-    Snappy,
+    Gzip(CompressionLimits),
+    Zlib(CompressionLimits),
+    Zstd(CompressionLimits),
+    Snappy(CompressionLimits),
 }
 
 impl Decompressor {
     pub fn decompress(&self, bytes: Bytes) -> io::Result<Bytes> {
         match self {
             Decompressor::Plain => Ok(bytes),
-            Decompressor::Gzip => {
-                let mut decoder = GzDecoder::new(io::Cursor::new(bytes));
+            Decompressor::Gzip(limits) => Ok(CappedDecoder::gzip(io::Cursor::new(bytes), limits)
+                .decompress()?
+                .into()),
+            Decompressor::Zlib(limits) => Ok(CappedDecoder::zlib(bytes.reader(), limits)
+                .decompress()?
+                .into()),
+            Decompressor::Zstd(limits) => {
+                let mut decoder = ZstdDecoder::new(bytes.reader(), limits)?;
                 let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
                 Read::read_to_end(&mut decoder, &mut buff)?;
                 Ok(buff.into())
             },
-            Decompressor::Zlib => {
-                let mut decoder = ZlibDecoder::new(bytes.reader());
-                let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
-                Read::read_to_end(&mut decoder, &mut buff)?;
-                Ok(buff.into())
-            },
-            Decompressor::Zstd => {
-                let mut decoder = ZstdDecoder::new(bytes.reader())?;
-                let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
-                Read::read_to_end(&mut decoder, &mut buff)?;
-                Ok(buff.into())
-            },
-            Decompressor::Snappy => {
-                let mut decoder = SnappyDecoder::new(bytes.reader());
+            Decompressor::Snappy(limits) => {
+                let mut decoder = SnappyDecoder::new(bytes.reader(), *limits);
                 let mut buff: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
                 Read::read_to_end(&mut decoder, &mut buff)?;
                 Ok(buff.into())
@@ -234,20 +228,25 @@ impl Decompressor {
     }
 }
 
-impl From<Compression> for Decompressor {
-    fn from(compression: Compression) -> Self {
+/// Built from the compression scheme plus the limits to decode under.
+///
+/// `CompressionLimits` is `Copy`, so this needs neither a lifetime nor an `Arc`: callers hand over
+/// a copy of the one in `GlobalOptions`.
+impl From<(Compression, CompressionLimits)> for Decompressor {
+    fn from((compression, limits): (Compression, CompressionLimits)) -> Self {
         match compression {
             Compression::None => Decompressor::Plain,
-            Compression::Gzip(_) => Decompressor::Gzip,
-            Compression::Zlib(_) => Decompressor::Zlib,
-            Compression::Zstd(_) => Decompressor::Zstd,
-            Compression::Snappy => Decompressor::Snappy,
+            Compression::Gzip(_) => Decompressor::Gzip(limits),
+            Compression::Zlib(_) => Decompressor::Zlib(limits),
+            Compression::Zstd(_) => Decompressor::Zstd(limits),
+            Compression::Snappy => Decompressor::Snappy(limits),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use vector_common::decompression::CompressionLimits;
     use std::io::Write;
 
     use crate::sink::compression::CompressionLevel;
@@ -274,7 +273,7 @@ mod tests {
             assert!(compressed_data.len() < data.len());
             assert_ne!(data, &compressed_data[..]);
         }
-        let decompressor = Decompressor::from(c);
+        let decompressor = Decompressor::from((c, CompressionLimits::default()));
         let decompressed_data = decompressor.decompress(compressed_data).unwrap();
         assert_eq!(data, &decompressed_data[..]);
     }

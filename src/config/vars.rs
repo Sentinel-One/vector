@@ -20,6 +20,18 @@ pub static ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX: LazyLock<Regex> = LazyLock:
 });
 
 /// Result<interpolated config, errors>
+///
+/// Note this splices variable values into the raw config text before it is parsed, so a value
+/// containing a quote and a newline can terminate its scalar and become configuration structure.
+/// That is the same shape as the secret-interpolation issue fixed in
+/// `config::loading::secret::interpolate`, and it is deliberately *not* guarded here: environment
+/// variables are set by whoever deploys Vector, who already authors the config, so no trust
+/// boundary is crossed. Values are also legitimately used to inject config fragments rather than
+/// single scalars, which the checks applied to secrets would break.
+///
+/// If a variable source is ever introduced that is not controlled by the config author, this
+/// function needs the same treatment `secret::interpolate` received - do not assume the pattern is
+/// safe because it appears here.
 pub fn interpolate(input: &str, vars: &HashMap<String, String>) -> Result<String, Vec<String>> {
     let mut errors = Vec::new();
 

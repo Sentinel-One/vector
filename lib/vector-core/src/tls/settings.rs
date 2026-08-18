@@ -1,3 +1,4 @@
+use cfg_if::cfg_if;
 use std::{
     fmt,
     fs::File,
@@ -310,11 +311,21 @@ impl TlsSettings {
         if self.authorities.is_empty() {
             debug!("Fetching system root certs.");
 
-            #[cfg(windows)]
-            load_windows_certs(context).unwrap();
-
-            #[cfg(target_os = "macos")]
-            load_mac_certs(context).unwrap();
+            cfg_if! {
+                if #[cfg(windows)] {
+                    load_windows_certs(context).unwrap();
+                } else if #[cfg(target_os = "macos")] {
+                    cfg_if! { // Panic in release builds, warn in debug builds.
+                        if #[cfg(debug_assertions)] {
+                            if let Err(error) = load_mac_certs(context) {
+                                warn!(message = "Failed to load macOS root certs.", %error);
+                            }
+                        } else {
+                            load_mac_certs(context).unwrap();
+                        }
+                    }
+                }
+            }
         } else {
             let mut store = X509StoreBuilder::new().context(NewStoreBuilderSnafu)?;
             for authority in &self.authorities {

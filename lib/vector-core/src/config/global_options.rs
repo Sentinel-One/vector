@@ -1,6 +1,7 @@
 use std::{fs::DirBuilder, path::PathBuf, time::Duration};
 
 use snafu::{ResultExt, Snafu};
+use vector_common::decompression::OperationalLimits;
 use vector_common::TimeZone;
 use crate::chkpts::StoreConfig as CheckpointConfig;
 use vector_config::configurable_component;
@@ -75,6 +76,11 @@ pub struct GlobalOptions {
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub proxy: ProxyConfig,
+
+    /// Operational limits applied across components.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    pub limits: OperationalLimits,
 
     /// Controls how acknowledgements are handled for all sinks by default.
     ///
@@ -241,6 +247,13 @@ impl GlobalOptions {
                 acknowledgements: self.acknowledgements.merge_default(&with.acknowledgements),
                 timezone: self.timezone.or(with.timezone),
                 proxy: self.proxy.merge(&with.proxy),
+                // Whichever file set a non-default wins; if both did, this file's value is kept.
+                // Same precedence as the `Option` fields above, which use `or`.
+                limits: if self.limits == OperationalLimits::default() {
+                    with.limits
+                } else {
+                    self.limits
+                },
                 expire_metrics: self.expire_metrics.or(with.expire_metrics),
                 expire_metrics_secs: self.expire_metrics_secs.or(with.expire_metrics_secs),
                 checkpoint,

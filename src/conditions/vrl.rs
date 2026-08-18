@@ -6,7 +6,6 @@ use vrl::diagnostic::Formatter;
 use vrl::value::Value;
 
 use crate::config::LogNamespace;
-use crate::event::TargetEvents;
 use crate::{
     conditions::{Condition, Conditional, ConditionalConfig},
     event::{Event, VrlTarget},
@@ -103,10 +102,10 @@ impl Vrl {
         let timezone = TimeZone::default();
 
         let result = Runtime::default().resolve(&mut target, &self.program, &timezone);
-        let original_event = match target.into_events(log_namespace) {
-            TargetEvents::One(event) => event,
-            _ => panic!("Event was modified in a condition. This is an internal compiler error."),
-        };
+        // Deliberately not `into_events`: that infers fan-out from the root value type, so an
+        // array-rooted event - which can arrive over the native protobuf codec, and may even be
+        // empty - would yield `Logs` and panic here on input shape alone.
+        let original_event = target.into_event(log_namespace);
         (original_event, result)
     }
 }
@@ -271,6 +270,64 @@ mod test {
                     check.map_err(|e| e.to_string())
                 );
             }
+        }
+    }
+
+    // OBE-11558: an array-rooted log event made `into_events` report a fan-out, which this
+    // condition treated as an internal compiler error and panicked on. A transform panic becomes
+    // a fatal ShutdownError that exits the whole daemon, so input shape alone could kill Vector.
+    // An event can arrive array-rooted over the native protobuf codec, and an *empty* array is
+    // enough to trigger it.
+    mod array_rooted_events {
+        use super::*;
+        use vector_lib::event::{EventMetadata, LogEvent};
+        use vrl::value::Value;
+
+        fn array_rooted_event(values: Vec<Value>) -> Event {
+            Event::from(LogEvent::from_parts(
+                Value::Array(values),
+                EventMetadata::default(),
+            ))
+        }
+
+        fn condition() -> Condition {
+            VrlConfig {
+                source: "true".to_owned(),
+                runtime: Default::default(),
+            }
+            .build(&Default::default())
+            .expect("condition should build")
+        }
+
+        #[test]
+        fn array_rooted_event_does_not_panic() {
+            let (result, event) = condition().check(array_rooted_event(vec![1.into(), 2.into()]));
+
+            assert!(result);
+            assert_eq!(
+                event.as_log().value(),
+                &Value::Array(vec![1.into(), 2.into()]),
+                "a read-only condition must return the event unchanged"
+            );
+        }
+
+        #[test]
+        fn empty_array_rooted_event_does_not_panic() {
+            let (result, event) = condition().check(array_rooted_event(vec![]));
+
+            assert!(result);
+            assert_eq!(event.as_log().value(), &Value::Array(vec![]));
+        }
+
+        #[test]
+        fn object_rooted_event_is_unaffected() {
+            let (result, event) = condition().check(log_event!["foo" => "bar"]);
+
+            assert!(result);
+            assert_eq!(
+                event.as_log().get("foo").map(|v| v.to_string_lossy()),
+                Some("bar".into())
+            );
         }
     }
 }
