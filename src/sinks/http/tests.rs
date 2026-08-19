@@ -1,5 +1,11 @@
 //! Unit tests for the `http` sink.
 
+// Tests decode payloads this process just encoded, so there is no untrusted input and nothing to
+// cap. They deliberately keep using the raw decoders: leaving them untouched means they stay an
+// independent regression check on the capped wrappers, rather than testing those wrappers against
+// themselves.
+#![allow(clippy::disallowed_types)]
+
 use std::sync::{atomic, Arc};
 
 use bytes::{Buf, Bytes};

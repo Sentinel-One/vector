@@ -2,11 +2,9 @@ use super::{BoxedFramingError, FramingError};
 use crate::{BytesDecoder, StreamDecodingError};
 use bytes::{Buf, Bytes, BytesMut};
 use derivative::Derivative;
-use flate2::read::{MultiGzDecoder, ZlibDecoder};
 use snafu::{ensure, ResultExt, Snafu};
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio;
@@ -14,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use vector_common::constants::{GZIP_MAGIC, ZLIB_MAGIC};
+use vector_common::decompression::{CappedDecoder, CompressionLimits};
 use vector_config::configurable_component;
 
 const GELF_MAGIC: &[u8] = &[0x1e, 0x0f];
@@ -35,12 +34,13 @@ pub struct ChunkedGelfDecoderConfig {
 
 impl ChunkedGelfDecoderConfig {
     /// Build the `ChunkedGelfDecoder` from this configuration.
-    pub fn build(&self) -> ChunkedGelfDecoder {
+    pub fn build(&self, compression_limits: CompressionLimits) -> ChunkedGelfDecoder {
         ChunkedGelfDecoder::new(
             self.chunked_gelf.timeout_secs,
             self.chunked_gelf.pending_messages_limit,
             self.chunked_gelf.max_length,
             self.chunked_gelf.decompression,
+            compression_limits,
         )
     }
 }
@@ -208,24 +208,20 @@ impl ChunkedGelfDecompression {
         Self::None
     }
 
-    pub fn decompress(&self, data: Bytes) -> Result<Bytes, ChunkedGelfDecompressionError> {
+    pub fn decompress(
+        &self,
+        data: Bytes,
+        limits: &CompressionLimits,
+    ) -> Result<Bytes, ChunkedGelfDecompressionError> {
         let decompressed = match self {
-            Self::Gzip => {
-                let mut decoder = MultiGzDecoder::new(data.reader());
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .context(GzipDecompressionSnafu)?;
-                Bytes::from(decompressed)
-            }
-            Self::Zlib => {
-                let mut decoder = ZlibDecoder::new(data.reader());
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .context(ZlibDecompressionSnafu)?;
-                Bytes::from(decompressed)
-            }
+            Self::Gzip => CappedDecoder::gzip(data.reader(), limits)
+                .decompress()
+                .map(Bytes::from)
+                .context(GzipDecompressionSnafu)?,
+            Self::Zlib => CappedDecoder::zlib(data.reader(), limits)
+                .decompress()
+                .map(Bytes::from)
+                .context(ZlibDecompressionSnafu)?,
             Self::None => data,
         };
         Ok(decompressed)
@@ -298,6 +294,8 @@ impl FramingError for ChunkedGelfDecoderError {
 /// and [Graylog's go-gelf library](https://github.com/Graylog2/go-gelf/blob/v1/gelf/reader.go).
 #[derive(Debug, Clone)]
 pub struct ChunkedGelfDecoder {
+    /// Limits to decompress a reassembled message under.
+    compression_limits: CompressionLimits,
     // We have to use this decoder to read all the bytes from the buffer first and don't let tokio
     // read it buffered, as tokio FramedRead will not always call the decode method with the
     // whole message. (see https://docs.rs/tokio-util/latest/src/tokio_util/codec/framed_impl.rs.html#26).
@@ -318,10 +316,12 @@ impl ChunkedGelfDecoder {
         pending_messages_limit: Option<usize>,
         max_length: Option<usize>,
         decompression_config: ChunkedGelfDecompressionConfig,
+        compression_limits: CompressionLimits,
     ) -> Self {
         Self {
             bytes_decoder: BytesDecoder::new(),
             decompression_config,
+            compression_limits,
             state: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs_f64(timeout_secs),
             pending_messages_limit,
@@ -475,7 +475,7 @@ impl ChunkedGelfDecoder {
             .map(|message| {
                 self.decompression_config
                     .get_decompression(&message)
-                    .decompress(message)
+                    .decompress(message, &self.compression_limits)
                     .context(DecompressionSnafu)
             })
             .transpose()
@@ -489,6 +489,7 @@ impl Default for ChunkedGelfDecoder {
             None,
             None,
             ChunkedGelfDecompressionConfig::Auto,
+            CompressionLimits::default(),
         )
     }
 }
@@ -1277,5 +1278,86 @@ mod tests {
         let detected_compression = ChunkedGelfDecompression::from_magic(&payload.into());
 
         assert_eq!(detected_compression, ChunkedGelfDecompression::None);
+    }
+
+    /// OBE-10706: a GELF payload used to be inflated with an unbounded `read_to_end`, so a small
+    /// datagram could drive an arbitrarily large allocation.
+    ///
+    /// `MultiGzDecoder` walks every concatenated member, so one cheap member repeated past the cap
+    /// is enough to exceed it — no single oversized member required.
+    #[test]
+    fn gzip_decompression_is_capped() {
+        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+        let member = Compression::Gzip.compress(&vec![0u8; 1024 * 1024]);
+        let members = DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1;
+        let mut bomb = BytesMut::new();
+        for _ in 0..members {
+            bomb.put_slice(&member);
+        }
+        let bomb = bomb.freeze();
+
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+            bomb.len()
+        );
+
+        let error = ChunkedGelfDecompression::Gzip
+            .decompress(bomb, &CompressionLimits::default())
+            .expect_err("a payload inflating past the cap must be rejected");
+
+        assert!(matches!(
+            error,
+            ChunkedGelfDecompressionError::GzipDecompression { .. }
+        ));
+    }
+
+    /// The zlib arm needs its own bomb: unlike gzip, zlib has no concatenated-stream form, so the
+    /// payload must be a single oversized stream. Fed to the encoder in chunks to keep the test's
+    /// own memory bounded.
+    #[test]
+    fn zlib_decompression_is_capped() {
+        use std::io::Write as IoWrite;
+
+        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let bomb = Bytes::from(encoder.finish().unwrap());
+
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+            bomb.len()
+        );
+
+        let error = ChunkedGelfDecompression::Zlib
+            .decompress(bomb, &CompressionLimits::default())
+            .expect_err("a payload inflating past the cap must be rejected");
+
+        assert!(matches!(
+            error,
+            ChunkedGelfDecompressionError::ZlibDecompression { .. }
+        ));
+    }
+
+    /// The cap must not disturb ordinary traffic. Zlib shares the same `CappedDecoder` wrapper as
+    /// gzip, so exercising both here covers the wiring of each arm.
+    #[rstest]
+    #[case(Compression::Gzip)]
+    #[case(Compression::Zlib)]
+    fn decompression_under_the_cap_is_unaffected(#[case] compression: Compression) {
+        let payload = "the quick brown fox".repeat(1024);
+        let compressed = compression.compress(&payload);
+
+        let decompressed = ChunkedGelfDecompression::from_magic(&compressed)
+            .decompress(compressed, &CompressionLimits::default())
+            .expect("a payload within the cap must decompress");
+
+        assert_eq!(decompressed, Bytes::from(payload));
     }
 }

@@ -77,6 +77,15 @@ pub struct ConfigBuilder {
     #[serde(default, skip)]
     #[doc(hidden)]
     pub allow_empty: bool,
+
+    /// Allow a component to raise an operational limit above the global one.
+    ///
+    /// Not a config key: it comes from a start option, so that a ceiling set by whoever runs
+    /// Vector cannot be lifted by editing a pipeline file. Set by the loader (and by `validate`,
+    /// which must predict what the corresponding run would do).
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub allow_component_limit_overrides: bool,
 }
 
 impl From<Config> for ConfigBuilder {
@@ -94,6 +103,7 @@ impl From<Config> for ConfigBuilder {
             tests,
             secret,
             graceful_shutdown_duration,
+            allow_component_limit_overrides,
         } = config;
 
         let transforms = transforms
@@ -123,6 +133,7 @@ impl From<Config> for ConfigBuilder {
             secret,
             graceful_shutdown_duration,
             allow_empty: false,
+            allow_component_limit_overrides,
         }
     }
 }

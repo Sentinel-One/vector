@@ -177,7 +177,11 @@ impl SinkConfig for HecMetricsSinkConfig {
 }
 
 impl HecMetricsSinkConfig {
-    pub fn build_processor(&self, client: HttpClient, _: SinkContext) -> crate::Result<VectorSink> {
+    pub fn build_processor(
+        &self,
+        client: HttpClient,
+        cx: SinkContext,
+    ) -> crate::Result<VectorSink> {
         let ack_client = if self.acknowledgements.indexer_acknowledgements_enabled {
             Some(client.clone())
         } else {
@@ -223,6 +227,7 @@ impl HecMetricsSinkConfig {
             self.rejection_report.clone(),
             self.compression,
             rej_ctx,
+            cx.globals.limits.compression,
         );
 
         let batch_settings = self.batch.into_batcher_settings()?;

@@ -83,6 +83,7 @@ impl ApplicationConfig {
             opts.require_healthy,
             opts.allow_empty_config,
             graceful_shutdown_duration,
+            opts.allow_component_limit_overrides,
             signal_handler,
         )
         .await?;
@@ -264,6 +265,7 @@ impl Application {
             signals,
             topology_controller,
             allow_empty_config: root_opts.allow_empty_config,
+            allow_component_limit_overrides: root_opts.allow_component_limit_overrides,
         })
     }
 }
@@ -275,6 +277,7 @@ pub struct StartedApplication {
     pub signals: SignalPair,
     pub topology_controller: SharedTopologyController,
     pub allow_empty_config: bool,
+    pub allow_component_limit_overrides: bool,
 }
 
 impl StartedApplication {
@@ -290,6 +293,7 @@ impl StartedApplication {
             topology_controller,
             internal_topologies,
             allow_empty_config,
+            allow_component_limit_overrides,
         } = self;
 
         let mut graceful_crash = UnboundedReceiverStream::new(graceful_crash_receiver);
@@ -306,6 +310,7 @@ impl StartedApplication {
                     &config_paths,
                     &mut signal_handler,
                     allow_empty_config,
+                    allow_component_limit_overrides,
                 ).await {
                     break signal;
                 },
@@ -334,6 +339,7 @@ async fn handle_signal(
     config_paths: &[ConfigPath],
     signal_handler: &mut SignalHandler,
     allow_empty_config: bool,
+    allow_component_limit_overrides: bool,
 ) -> Option<SignalTo> {
     match signal {
         Ok(SignalTo::ReloadFromConfigBuilder(config_builder)) => {
@@ -353,6 +359,7 @@ async fn handle_signal(
                 &topology_controller.config_paths,
                 signal_handler,
                 allow_empty_config,
+                allow_component_limit_overrides,
             )
             .await;
 
@@ -487,6 +494,7 @@ pub async fn load_configs(
     require_healthy: Option<bool>,
     allow_empty_config: bool,
     graceful_shutdown_duration: Option<Duration>,
+    allow_component_limit_overrides: bool,
     signal_handler: &mut SignalHandler,
 ) -> Result<Config, ExitCode> {
     let config_paths = config::process_paths(config_paths).ok_or(exitcode::CONFIG)?;
@@ -514,6 +522,7 @@ pub async fn load_configs(
         &config_paths,
         signal_handler,
         allow_empty_config,
+        allow_component_limit_overrides,
     )
     .await
     .map_err(handle_config_errors)?;
@@ -526,6 +535,15 @@ pub async fn load_configs(
     }
     config.healthchecks.set_require_healthy(require_healthy);
     config.graceful_shutdown_duration = graceful_shutdown_duration;
+
+    if allow_component_limit_overrides {
+        // Worth a line of its own: the global limits stop being a ceiling for the rest of this
+        // run, so the log should say so even when no component actually exceeds them.
+        info!(
+            "Component limit overrides are permitted; a component may raise a limit above the \
+             global value."
+        );
+    }
 
     Ok(config)
 }

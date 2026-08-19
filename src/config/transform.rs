@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use vector_common::decompression::OperationalLimitsOverride;
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -61,6 +62,14 @@ where
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub graph: GraphConfig,
 
+    /// Overrides the global operational limits for this component.
+    ///
+    /// A limit looser than the global one is clamped back to the global value unless Vector runs
+    /// with `--allow-component-limit-overrides`; a stricter one always applies.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub limits: OperationalLimitsOverride,
+
     #[configurable(derived)]
     pub inputs: Inputs<T>,
 
@@ -83,6 +92,7 @@ where
         TransformOuter {
             inputs,
             inner,
+            limits: Default::default(),
             graph: Default::default(),
         }
     }
@@ -103,6 +113,7 @@ where
         TransformOuter {
             inputs: Inputs::from_iter(inputs),
             inner: self.inner,
+            limits: self.limits,
             graph: self.graph,
         }
     }

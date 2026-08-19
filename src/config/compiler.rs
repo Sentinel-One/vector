@@ -51,6 +51,7 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
         secret,
         graceful_shutdown_duration,
         allow_empty: _,
+        allow_component_limit_overrides,
     } = builder;
 
     let graph = match Graph::new(&sources, &transforms, &sinks, schema) {
@@ -104,6 +105,7 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
             tests,
             secret,
             graceful_shutdown_duration,
+            allow_component_limit_overrides,
         };
 
         config.propagate_acknowledgements()?;

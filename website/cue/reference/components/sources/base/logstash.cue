@@ -46,6 +46,20 @@ base: components: sources: logstash: configuration: {
 			type: uint: unit: "seconds"
 		}
 	}
+	max_decompressed_bytes: {
+		description: """
+			Maximum size in bytes that a compressed frame payload is allowed to expand to.
+			Guards against decompression bomb (zip bomb) attacks.
+
+			This bound applies per frame, so peak memory scales with the number of concurrent
+			connections. Raise it only alongside a finite `connection_limit`.
+			"""
+		required: false
+		type: uint: {
+			default: 268435456
+			unit:    "bytes"
+		}
+	}
 	permit_origin: {
 		description: "List of allowed origin IP networks. IP addresses must be in CIDR notation."
 		required:    false

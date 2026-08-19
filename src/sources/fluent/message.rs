@@ -32,8 +32,12 @@ pub(super) enum FluentMessage {
     PackedForward(FluentTag, serde_bytes::ByteBuf),
     PackedForwardWithOptions(FluentTag, serde_bytes::ByteBuf, FluentMessageOptions),
 
-    // should be last as it'll match any other message
-    Heartbeat(rmpv::Value), // should be Nil if heartbeat
+    // Should be last, as an untagged variant matches whatever the earlier ones reject.
+    //
+    // Deliberately `()` rather than `rmpv::Value`: the Forward spec sends nil for a heartbeat, and
+    // typing it as nil means an unrecognised message is refused by serde instead of being
+    // materialised into an arbitrary, arbitrarily-nested value.
+    Heartbeat(()),
 }
 
 /// Server options sent by client.

@@ -1,15 +1,14 @@
-use std::{convert::Infallible, io};
+use std::convert::Infallible;
 
 use bytes::{Buf, Bytes};
 use chrono::Utc;
-use flate2::read::MultiGzDecoder;
 use snafu::ResultExt;
 use vector_lib::config::LogNamespace;
 use vector_lib::internal_event::{BytesReceived, Protocol};
 use warp::{http::StatusCode, Filter};
 
 use super::{
-    errors::{ParseSnafu, RequestError},
+    errors::{DecodeSnafu, ParseSnafu, RequestError},
     handlers,
     models::{FirehoseRequest, FirehoseResponse},
     Compression,
@@ -17,6 +16,11 @@ use super::{
 use crate::{
     codecs,
     internal_events::{AwsKinesisFirehoseRequestError, AwsKinesisFirehoseRequestReceived},
+    sources::util::{
+        decompression::{CappedDecoder, CompressionLimits},
+        http::capped_body,
+        http::ErrorMessage,
+    },
     SourceSender,
 };
 
@@ -29,10 +33,12 @@ pub fn firehose(
     acknowledgements: bool,
     out: SourceSender,
     log_namespace: LogNamespace,
+    compression_limits: CompressionLimits,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Infallible> + Clone {
     let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
     let context = handlers::Context {
         compression: record_compression,
+        compression_limits,
         store_access_key,
         decoder,
         acknowledgements,
@@ -57,7 +63,7 @@ pub fn firehose(
                 })
                 .untuple_one(),
         )
-        .and(parse_body())
+        .and(parse_body(compression_limits))
         .and(warp::any().map(move || context.clone()))
         .and_then(handlers::firehose)
         .recover(handle_firehose_rejection)
@@ -66,33 +72,41 @@ pub fn firehose(
 /// Decode (if needed) and parse request body
 ///
 /// Firehose can be configured to gzip compress messages so we handle this here
-fn parse_body() -> impl Filter<Extract = (FirehoseRequest,), Error = warp::reject::Rejection> + Clone
-{
+fn parse_body(
+    compression_limits: CompressionLimits,
+) -> impl Filter<Extract = (FirehoseRequest,), Error = warp::reject::Rejection> + Clone {
     warp::any()
         .and(warp::header::optional::<String>("Content-Encoding"))
         .and(warp::header("X-Amz-Firehose-Request-Id"))
-        .and(warp::body::bytes())
+        .and(capped_body(&compression_limits))
         .and_then(
-            |encoding: Option<String>, request_id: String, body: Bytes| async move {
-                match encoding {
-                    Some(s) if s == "gzip" => {
-                        Ok(Box::new(MultiGzDecoder::new(body.reader())) as Box<dyn io::Read>)
-                    }
-                    Some(s) => Err(warp::reject::Rejection::from(
-                        RequestError::UnsupportedEncoding {
-                            encoding: s,
-                            request_id: request_id.clone(),
-                        },
-                    )),
-                    None => Ok(Box::new(body.reader()) as Box<dyn io::Read>),
-                }
-                .and_then(|r| {
-                    serde_json::from_reader(r)
-                        .context(ParseSnafu {
+            move |encoding: Option<String>, request_id: String, body: Bytes| async move {
+                // Decompress (if needed) into a buffer capped by the global decompressed-size
+                // limit so a gzip bomb cannot drive unbounded allocation.
+                let decoded: Bytes = match encoding {
+                    Some(s) if s == "gzip" => CappedDecoder::gzip(body.reader(), &compression_limits)
+                        .decompress()
+                        .map(Bytes::from)
+                        .with_context(|_| DecodeSnafu {
                             request_id: request_id.clone(),
                         })
-                        .map_err(warp::reject::custom)
-                })
+                        .map_err(warp::reject::custom)?,
+                    Some(s) => {
+                        return Err(warp::reject::Rejection::from(
+                            RequestError::UnsupportedEncoding {
+                                encoding: s,
+                                request_id,
+                            },
+                        ));
+                    }
+                    None => body,
+                };
+
+                serde_json::from_slice(&decoded)
+                    .context(ParseSnafu {
+                        request_id: request_id.clone(),
+                    })
+                    .map_err(warp::reject::custom)
             },
         )
 }
@@ -155,6 +169,13 @@ async fn handle_firehose_rejection(err: warp::Rejection) -> Result<impl warp::Re
     } else if let Some(e) = err.find::<warp::reject::MissingHeader>() {
         code = StatusCode::BAD_REQUEST;
         message = format!("Required header missing: {}", e.name());
+        request_id = None;
+    } else if let Some(e) = err.find::<ErrorMessage>() {
+        // `capped_body()` rejects an oversized request body with an `ErrorMessage` carrying a 413.
+        // Without this arm warp falls through to a generic 500, which would misreport a client
+        // error as a server fault.
+        code = e.status_code();
+        message = e.to_string();
         request_id = None;
     } else {
         code = StatusCode::INTERNAL_SERVER_ERROR;

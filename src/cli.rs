@@ -237,44 +237,13 @@ pub struct RootOpts {
     #[arg(long, env = "VECTOR_ALLOW_EMPTY_CONFIG", default_value = "false")]
     pub allow_empty_config: bool,
 
-    /// Maximum length, in bytes, of a single delimited frame.
+    /// Allow a component to raise an operational limit above the global one.
     ///
-    /// Delimited framers buffer bytes until they see their delimiter, so a peer that never sends
-    /// one would otherwise grow the per-connection buffer without bound. A frame that reaches this
-    /// limit while still incomplete is rejected and the stream is closed.
-    ///
-    /// Defaults to 102400 (100 KiB). Raise this only when sources routinely receive legitimately
-    /// long frames; individual components can also override it with their own `max_length` option.
-    ///
-    /// Must be at least 1024; a cap below that would reject essentially all traffic rather than
-    /// just runaway frames.
-    #[arg(
-        long,
-        env = "VECTOR_MAX_FRAME_LENGTH_BYTES",
-        default_value_t = vector_lib::codecs::max_length::DEFAULT_MAX_FRAME_LENGTH_BYTES,
-        value_parser = parse_max_frame_length_bytes,
-    )]
-    pub max_frame_length_bytes: usize,
-}
-
-/// Lower bound for `--max-frame-length-bytes`.
-///
-/// Guards against a value (notably `0`) that would silently reject all delimited ingestion, which
-/// looks identical to a broken pipeline from the outside.
-const MIN_MAX_FRAME_LENGTH_BYTES: usize = 1024;
-
-fn parse_max_frame_length_bytes(raw: &str) -> Result<usize, String> {
-    let value: usize = raw
-        .parse()
-        .map_err(|_| format!("`{raw}` is not a valid number of bytes"))?;
-
-    if value < MIN_MAX_FRAME_LENGTH_BYTES {
-        return Err(format!(
-            "`{raw}` is below the minimum of {MIN_MAX_FRAME_LENGTH_BYTES} bytes"
-        ));
-    }
-
-    Ok(value)
+    /// Without this, a component asking for a limit looser than `limits.*` is clamped back to the
+    /// global value and a warning is logged. It is a start option rather than a config key so that
+    /// a ceiling set by whoever runs Vector cannot be lifted by editing pipeline config.
+    #[arg(long, env = "VECTOR_ALLOW_COMPONENT_LIMIT_OVERRIDES")]
+    pub allow_component_limit_overrides: bool,
 }
 
 impl RootOpts {
@@ -301,8 +270,6 @@ impl RootOpts {
         }
 
         crate::metrics::init_global().expect("metrics initialization failed");
-
-        vector_lib::codecs::max_length::set_max_frame_length_bytes(self.max_frame_length_bytes);
     }
 }
 
@@ -439,50 +406,53 @@ pub fn handle_config_errors(errors: Vec<String>) -> exitcode::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use clap::Parser;
 
+    use super::{Opts, SubCommand};
+
+    fn parse(args: &[&str]) -> Opts {
+        Opts::try_parse_from(args).expect("args should parse")
+    }
+
+    /// Off unless asked for: the default run must clamp component limits to the global ones.
     #[test]
-    fn max_frame_length_accepts_reasonable_values() {
-        assert_eq!(parse_max_frame_length_bytes("102400"), Ok(102_400));
-        assert_eq!(
-            parse_max_frame_length_bytes("1024"),
-            Ok(MIN_MAX_FRAME_LENGTH_BYTES)
+    fn component_limit_overrides_are_off_by_default() {
+        assert!(!parse(&["vector"]).root.allow_component_limit_overrides);
+    }
+
+    /// The flag is the only way to lift the ceiling, so it has to actually be wired to clap.
+    #[test]
+    fn the_component_limit_override_flag_is_accepted() {
+        assert!(
+            parse(&["vector", "--allow-component-limit-overrides"])
+                .root
+                .allow_component_limit_overrides
         );
     }
 
-    /// A zero (or near-zero) cap would reject essentially all delimited ingestion while looking
-    /// like a silently broken pipeline, so it must fail loudly at startup instead.
+    /// `validate` takes it as its own option, so it can be written after the subcommand the way
+    /// every other validate option is.
     #[test]
-    fn max_frame_length_rejects_values_below_the_floor() {
-        for raw in ["0", "1", "512", "1023"] {
-            assert!(
-                parse_max_frame_length_bytes(raw).is_err(),
-                "{raw} should have been rejected"
-            );
+    fn validate_accepts_the_component_limit_override_flag() {
+        let opts = parse(&[
+            "vector",
+            "validate",
+            "--allow-component-limit-overrides",
+            "vector.yaml",
+        ]);
+
+        match opts.sub_command {
+            Some(SubCommand::Validate(v)) => assert!(v.allow_component_limit_overrides),
+            other => panic!("expected the validate subcommand, got {other:?}"),
         }
     }
 
+    /// And defaults to off there too, so `vector validate` describes a default run.
     #[test]
-    fn max_frame_length_rejects_non_numeric() {
-        assert!(parse_max_frame_length_bytes("100KiB").is_err());
-        assert!(parse_max_frame_length_bytes("-1").is_err());
-        assert!(parse_max_frame_length_bytes("").is_err());
-    }
-
-    /// The clap default must track the constant the framers actually enforce.
-    #[test]
-    fn cli_default_matches_the_enforced_default() {
-        let opts = RootOpts::parse_from(["vector"]);
-        assert_eq!(
-            opts.max_frame_length_bytes,
-            vector_lib::codecs::max_length::DEFAULT_MAX_FRAME_LENGTH_BYTES
-        );
-    }
-
-    /// The flag must actually be settable, otherwise the escape hatch for long frames is absent.
-    #[test]
-    fn cli_flag_overrides_the_default() {
-        let opts = RootOpts::parse_from(["vector", "--max-frame-length-bytes", "1048576"]);
-        assert_eq!(opts.max_frame_length_bytes, 1_048_576);
+    fn validate_defaults_the_component_limit_override_flag_to_off() {
+        match parse(&["vector", "validate", "vector.yaml"]).sub_command {
+            Some(SubCommand::Validate(v)) => assert!(!v.allow_component_limit_overrides),
+            other => panic!("expected the validate subcommand, got {other:?}"),
+        }
     }
 }

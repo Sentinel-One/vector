@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use ordered_float::NotNan;
 use vector_lib::config::LogNamespace;
 use vector_lib::configurable::{configurable_component, ConfigurableString};
-use vector_lib::event::{TargetEvents, VrlTarget};
+use vector_lib::event::VrlTarget;
 use vector_lib::{event::Event, lookup::lookup_v2::ConfigTargetPath};
 use vrl::compiler::{ProgramInfo, Target};
 use vrl::core::Value;
@@ -219,10 +219,10 @@ impl Equality {
     }
 
     pub(crate) fn into_event(target: VrlTarget, log_ns: LogNamespace) -> Event {
-        match target.into_events(log_ns) {
-            TargetEvents::One(event) => event,
-            _ => panic!("Event was modified in a condition. This is an internal compiler error."),
-        }
+        // Deliberately not `into_events`: that infers fan-out from the root value type, so an
+        // array-rooted event - which can arrive over the native protobuf codec, and may even be
+        // empty - would yield `Logs` and panic here on input shape alone.
+        target.into_event(log_ns)
     }
 
     pub(crate) fn check(&self, e: Event) -> (bool, Event) {
@@ -617,6 +617,55 @@ mod tests {
 
         let eq_wrong = build(vec![(".name", Constant::String("other".into()))]);
         assert!(!eq_wrong.check(metric).0);
+    }
+
+    // OBE-11558: an array-rooted log event made `into_events` report a fan-out, which
+    // `into_event` treated as an internal compiler error and panicked on. A transform panic
+    // becomes a fatal ShutdownError that exits the whole daemon, so input shape alone could kill
+    // Vector. Such an event can arrive over the native protobuf codec, and an *empty* array is
+    // enough. This is the fork-only sibling of the same bug in `conditions::vrl`.
+    fn array_rooted_event(values: Vec<Value>) -> Event {
+        Event::Log(LogEvent::from_parts(
+            Value::Array(values),
+            crate::event::EventMetadata::default(),
+        ))
+    }
+
+    #[test]
+    fn check_on_array_rooted_event_does_not_panic() {
+        let eq = build(vec![(".foo", Constant::Integer(42))]);
+        let original = array_rooted_event(vec![Value::from(1), Value::from(2)]);
+
+        let (matched, returned) = eq.check(original.clone());
+
+        // `.foo` cannot resolve against an array root, so the clause simply does not match.
+        assert!(!matched);
+        assert_eq!(
+            original, returned,
+            "a read-only condition must return the event unchanged"
+        );
+    }
+
+    #[test]
+    fn check_on_empty_array_rooted_event_does_not_panic() {
+        let eq = build(vec![(".foo", Constant::Integer(42))]);
+        let original = array_rooted_event(vec![]);
+
+        let (matched, returned) = eq.check(original.clone());
+
+        assert!(!matched);
+        assert_eq!(original, returned);
+    }
+
+    #[test]
+    fn check_with_context_on_array_rooted_event_does_not_panic() {
+        let eq = build(vec![(".foo", Constant::Integer(42))]);
+        let original = array_rooted_event(vec![]);
+
+        let (result, returned) = eq.check_with_context(original.clone());
+
+        assert!(result.is_err());
+        assert_eq!(original, returned);
     }
 
     // ---------- Equality::check_with_context ----------

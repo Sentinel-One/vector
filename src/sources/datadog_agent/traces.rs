@@ -12,6 +12,7 @@ use warp::{filters::BoxedFilter, path, path::FullPath, reply::Response, Filter, 
 use vector_lib::internal_event::{CountByteSize, InternalEventHandle as _};
 use vector_lib::EstimatedJsonEncodedSizeOf;
 
+use crate::sources::util::http::capped_body;
 use crate::{
     event::{Event, ObjectMap, TraceEvent, Value},
     sources::{
@@ -48,7 +49,7 @@ fn build_trace_filter(
             "X-Datadog-Reported-Languages",
         ))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
+        .and(capped_body(&source.compression_limits))
         .and_then(
             move |path: FullPath,
                   encoding_header: Option<String>,

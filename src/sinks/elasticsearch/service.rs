@@ -17,6 +17,7 @@ use vector_lib::{
     request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
 };
 
+use vector_common::decompression::CompressionLimits;
 use super::{ElasticsearchCommon, ElasticsearchConfig, RejectionReport};
 use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
@@ -99,6 +100,8 @@ impl RejectionContext for ElasticsearchRejectionContext {
 
 #[derive(Clone)]
 pub struct ElasticsearchService {
+    /// Limits used when logging a rejected request payload.
+    compression_limits: CompressionLimits,
     // TODO: `HttpBatchService` has been deprecated for direct use in sinks.
     //       This sink should undergo a refactor to utilize the `HttpService`
     //       instead, which extracts much of the boilerplate code for `Service`.
@@ -118,6 +121,7 @@ impl ElasticsearchService {
         rej_rpt: RejectionReport,
         compression: Compression,
         rej_ctx: Arc<ElasticsearchRejectionContext>,
+        compression_limits: CompressionLimits,
     ) -> ElasticsearchService {
         let http_request_builder = Arc::new(http_request_builder);
         let batch_service = HttpBatchService::new(http_client, move |req| {
@@ -126,7 +130,13 @@ impl ElasticsearchService {
                 Box::pin(async move { request_builder.build_request(req).await });
             future
         });
-        ElasticsearchService { batch_service, rej_rpt, compression, rej_ctx }
+        ElasticsearchService {
+            batch_service,
+            rej_rpt,
+            compression,
+            rej_ctx,
+            compression_limits,
+        }
     }
 }
 
@@ -234,13 +244,20 @@ impl Service<ElasticsearchRequest> for ElasticsearchService {
             None
         };
         let rej_ctx = Arc::clone(&self.rej_ctx);
+        let compression_limits = self.compression_limits;
         Box::pin(async move {
             http_service.ready().await?;
             let events_byte_size =
                 std::mem::take(req.metadata_mut()).into_events_estimated_json_encoded_byte_size();
             let http_response = http_service.call(req).await?;
 
-            let event_status = get_event_status(&http_response, req_for_rpt, rej_rpt, &rej_ctx);
+            let event_status = get_event_status(
+                &http_response,
+                req_for_rpt,
+                rej_rpt,
+                &rej_ctx,
+                compression_limits,
+            );
             Ok(ElasticsearchResponse {
                 event_status,
                 http_response,
@@ -289,13 +306,14 @@ fn get_event_status(
     request: Option<(ElasticsearchRequest, Compression)>,
     rej_rpt: RejectionReport,
     rej_ctx: &ElasticsearchRejectionContext,
+    compression_limits: CompressionLimits,
 ) -> EventStatus {
     let status = response.status();
     if status.is_success() {
         let body = response.body();
         if String::from_utf8_lossy(body).contains(response_frag("errors", "true").as_str()) {
             let req = request.map(|(req, comp)| (req.payload, comp));
-            emit_rejection_error(rej_ctx, status.as_u16(), body, req, rej_rpt);
+            emit_rejection_error(rej_ctx, status.as_u16(), body, req, rej_rpt, compression_limits);
             EventStatus::Rejected
         } else {
             EventStatus::Delivered
@@ -306,11 +324,25 @@ fn get_event_status(
         } else {
             rej_rpt
         };
-        emit_rejection_error(rej_ctx, status.as_u16(), response.body(), None, mode);
+        emit_rejection_error(
+            rej_ctx,
+            status.as_u16(),
+            response.body(),
+            None,
+            mode,
+            compression_limits,
+        );
         EventStatus::Errored
     } else {
         let req = request.map(|(req, comp)| (req.payload, comp));
-        emit_rejection_error(rej_ctx, status.as_u16(), response.body(), req, rej_rpt);
+        emit_rejection_error(
+            rej_ctx,
+            status.as_u16(),
+            response.body(),
+            req,
+            rej_rpt,
+            compression_limits,
+        );
         EventStatus::Rejected
     }
 }

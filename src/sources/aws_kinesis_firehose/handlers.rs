@@ -1,9 +1,6 @@
-use std::io::Read;
-
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
-use flate2::read::MultiGzDecoder;
 use futures::StreamExt;
 use snafu::{ResultExt, Snafu};
 use tokio_util::codec::FramedRead;
@@ -36,13 +33,18 @@ use crate::{
     internal_events::{
         AwsKinesisFirehoseAutomaticRecordDecodeError, EventsReceived, StreamClosedError,
     },
-    sources::aws_kinesis_firehose::AwsKinesisFirehoseConfig,
+    sources::{
+        aws_kinesis_firehose::AwsKinesisFirehoseConfig,
+        util::decompression::{CappedDecoder, CompressionLimits, DecompressedSizeLimitExceeded},
+    },
     SourceSender,
 };
 
 #[derive(Clone)]
 pub(super) struct Context {
     pub(super) compression: Compression,
+    /// Limits to decompress records under, from this component's context.
+    pub(super) compression_limits: CompressionLimits,
     pub(super) store_access_key: bool,
     pub(super) decoder: Decoder,
     pub(super) acknowledgements: bool,
@@ -62,7 +64,7 @@ pub(super) async fn firehose(
     let events_received = register!(EventsReceived);
 
     for record in request.records {
-        let bytes = decode_record(&record, context.compression)
+        let bytes = decode_record(&record, context.compression, &context.compression_limits)
             .with_context(|_| ParseRecordsSnafu {
                 request_id: request_id.clone(),
             })
@@ -205,6 +207,7 @@ pub enum RecordDecodeError {
 fn decode_record(
     record: &EncodedFirehoseRecord,
     compression: Compression,
+    limits: &CompressionLimits,
 ) -> Result<Bytes, RecordDecodeError> {
     let buf = BASE64_STANDARD
         .decode(record.data.as_bytes())
@@ -216,12 +219,20 @@ fn decode_record(
 
     match compression {
         Compression::None => Ok(Bytes::from(buf)),
-        Compression::Gzip => decode_gzip(&buf[..]).with_context(|_| DecompressionSnafu {
+        Compression::Gzip => decode_gzip(&buf[..], limits).with_context(|_| DecompressionSnafu {
             compression: compression.to_owned(),
         }),
         Compression::Auto => {
             if is_gzip(&buf) {
-                decode_gzip(&buf[..]).or_else(|error| {
+                decode_gzip(&buf[..], limits).or_else(|error| {
+                    // An exceeded size cap means the magic bytes really were gzip and the payload
+                    // is oversized, so reject it. Only fall back to forwarding the raw bytes when
+                    // auto-detection guessed wrong (valid-looking magic, but not actually gzip).
+                    if DecompressedSizeLimitExceeded::is(&error) {
+                        return Err(error).with_context(|_| DecompressionSnafu {
+                            compression: Compression::Gzip,
+                        });
+                    }
                     emit!(AwsKinesisFirehoseAutomaticRecordDecodeError {
                         compression: Compression::Gzip,
                         error
@@ -246,13 +257,9 @@ fn is_gzip(data: &[u8]) -> bool {
     data.starts_with(GZIP_MAGIC)
 }
 
-fn decode_gzip(data: &[u8]) -> std::io::Result<Bytes> {
-    let mut decoded = Vec::new();
-
-    let mut gz = MultiGzDecoder::new(data);
-    gz.read_to_end(&mut decoded)?;
-
-    Ok(Bytes::from(decoded))
+fn decode_gzip(data: &[u8], limits: &CompressionLimits) -> std::io::Result<Bytes> {
+    // Cap the decompressed output so a gzip-bomb record cannot drive unbounded allocation.
+    CappedDecoder::gzip(data, limits).decompress().map(Bytes::from)
 }
 
 #[cfg(test)]
@@ -271,5 +278,88 @@ mod tests {
         encoder.write_all(CONTENT).unwrap();
         let compressed = encoder.finish().unwrap();
         assert!(is_gzip(&compressed));
+    }
+
+    /// One cheap gzip member repeated past the cap. `MultiGzDecoder` walks every concatenated
+    /// member, so no single oversized member is required.
+    fn gzip_bomb() -> Vec<u8> {
+        use crate::sources::util::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        let member = encoder.finish().unwrap();
+
+        let mut bomb = Vec::new();
+        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            bomb.extend_from_slice(&member);
+        }
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+            bomb.len()
+        );
+        bomb
+    }
+
+    fn record(data: &[u8]) -> EncodedFirehoseRecord {
+        EncodedFirehoseRecord {
+            data: BASE64_STANDARD.encode(data),
+        }
+    }
+
+    /// A gzip-bomb record must be refused rather than inflated.
+    #[test]
+    fn explicit_gzip_record_over_the_cap_is_rejected() {
+        let error = decode_record(&record(&gzip_bomb()), super::Compression::Gzip, &CompressionLimits::default())
+            .expect_err("a record inflating past the cap must be rejected");
+
+        assert!(matches!(
+            error,
+            RecordDecodeError::Decompression { .. }
+        ));
+    }
+
+    /// Under `Auto`, an oversized payload whose magic bytes really are gzip must be rejected, not
+    /// silently forwarded as raw bytes. The raw-bytes fallback exists only for a mis-detection.
+    #[test]
+    fn auto_detected_gzip_record_over_the_cap_is_rejected_not_forwarded() {
+        let error = decode_record(&record(&gzip_bomb()), super::Compression::Auto, &CompressionLimits::default())
+            .expect_err("an oversized auto-detected gzip record must not fall back to raw bytes");
+
+        assert!(matches!(
+            error,
+            RecordDecodeError::Decompression { .. }
+        ));
+    }
+
+    /// The cap must not disturb ordinary records, on either the explicit or the auto path.
+    #[test]
+    fn records_under_the_cap_are_unaffected() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(CONTENT).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        for compression in [super::Compression::Gzip, super::Compression::Auto] {
+            let decoded = decode_record(&record(&compressed), compression, &CompressionLimits::default())
+                .expect("a record within the cap must decode");
+            assert_eq!(decoded, Bytes::from_static(CONTENT));
+        }
+
+        let plain = decode_record(&record(CONTENT), super::Compression::None, &CompressionLimits::default())
+            .expect("an uncompressed record must decode");
+        assert_eq!(plain, Bytes::from_static(CONTENT));
+    }
+
+    /// Auto-detection guessing wrong (gzip magic, not actually gzip) must still fall back to
+    /// forwarding the raw bytes -- the size cap must not turn that into a hard failure.
+    #[test]
+    fn auto_detection_mistake_still_falls_back_to_raw_bytes() {
+        let mut not_gzip = vector_common::constants::GZIP_MAGIC.to_vec();
+        not_gzip.extend_from_slice(b"definitely not a gzip stream");
+
+        let decoded = decode_record(&record(&not_gzip), super::Compression::Auto, &CompressionLimits::default())
+            .expect("a mis-detected record must fall back to raw bytes");
+
+        assert_eq!(decoded, Bytes::from(not_gzip));
     }
 }

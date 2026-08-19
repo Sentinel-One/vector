@@ -27,9 +27,11 @@ rusqlite.workspace = true
 toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+testcontainers-modules = { version = "0.7", features = ["postgres"], optional = true }
 
 [features]
 default = []
+pg-integration-tests = ["dep:testcontainers-modules"]
 
 [dev-dependencies]
 assert_matches = { version = "1.5" }
