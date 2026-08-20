@@ -1,6 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use derivative::Derivative;
 use tokio_util::codec::Decoder;
+use vector_common::decompression::FramingLimits;
 use vector_config::configurable_component;
 
 use super::{BoxedFramingError, CharacterDelimitedDecoder};
@@ -23,13 +24,13 @@ pub struct NewlineDelimitedDecoderOptions {
     ///
     /// This length does *not* include the trailing delimiter.
     ///
-    /// By default, there is no maximum length enforced. If events are malformed, this can lead to
-    /// additional resource usage as events continue to be buffered in memory, and can potentially
-    /// lead to memory exhaustion in extreme cases.
+    /// Defaults to the deployment's configured frame length cap
+    /// (`limits.framing.max_frame_length_bytes`, 1 MiB unless overridden). Set this field to
+    /// override the cap for this component alone; unlike `sources.<name>.limits.framing`, it is
+    /// applied exactly as given, not clamped by `--allow-component-limit-overrides`.
     ///
-    /// If there is a risk of processing malformed data, such as logs with user-controlled input,
-    /// consider setting the maximum length to a reasonably large value as a safety net. This
-    /// ensures that processing is not actually unbounded.
+    /// A frame longer than the limit is a fatal decode error and the connection is reset, whether
+    /// or not its delimiter had arrived.
     #[serde(skip_serializing_if = "vector_core::serde::is_default")]
     pub max_length: Option<usize>,
 }
@@ -57,12 +58,15 @@ impl NewlineDelimitedDecoderConfig {
     }
 
     /// Build the `NewlineDelimitedDecoder` from this configuration.
-    pub const fn build(&self) -> NewlineDelimitedDecoder {
-        if let Some(max_length) = self.newline_delimited.max_length {
-            NewlineDelimitedDecoder::new_with_max_length(max_length)
-        } else {
-            NewlineDelimitedDecoder::new()
-        }
+    ///
+    /// Falls back to `limits.max_frame_length_bytes` (the deployment's configured cap) when this
+    /// component has not set its own `max_length`.
+    pub fn build(&self, limits: FramingLimits) -> NewlineDelimitedDecoder {
+        let max_length = self
+            .newline_delimited
+            .max_length
+            .unwrap_or(limits.max_frame_length_bytes);
+        NewlineDelimitedDecoder::new_with_max_length(max_length)
     }
 }
 
@@ -71,7 +75,11 @@ impl NewlineDelimitedDecoderConfig {
 pub struct NewlineDelimitedDecoder(CharacterDelimitedDecoder);
 
 impl NewlineDelimitedDecoder {
-    /// Creates a new `NewlineDelimitedDecoder`.
+    /// Creates a new `NewlineDelimitedDecoder`, using the documented default frame length cap.
+    ///
+    /// Callers that have access to a component's context should prefer
+    /// [`NewlineDelimitedDecoderConfig::build`] instead, so the deployment's configured limit
+    /// applies rather than this hardcoded default.
     pub const fn new() -> Self {
         Self(CharacterDelimitedDecoder::new(b'\n'))
     }
@@ -132,12 +140,16 @@ mod tests {
 
     #[test]
     fn decode_bytes_with_newlines_and_max_length() {
+        // An over-long line is now fatal rather than skipped, so "baz" behind it is never read.
         let mut input = BytesMut::from("foo\nbarbara\nbaz\n");
         let mut decoder = NewlineDelimitedDecoder::new_with_max_length(3);
 
         assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "foo");
-        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "baz");
-        assert_eq!(decoder.decode(&mut input).unwrap(), None);
+        assert!(decoder.decode(&mut input).is_err());
+        assert!(
+            input.is_empty(),
+            "the stream is abandoned, not resynchronized"
+        );
     }
 
     #[test]
@@ -167,7 +179,38 @@ mod tests {
         let mut decoder = NewlineDelimitedDecoder::new_with_max_length(3);
 
         assert_eq!(decoder.decode_eof(&mut input).unwrap().unwrap(), "foo");
+        assert!(decoder.decode_eof(&mut input).is_err());
+        assert!(input.is_empty());
+    }
+
+    /// Lines within the limit are unaffected by the cap, including at EOF without a trailing
+    /// delimiter — the accept half of the pair above.
+    #[test]
+    fn decode_bytes_within_max_length_are_unaffected() {
+        let mut input = BytesMut::from("foo\nbar\nbaz");
+        let mut decoder = NewlineDelimitedDecoder::new_with_max_length(3);
+
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "foo");
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "bar");
+        assert_eq!(decoder.decode(&mut input).unwrap(), None);
         assert_eq!(decoder.decode_eof(&mut input).unwrap().unwrap(), "baz");
         assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
+    }
+
+    /// `build()` must fall back to the deployment's configured cap, not the hardcoded default,
+    /// when the component has not set its own `max_length`.
+    #[test]
+    fn build_falls_back_to_the_deployment_configured_cap() {
+        let config = NewlineDelimitedDecoderConfig::new();
+        let decoder = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        assert_eq!(decoder.0.max_length(), 4096);
+    }
+
+    /// An explicit `max_length` on the component always wins over the deployment's cap.
+    #[test]
+    fn build_prefers_an_explicit_max_length_over_the_deployment_cap() {
+        let config = NewlineDelimitedDecoderConfig::new_with_max_length(64);
+        let decoder = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        assert_eq!(decoder.0.max_length(), 64);
     }
 }

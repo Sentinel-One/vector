@@ -4,7 +4,7 @@ mod http;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex};
-use vector_common::decompression::CompressionLimits;
+use vector_common::decompression::OperationalLimits;
 use vector_lib::{
     codecs::{
         decoding::{self, DeserializerConfig},
@@ -267,7 +267,7 @@ fn encoder_framing_to_decoding_framer(framing: encoding::FramingConfig) -> decod
         },
     };
 
-    framing_config.build(CompressionLimits::default())
+    framing_config.build(OperationalLimits::default())
 }
 
 /// Direction that the resource is operating in.

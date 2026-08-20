@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use byteorder::{ByteOrder, NetworkEndian};
@@ -19,7 +21,34 @@ use vrl::core::Value;
 use vrl::value::KeyString;
 
 use crate::decoding::BoxedFramingError;
+use indexmap::IndexMap;
 use vector_config::configurable_component;
+
+/// Maximum number of exporters whose templates are cached at once.
+///
+/// The map is keyed by attacker-influenceable data (the source address of a datagram), so it needs
+/// a ceiling of its own: without one, spraying spoofed source addresses grows it without bound.
+/// When full the least recently used exporter is evicted, which costs that exporter a template
+/// refresh rather than dropping its data permanently.
+const MAX_TRACKED_EXPORTERS: usize = 1024;
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Which template cache a decoder reads and writes.
+///
+/// NetFlow v9/IPFIX templates are defined by the exporter and are only meaningful in its own
+/// context (RFC 3954 section 5.2, RFC 7011 section 8): template id 260 from one exporter says
+/// nothing about template id 260 from another. Sharing one cache across peers lets any host that
+/// can reach the collector redefine the layout that another exporter's data records are decoded
+/// with, so each scope gets its own parser.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ExporterScope {
+    /// A datagram peer. Keyed on the address only, deliberately not the port: an exporter's source
+    /// port can change between datagrams, and including it would hide templates it already sent.
+    Datagram(IpAddr),
+    /// One stream connection. Templates live and die with the connection.
+    Connection(u64),
+}
 
 /// Config used to build a `NetflowDecoderDecoder`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -70,7 +99,19 @@ impl NetflowDecoderOptions {
 pub struct NetflowDecoder {
     /// The maximum length of the byte buffer.
     pub max_length: usize,
-    parser: Arc<Mutex<NetflowParser>>,
+    /// One stateful parser per exporter, shared across clones. UDP clones this decoder per
+    /// datagram, so the cache cannot live in the clone: templates arrive in one datagram and the
+    /// data records referencing them in later ones.
+    parsers: Arc<Mutex<IndexMap<ExporterScope, TrackedParser>>>,
+    /// Which entry of `parsers` this clone uses. Defaults to a fresh connection scope so a caller
+    /// that forgets to set it gets isolation rather than a shared cache.
+    scope: ExporterScope,
+}
+
+#[derive(Debug)]
+struct TrackedParser {
+    parser: NetflowParser,
+    last_used: u64,
 }
 
 impl NetflowDecoder {
@@ -88,13 +129,75 @@ impl NetflowDecoder {
     pub fn new_with_max_length(max_length: usize) -> Self {
         Self {
             max_length,
-            parser: Arc::new(Mutex::new(NetflowParser::default())),
+            parsers: Arc::new(Mutex::new(IndexMap::new())),
+            scope: ExporterScope::Connection(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)),
         }
+    }
+
+    /// Scopes this decoder's templates to a datagram peer.
+    ///
+    /// Call on the per-datagram clone before decoding, so each exporter resolves its data records
+    /// against templates it sent itself.
+    pub fn set_datagram_peer(&mut self, peer: IpAddr) {
+        self.scope = ExporterScope::Datagram(peer);
+    }
+
+    /// Scopes this decoder's templates to a fresh connection.
+    ///
+    /// Call once per accepted connection. Without this every connection built from the same
+    /// configured decoder would inherit one scope and share a template cache.
+    pub fn set_new_connection_scope(&mut self) {
+        self.scope = ExporterScope::Connection(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed));
     }
 
     /// Returns the maximum frame length when decoding.
     pub const fn max_length(&self) -> usize {
         self.max_length
+    }
+
+    /// Returns the parser for `scope`, creating it if this exporter has not been seen before and
+    /// evicting the least recently used exporter if the cache is full.
+    fn parser_for<'a>(
+        parsers: &'a mut IndexMap<ExporterScope, TrackedParser>,
+        scope: &ExporterScope,
+    ) -> &'a mut NetflowParser {
+        // Monotonic tick rather than a clock: only the ordering matters, and this keeps the hot
+        // path free of a syscall.
+        static TICK: AtomicU64 = AtomicU64::new(0);
+        let now = TICK.fetch_add(1, Ordering::Relaxed);
+
+        if !parsers.contains_key(scope) {
+            if parsers.len() >= MAX_TRACKED_EXPORTERS {
+                // Eviction is O(n) but only runs when the cache is full; lookups stay O(1).
+                if let Some((index, _, _)) = parsers
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, tracked))| tracked.last_used)
+                    .map(|(index, (key, tracked))| (index, key.clone(), tracked.last_used))
+                {
+                    parsers.shift_remove_index(index);
+                    warn!(
+                        message = "Netflow template cache is full; evicted the least recently \
+                                   used exporter, which must resend its templates.",
+                        max_tracked_exporters = MAX_TRACKED_EXPORTERS,
+                        internal_log_rate_limit = true
+                    );
+                }
+            }
+            parsers.insert(
+                scope.clone(),
+                TrackedParser {
+                    parser: NetflowParser::default(),
+                    last_used: now,
+                },
+            );
+        }
+
+        let tracked = parsers
+            .get_mut(scope)
+            .expect("entry was just inserted if absent");
+        tracked.last_used = now;
+        &mut tracked.parser
     }
 
     fn insert_v9_header_fields(v9pkt: &V9) -> BTreeMap<KeyString, Value> {
@@ -216,7 +319,8 @@ impl Decoder for NetflowDecoder {
         }
 
         let mut packets = Vec::new();
-        let mut parser = self.parser.lock().expect("Failed to lock NetflowParser");
+        let mut parsers = self.parsers.lock().expect("Failed to lock NetflowParser");
+        let parser = Self::parser_for(&mut parsers, &self.scope);
         let parse_results = parser.parse_bytes(src.as_mut());
 
         let mut had_fatal_error = false;
@@ -1003,4 +1107,162 @@ mod tests {
         let data_records = collect_records(&data_results);
         assert!(data_records.iter().any(|r| r["template_type"] == "data"));
     }
+
+
+    // ---- template scoping (OBE-11566) ---------------------------------------------------------
+    //
+    // Minimal hand-built v9 packets rather than base64 captures: what matters here is exactly
+    // which template id each exporter defined, which a capture blob would hide.
+
+    /// v9 header: version, flowset count, uptime, epoch, sequence, source id.
+    fn v9_header(flowset_count: u16) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&9u16.to_be_bytes());
+        p.extend_from_slice(&flowset_count.to_be_bytes());
+        p.extend_from_slice(&0u32.to_be_bytes()); // sys_up_time
+        p.extend_from_slice(&1u32.to_be_bytes()); // unix_secs
+        p.extend_from_slice(&0u32.to_be_bytes()); // sequence
+        p.extend_from_slice(&0u32.to_be_bytes()); // source_id
+        p
+    }
+
+    /// Template flowset (flowset id 0) defining `template_id` as the given (field_type, length)s.
+    fn v9_template(template_id: u16, fields: &[(u16, u16)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&template_id.to_be_bytes());
+        body.extend_from_slice(&(fields.len() as u16).to_be_bytes());
+        for (ty, len) in fields {
+            body.extend_from_slice(&ty.to_be_bytes());
+            body.extend_from_slice(&len.to_be_bytes());
+        }
+        let mut p = v9_header(1);
+        p.extend_from_slice(&0u16.to_be_bytes());
+        p.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        p.extend_from_slice(&body);
+        p
+    }
+
+    /// Data flowset referencing `template_id`.
+    fn v9_data(template_id: u16, record: &[u8]) -> Vec<u8> {
+        let mut p = v9_header(1);
+        p.extend_from_slice(&template_id.to_be_bytes());
+        p.extend_from_slice(&((record.len() + 4) as u16).to_be_bytes());
+        p.extend_from_slice(record);
+        p
+    }
+
+    /// IPV4_SRC_ADDR then IPV4_DST_ADDR — what the legitimate exporter registers.
+    fn honest_fields() -> Vec<(u16, u16)> {
+        vec![(8, 4), (12, 4)]
+    }
+
+    /// The same template id with a different layout — what a spoofing peer registers so the
+    /// victim's records decode against the wrong offsets.
+    fn poisoned_fields() -> Vec<(u16, u16)> {
+        vec![(2, 4), (1, 4)] // IN_PKTS, IN_BYTES
+    }
+
+    const RECORD: [u8; 8] = [10, 0, 0, 9, 10, 0, 0, 8];
+
+    fn decode_from(decoder: &NetflowDecoder, peer: &str, packet: &[u8]) -> String {
+        let mut decoder = decoder.clone();
+        decoder.set_datagram_peer(peer.parse().expect("valid ip"));
+        let mut buf = BytesMut::from(packet);
+        decoder
+            .decode(&mut buf)
+            .expect("decode should not fail")
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// The feature itself: a template learned from one datagram must still decode data records
+    /// arriving in a later datagram from the same exporter. Without this, "isolation" could be
+    /// satisfied trivially by never caching anything.
+    #[test]
+    fn templates_persist_across_datagrams_from_the_same_exporter() {
+        let decoder = NetflowDecoder::new();
+
+        decode_from(&decoder, "10.0.0.1", &v9_template(256, &honest_fields()));
+        let text = decode_from(&decoder, "10.0.0.1", &v9_data(256, &RECORD));
+
+        assert!(
+            text.contains("10.0.0.9"),
+            "data should decode against the template this exporter sent, got: {text}"
+        );
+    }
+
+    /// The finding: another peer redefining the same template id must not change how this
+    /// exporter's records are decoded.
+    #[test]
+    fn one_exporter_cannot_poison_another_exporters_template() {
+        let decoder = NetflowDecoder::new();
+
+        decode_from(&decoder, "10.0.0.1", &v9_template(256, &honest_fields()));
+        decode_from(&decoder, "10.0.0.2", &v9_template(256, &poisoned_fields()));
+
+        let text = decode_from(&decoder, "10.0.0.1", &v9_data(256, &RECORD));
+        assert!(
+            text.contains("10.0.0.9"),
+            "another exporter poisoned this exporter's template 256, got: {text}"
+        );
+    }
+
+    /// Templates must not leak the other way either: an exporter that never sent one must not
+    /// decode against a template another exporter happened to register.
+    #[test]
+    fn an_exporter_cannot_borrow_another_exporters_template() {
+        let decoder = NetflowDecoder::new();
+
+        decode_from(&decoder, "10.0.0.1", &v9_template(256, &honest_fields()));
+
+        let text = decode_from(&decoder, "10.0.0.3", &v9_data(256, &RECORD));
+        assert!(
+            !text.contains("10.0.0.9"),
+            "an exporter that sent no template decoded against another's, got: {text}"
+        );
+    }
+
+    /// Stream peers are isolated too, and each connection scope is distinct from every other.
+    #[test]
+    fn each_connection_scope_is_distinct() {
+        let decoder = NetflowDecoder::new();
+
+        let mut first = decoder.clone();
+        first.set_new_connection_scope();
+        let mut buf = BytesMut::from(&v9_template(256, &honest_fields())[..]);
+        first.decode(&mut buf).expect("template should decode");
+
+        let mut second = decoder.clone();
+        second.set_new_connection_scope();
+        let mut buf = BytesMut::from(&v9_data(256, &RECORD)[..]);
+        let text = second
+            .decode(&mut buf)
+            .expect("decode should not fail")
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+
+        assert!(
+            !text.contains("10.0.0.9"),
+            "a second connection reused the first connection's template, got: {text}"
+        );
+    }
+
+    /// The cache is keyed on the datagram source address, which an attacker controls, so it needs
+    /// a ceiling of its own.
+    #[test]
+    fn exporter_cache_is_bounded() {
+        let decoder = NetflowDecoder::new();
+
+        for i in 0..(MAX_TRACKED_EXPORTERS + 50) {
+            let peer = format!("10.{}.{}.{}", (i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+            decode_from(&decoder, &peer, &v9_template(256, &honest_fields()));
+        }
+
+        let tracked = decoder.parsers.lock().expect("lock").len();
+        assert!(
+            tracked <= MAX_TRACKED_EXPORTERS,
+            "cache grew to {tracked} entries, above the {MAX_TRACKED_EXPORTERS} ceiling",
+        );
+    }
+
 }

@@ -149,6 +149,54 @@ impl CompressionLimits {
     }
 }
 
+/// Default cap on the length of a single delimited frame.
+///
+/// Sized well above ordinary line-oriented traffic so that unusually wide but legitimate records
+/// decode without a pipeline author needing to raise it, while still bounding a peer that never
+/// sends a delimiter. Deployments with routinely larger single-line records (e.g.
+/// CloudTrail-via-`aws_s3`, which can exceed 10 MB) still need to raise this via
+/// `limits.framing.max_frame_length_bytes` or a component's own `max_length`.
+pub const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 1024 * 1024;
+
+/// Limits applied by delimited framers (`character_delimited`, `newline_delimited`,
+/// `octet_counting`) while a frame is still incomplete.
+///
+/// Carried in `GlobalOptions`, so every component reaches it through its own context
+/// (`SourceContext` / `SinkContext` / `TransformContext`) rather than reading process state.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramingLimits {
+    /// Maximum length, in bytes, of a single delimited frame.
+    ///
+    /// Delimited framers buffer bytes until they see their delimiter, so a peer that never sends
+    /// one would otherwise grow the per-connection buffer without bound. A frame that reaches this
+    /// limit while still incomplete is a fatal decode error and the connection is reset.
+    #[serde(default = "default_max_frame_length_bytes")]
+    pub max_frame_length_bytes: usize,
+}
+
+const fn default_max_frame_length_bytes() -> usize {
+    DEFAULT_MAX_FRAME_LENGTH_BYTES
+}
+
+impl Default for FramingLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_length_bytes: DEFAULT_MAX_FRAME_LENGTH_BYTES,
+        }
+    }
+}
+
+impl FramingLimits {
+    /// Builds limits with an explicit frame-length cap. Mostly useful in tests.
+    #[must_use]
+    pub const fn with_max_frame_length_bytes(max_frame_length_bytes: usize) -> Self {
+        Self {
+            max_frame_length_bytes,
+        }
+    }
+}
+
 /// Operational limits carried in `GlobalOptions`.
 ///
 /// A single place to hang caps that components need but should not read from process state. Add
@@ -160,6 +208,11 @@ pub struct OperationalLimits {
     #[configurable(derived)]
     #[serde(default)]
     pub compression: CompressionLimits,
+
+    /// Limits applied by delimited framers while a frame is still incomplete.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub framing: FramingLimits,
 }
 
 /// Per-component override of [`CompressionLimits`].
@@ -179,6 +232,25 @@ pub struct CompressionLimitsOverride {
     pub max_decompressed_size_bytes: Option<usize>,
 }
 
+/// Per-component override of [`FramingLimits`].
+///
+/// Every field is optional so that "not set" stays distinct from "set to the default". Without
+/// that distinction a component that says nothing would look like it were asking for the default
+/// value, and could not be told apart from one that deliberately asked for it.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FramingLimitsOverride {
+    /// Overrides [`FramingLimits::max_frame_length_bytes`] for this component.
+    ///
+    /// A value below the global limit always applies. A value above it is clamped back to the
+    /// global limit unless Vector is started with `--allow-component-limit-overrides`, so that a
+    /// ceiling chosen by whoever runs the process cannot be lifted by editing pipeline config.
+    /// Individual framing codecs also expose their own `max_length` option, which is unaffected by
+    /// this override and always applies as given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_length_bytes: Option<usize>,
+}
+
 /// Per-component override of [`OperationalLimits`].
 ///
 /// Attached to every source, transform and sink. Unset fields inherit the global value.
@@ -189,6 +261,11 @@ pub struct OperationalLimitsOverride {
     #[configurable(derived)]
     #[serde(default)]
     pub compression: CompressionLimitsOverride,
+
+    /// Overrides the global framing limits for this component.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub framing: FramingLimitsOverride,
 }
 
 impl OperationalLimitsOverride {
@@ -256,6 +333,22 @@ impl OperationalLimits {
                 } else {
                     requested
                 };
+        }
+
+        if let Some(requested) = over.framing.max_frame_length_bytes {
+            let allowed = self.framing.max_frame_length_bytes;
+            if requested > allowed {
+                raises.push(LimitRaise {
+                    field: "limits.framing.max_frame_length_bytes",
+                    requested,
+                    allowed,
+                });
+            }
+            resolved.framing.max_frame_length_bytes = if requested > allowed && !allow_raise {
+                allowed
+            } else {
+                requested
+            };
         }
 
         (resolved, raises)
@@ -641,6 +734,10 @@ mod tests {
             CompressionLimits::default().max_decompressed_size_bytes,
             DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
         );
+        assert_eq!(
+            FramingLimits::default().max_frame_length_bytes,
+            DEFAULT_MAX_FRAME_LENGTH_BYTES
+        );
     }
 
     /// Cross-check every capped decoder against the raw decoder it wraps.
@@ -724,6 +821,7 @@ mod tests {
     fn global(max: usize) -> OperationalLimits {
         OperationalLimits {
             compression: CompressionLimits::with_max_decompressed_size_bytes(max),
+            framing: FramingLimits::default(),
         }
     }
 
@@ -731,6 +829,23 @@ mod tests {
         OperationalLimitsOverride {
             compression: CompressionLimitsOverride {
                 max_decompressed_size_bytes: Some(max),
+            },
+            framing: FramingLimitsOverride::default(),
+        }
+    }
+
+    fn global_framing(max: usize) -> OperationalLimits {
+        OperationalLimits {
+            compression: CompressionLimits::default(),
+            framing: FramingLimits::with_max_frame_length_bytes(max),
+        }
+    }
+
+    fn asking_framing(max: usize) -> OperationalLimitsOverride {
+        OperationalLimitsOverride {
+            compression: CompressionLimitsOverride::default(),
+            framing: FramingLimitsOverride {
+                max_frame_length_bytes: Some(max),
             },
         }
     }
@@ -823,5 +938,52 @@ mod tests {
         let set: OperationalLimitsOverride =
             serde_json::from_str(r#"{"compression":{"max_decompressed_size_bytes":512}}"#).unwrap();
         assert_eq!(set.compression.max_decompressed_size_bytes, Some(512));
+    }
+
+    // ---- framing limit overrides, mirroring the compression cases above ------------------------
+    //
+    // The resolution logic is shared (`resolve` applies both groups the same way), so these cases
+    // exist to pin that `framing` is actually wired into it — a copy-paste that missed one branch
+    // would leave this group inert while the compression tests above kept passing.
+
+    /// A pipeline asking for a longer frame than the operator's ceiling — e.g.
+    /// CloudTrail-via-`aws_s3` single-line records over 10 MB — is clamped by default.
+    #[test]
+    fn raising_the_frame_length_limit_is_clamped_by_default() {
+        let (resolved, raises) = global_framing(1024).resolve(&asking_framing(4096), false);
+
+        assert_eq!(
+            resolved.framing.max_frame_length_bytes, 1024,
+            "the global limit must survive a component asking for more"
+        );
+        assert_eq!(
+            raises,
+            vec![LimitRaise {
+                field: "limits.framing.max_frame_length_bytes",
+                requested: 4096,
+                allowed: 1024,
+            }]
+        );
+    }
+
+    /// The escape hatch applies to framing the same way it does to compression.
+    #[test]
+    fn raising_the_frame_length_limit_is_granted_when_explicitly_allowed() {
+        let (resolved, raises) = global_framing(1024).resolve(&asking_framing(4096), true);
+
+        assert_eq!(resolved.framing.max_frame_length_bytes, 4096);
+        assert_eq!(raises.len(), 1);
+    }
+
+    /// A component may always ask for a stricter frame length than the deployment.
+    #[test]
+    fn lowering_the_frame_length_limit_is_always_granted() {
+        for allow_raise in [false, true] {
+            let (resolved, raises) =
+                global_framing(4096).resolve(&asking_framing(1024), allow_raise);
+
+            assert_eq!(resolved.framing.max_frame_length_bytes, 1024);
+            assert!(raises.is_empty(), "lowering is not a raise");
+        }
     }
 }

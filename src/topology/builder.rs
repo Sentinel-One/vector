@@ -1150,6 +1150,7 @@ mod limit_override_tests {
         GlobalOptions {
             limits: OperationalLimits {
                 compression: CompressionLimits::with_max_decompressed_size_bytes(max),
+                ..Default::default()
             },
             ..Default::default()
         }
@@ -1160,6 +1161,7 @@ mod limit_override_tests {
             compression: CompressionLimitsOverride {
                 max_decompressed_size_bytes: Some(max),
             },
+            ..Default::default()
         }
     }
 

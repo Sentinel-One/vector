@@ -185,12 +185,34 @@ pub struct JsonPathDeserializerOptions {
 ///
 /// This deserializer maintains parser state across calls to support streaming,
 /// allowing JSON to be split across multiple `parse()` calls.
-#[derive(Clone)]
 pub struct JsonPathDeserializer {
     path_map: BTreeMap<String, PathOperation>,
     lossy: bool,
-    /// Streaming parser state (wrapped in Arc<Mutex> for interior mutability)
+    feeder_capacity: usize,
+    /// Streaming parser state (wrapped in Arc<Mutex> for interior mutability).
+    ///
+    /// A JSON document may span several frames, so this has to persist between `parse` calls —
+    /// but only within one stream. See the `Clone` impl.
     parser_state: std::sync::Arc<std::sync::Mutex<StreamingParserState>>,
+}
+
+/// Cloning yields an independent parser, not a second handle to the same one.
+///
+/// `Decoder` is cloned once per accepted connection (and per datagram for message-based sources),
+/// so sharing the `Arc` would feed every client's bytes into a single streaming document: one
+/// client's frame could complete another's half-open object, and one malformed frame would leave
+/// the shared parser in an error state that no later frame from any client could recover from.
+impl Clone for JsonPathDeserializer {
+    fn clone(&self) -> Self {
+        Self {
+            path_map: self.path_map.clone(),
+            lossy: self.lossy,
+            feeder_capacity: self.feeder_capacity,
+            parser_state: std::sync::Arc::new(std::sync::Mutex::new(Self::new_parser_state(
+                self.feeder_capacity,
+            ))),
+        }
+    }
 }
 
 /// State maintained across parse() calls for streaming
@@ -202,19 +224,29 @@ struct StreamingParserState {
 impl JsonPathDeserializer {
     /// Creates a new `JsonPathDeserializer`.
     pub fn new(config: PathOperationConfig, options: JsonPathDeserializerOptions) -> Self {
-        let feeder = PushJsonFeeder::with_capacity(options.feeder_capacity);
-        let parser_options = JsonParserOptionsBuilder::default()
-            .with_streaming(true)
-            .build();
-        let parser = JsonParser::new_with_options(feeder, parser_options);
-
         Self {
             path_map: config.as_map(),
             lossy: options.lossy,
-            parser_state: std::sync::Arc::new(std::sync::Mutex::new(StreamingParserState {
-                parser,
-                state: ParserState::new(),
-            })),
+            feeder_capacity: options.feeder_capacity,
+            parser_state: std::sync::Arc::new(std::sync::Mutex::new(Self::new_parser_state(
+                options.feeder_capacity,
+            ))),
+        }
+    }
+
+    /// Builds a parser with no residual state.
+    ///
+    /// Used for a new deserializer, for each clone, and to recover after a parse error — actson's
+    /// push parser cannot resynchronise once it reports a syntax error, so the only way back is a
+    /// new parser.
+    fn new_parser_state(feeder_capacity: usize) -> StreamingParserState {
+        let feeder = PushJsonFeeder::with_capacity(feeder_capacity);
+        let parser_options = JsonParserOptionsBuilder::default()
+            .with_streaming(true)
+            .build();
+        StreamingParserState {
+            parser: JsonParser::new_with_options(feeder, parser_options),
+            state: ParserState::new(),
         }
     }
 }
@@ -290,24 +322,48 @@ impl Deserializer for JsonPathDeserializer {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
+        // Any failure below leaves actson in an error state and `ParserState.path` /
+        // `value_stack` holding fragments of the half-parsed document. actson's push parser cannot
+        // resynchronise after a syntax error, and `Error::ParsingError` is continuable, so without
+        // this the source would keep calling a permanently wrecked parser: every later frame on
+        // this stream fails or decodes against stale path residue. Discard the state so the next
+        // frame starts from a clean parser.
+        let result = self.parse_frame(&mut streaming_state, &bytes_slice, log_namespace);
+        if result.is_err() {
+            *streaming_state = Self::new_parser_state(self.feeder_capacity);
+        }
+        result
+    }
+}
+
+impl JsonPathDeserializer {
+    fn parse_frame(
+        &self,
+        streaming_state: &mut StreamingParserState,
+        bytes_slice: &[u8],
+        log_namespace: LogNamespace,
+    ) -> vector_common::Result<SmallVec<[Event; 1]>> {
         let mut byte_offset = 0usize;
         let total_len = bytes_slice.len();
         while byte_offset < total_len {
             if streaming_state.parser.feeder.is_full() {
-                self.drain_parser_events(&mut streaming_state)?;
+                self.drain_parser_events(streaming_state)?;
                 if streaming_state.parser.feeder.is_full() {
                     return Err("JSON feeder is full and cannot accept more bytes".into());
                 }
             }
 
-            let pushed = streaming_state.parser.feeder.push_bytes(&bytes_slice[byte_offset..]);
+            let pushed = streaming_state
+                .parser
+                .feeder
+                .push_bytes(&bytes_slice[byte_offset..]);
             if pushed == 0 {
                 return Err("JSON feeder could not accept bytes (0 bytes pushed)".into());
             }
             byte_offset += pushed;
         }
 
-        self.drain_parser_events(&mut streaming_state)?;
+        self.drain_parser_events(streaming_state)?;
 
         let mut result = SmallVec::new();
         let events_to_emit = std::mem::take(&mut streaming_state.state.events);
@@ -1290,4 +1346,118 @@ codec = "json_paths"
         assert_eq!(arr[3], Value::Integer(4));
         assert_eq!(arr[4], Value::Integer(5));
     }
+
+    // ---- parser isolation and recovery (OBE-11567) --------------------------------------------
+
+    fn test_deserializer() -> JsonPathDeserializer {
+        let config = PathOperationConfig::new(owned_value_path!("meta"), PathOperation::Identity);
+        JsonPathDeserializer::new(config, JsonPathDeserializerOptions::default())
+    }
+
+    fn parse_ok(d: &JsonPathDeserializer, raw: &str) -> usize {
+        d.parse(Bytes::from(raw.to_owned()), LogNamespace::Vector)
+            .expect("should parse")
+            .len()
+    }
+
+    /// A clone is a separate parser, not another handle to the same one.
+    ///
+    /// `Decoder` is cloned per connection, so a shared parser would let one client's bytes land in
+    /// the middle of another client's document.
+    #[test]
+    fn clones_do_not_share_parser_state() {
+        let first = test_deserializer();
+        let second = first.clone();
+
+        // `first` is left mid-document, with an unterminated object.
+        assert_eq!(parse_ok(&first, r#"{"meta": {"source": "#), 0);
+
+        // `second` must see a clean parser: a whole document decodes normally.
+        assert_eq!(
+            parse_ok(&second, r#"{"meta": {"source": "foo"}}"#),
+            1,
+            "a clone inherited another parser's half-open document"
+        );
+    }
+
+    /// The mirror of the above: one client's bytes must not be able to complete another's
+    /// half-open object, which would forge an event out of two senders' data.
+    #[test]
+    fn a_clone_cannot_complete_another_clones_document() {
+        let victim = test_deserializer();
+        let attacker = victim.clone();
+
+        assert_eq!(parse_ok(&victim, r#"{"meta": {"source": "#), 0);
+
+        // On a shared parser these bytes would close the victim's half-open object and emit an
+        // event stitched from two senders. On its own the fragment is not valid JSON, so an error
+        // is the expected outcome; what matters is that no event is produced either way.
+        let emitted = attacker
+            .parse(Bytes::from(r#""spoofed"}}"#), LogNamespace::Vector)
+            .map(|events| events.len())
+            .unwrap_or(0);
+        assert_eq!(
+            emitted, 0,
+            "one clone completed another clone's document, forging an event"
+        );
+    }
+
+    /// A malformed frame must not wedge the parser: actson cannot resynchronise after a syntax
+    /// error, and parse errors are continuable, so without a reset every later frame on this
+    /// stream would fail forever.
+    #[test]
+    fn parser_recovers_after_a_malformed_frame() {
+        let deserializer = test_deserializer();
+
+        assert_eq!(parse_ok(&deserializer, r#"{"meta": {"source": "foo"}}"#), 1);
+
+        assert!(
+            deserializer
+                .parse(Bytes::from("xxx not json xxx"), LogNamespace::Vector)
+                .is_err(),
+            "a malformed frame should be reported as an error"
+        );
+
+        assert_eq!(
+            parse_ok(&deserializer, r#"{"meta": {"source": "bar"}}"#),
+            1,
+            "the parser stayed wedged after a malformed frame"
+        );
+    }
+
+    /// Residue from an abandoned document must not leak into the next one — a disconnect
+    /// mid-object leaves `path` and `value_stack` populated.
+    #[test]
+    fn abandoned_document_does_not_corrupt_the_next_one() {
+        let deserializer = test_deserializer();
+
+        assert_eq!(parse_ok(&deserializer, r#"{"meta": {"source": "#), 0);
+        assert!(deserializer
+            .parse(Bytes::from("!!!"), LogNamespace::Vector)
+            .is_err());
+
+        let events = deserializer
+            .parse(
+                Bytes::from(r#"{"meta": {"source": "clean"}}"#),
+                LogNamespace::Vector,
+            )
+            .expect("should parse after the reset");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].as_log()["expr"], "meta".into());
+    }
+
+    /// The feature must survive the fix: a document split across frames still decodes within one
+    /// parser. Isolation must not be achieved by simply resetting on every call.
+    #[test]
+    fn a_document_split_across_frames_still_decodes() {
+        let deserializer = test_deserializer();
+
+        assert_eq!(parse_ok(&deserializer, r#"{"meta": {"sou"#), 0);
+        assert_eq!(
+            parse_ok(&deserializer, r#"rce": "foo"}}"#),
+            1,
+            "streaming across frames broke"
+        );
+    }
+
 }
