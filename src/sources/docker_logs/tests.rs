@@ -189,6 +189,31 @@ mod partial_merge_bounds {
         );
         assert!(default_max_merged_line_bytes() > 0);
     }
+
+    // The budget check used to run only once a merge state already existed, so a first partial
+    // frame that alone exceeded the budget was buffered unchecked instead of being flushed.
+    #[test]
+    fn oversized_first_frame_is_flushed_immediately() {
+        let max_merged_line_bytes = 10;
+        let frame_payload = "c".repeat(1000);
+        let mut harness = Harness::new(max_merged_line_bytes);
+
+        let event = harness.feed(&frame_payload, false).expect(
+            "a first frame already over budget must be flushed immediately, not buffered unchecked",
+        );
+
+        assert_eq!(message_of(&event), frame_payload, "no data must be lost");
+        assert_eq!(
+            harness.buffered_bytes(),
+            0,
+            "the merge state must be cleared once the oversized first frame is flushed"
+        );
+        assert_eq!(
+            event.get(event::PARTIAL).map(|v| v == &Value::from(true)),
+            Some(true),
+            "the flushed fragment continues in the next event, so it must be marked partial"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "docker-logs-integration-tests"))]

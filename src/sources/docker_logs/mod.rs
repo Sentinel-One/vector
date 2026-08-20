@@ -1195,32 +1195,39 @@ impl ContainerLogInfo {
             // accumulated has outgrown its budget, in which case emit what we have.
             if is_partial {
                 // If we already have a partial event merge state, the current
-                // message has to be merged into that existing state.
-                // Otherwise, create a new partial event merge state with the
-                // current message being the initial one.
-                let Some(merge_state) = partial_event_merge_state.as_mut() else {
-                    *partial_event_merge_state = Some(LogEventMergeState::new(log));
-                    return None;
-                };
-
-                // Depending on the log namespace the actual contents of the log "message" will be
-                // found in either the root of the event ("."), or at the globally configured "message_key".
-                match log_namespace {
-                    LogNamespace::Vector => {
-                        merge_state.merge_in_next_event(log, &["."]);
+                // message has to be merged into that existing state. Otherwise,
+                // start a new one with the current message as the initial one -
+                // still subject to the same budget check below, since a single
+                // first frame can already exceed it.
+                match partial_event_merge_state.as_mut() {
+                    Some(merge_state) => {
+                        // Depending on the log namespace the actual contents of the log "message" will be
+                        // found in either the root of the event ("."), or at the globally configured "message_key".
+                        match log_namespace {
+                            LogNamespace::Vector => {
+                                merge_state.merge_in_next_event(log, &["."]);
+                            }
+                            LogNamespace::Legacy => {
+                                merge_state.merge_in_next_event(
+                                    log,
+                                    &[log_schema()
+                                        .message_key()
+                                        .expect("global log_schema.message_key to be valid path")
+                                        .to_string()],
+                                );
+                            }
+                        }
                     }
-                    LogNamespace::Legacy => {
-                        merge_state.merge_in_next_event(
-                            log,
-                            &[log_schema()
-                                .message_key()
-                                .expect("global log_schema.message_key to be valid path")
-                                .to_string()],
-                        );
+                    None => {
+                        *partial_event_merge_state = Some(LogEventMergeState::new(log));
                     }
                 }
 
-                if merge_state.merged_bytes() <= max_merged_line_bytes {
+                let merged_bytes = partial_event_merge_state
+                    .as_ref()
+                    .expect("just set above")
+                    .merged_bytes();
+                if merged_bytes <= max_merged_line_bytes {
                     return None;
                 }
 

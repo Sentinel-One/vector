@@ -2942,7 +2942,7 @@ mod tests {
         fn gzip_bomb() -> Vec<u8> {
             use std::io::Write as _;
 
-            use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+            use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());

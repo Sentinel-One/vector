@@ -2,7 +2,7 @@ use bytes::Bytes;
 use vector_lib::configurable::configurable_component;
 
 use super::{Compression, Decompressor};
-use vector_common::decompression::CompressionLimits;
+use vector_common::limits::CompressionLimits;
 
 /// Controls how much detail is logged when a sink's HTTP request is rejected.
 #[configurable_component]

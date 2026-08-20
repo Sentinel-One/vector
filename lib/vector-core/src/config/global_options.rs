@@ -1,7 +1,7 @@
 use std::{fs::DirBuilder, path::PathBuf, time::Duration};
 
 use snafu::{ResultExt, Snafu};
-use vector_common::decompression::OperationalLimits;
+use vector_common::limits::OperationalLimits;
 use vector_common::TimeZone;
 use crate::chkpts::StoreConfig as CheckpointConfig;
 use vector_config::configurable_component;

@@ -44,13 +44,6 @@ pub use vector_lib::net::*;
 
 pub const MAX_IN_FLIGHT_EVENTS_TARGET: usize = 100_000;
 
-/// How long to wait for a peer to accept an acknowledgement before dropping the connection.
-///
-/// `write_all` progresses only as the peer's TCP receive window opens, so a peer that simply
-/// stops calling `recv()` parks the write - and with it the task, socket and fd - indefinitely.
-/// Generous enough that a merely slow client is never dropped.
-const ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub async fn try_bind_tcp_listener(
     addr: SocketListenAddr,
     mut listenfd: ListenFd,
@@ -111,6 +104,8 @@ where
         log_namespace: LogNamespace,
     ) -> crate::Result<crate::sources::Source> {
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
+        let ack_write_timeout =
+            Duration::from_secs(cx.globals.limits.connection.ack_write_timeout_secs);
 
         Ok(Box::pin(async move {
             let listenfd = ListenFd::from_env();
@@ -201,6 +196,7 @@ where
                                 tls_client_metadata_key.clone(),
                                 source_name,
                                 log_namespace,
+                                ack_write_timeout,
                             );
 
                             tokio::spawn(
@@ -235,6 +231,7 @@ async fn handle_stream<T>(
     tls_client_metadata_key: Option<OwnedValuePath>,
     source_name: &'static str,
     log_namespace: LogNamespace,
+    ack_write_timeout: Duration,
 ) where
     <<T as TcpSource>::Decoder as tokio_util::codec::Decoder>::Item: std::marker::Send,
     T: TcpSource,
@@ -397,24 +394,19 @@ async fn handle_stream<T>(
                                     // Releasing the permit stops the source-wide freeze but would
                                     // still leak this task, its socket and its fd to a peer that
                                     // never drains. Time the write out and treat expiry as fatal.
-                                    match tokio::time::timeout(ACK_WRITE_TIMEOUT, stream.write_all(&ack_bytes)).await {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(error)) => {
-                                            emit!(TcpSendAckError{ error });
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            emit!(TcpSendAckError {
-                                                error: io::Error::new(
-                                                    io::ErrorKind::TimedOut,
-                                                    format!(
-                                                        "peer did not accept the acknowledgement within {}s",
-                                                        ACK_WRITE_TIMEOUT.as_secs()
-                                                    ),
-                                                ),
-                                            });
-                                            break;
-                                        }
+                                    let write_result = match tokio::time::timeout(ack_write_timeout, stream.write_all(&ack_bytes)).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            format!(
+                                                "peer did not accept the acknowledgement within {}s",
+                                                ack_write_timeout.as_secs()
+                                            ),
+                                        )),
+                                    };
+                                    if let Err(error) = write_result {
+                                        emit!(TcpSendAckError { error });
+                                        break;
                                     }
                                 }
                                 if ack != TcpSourceAck::Ack {

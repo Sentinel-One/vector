@@ -4,7 +4,8 @@ use std::{io, io::Read, io::BufWriter};
 
 use bytes::{BufMut, BytesMut, Bytes, Buf};
 use flate2::write::{GzEncoder, ZlibEncoder};
-use vector_common::decompression::{CappedDecoder, CompressionLimits};
+use vector_common::decompression::CappedDecoder;
+use vector_common::limits::CompressionLimits;
 use crate::sink::compression::Compression;
 use super::{
     snappy::SnappyEncoder, snappy::SnappyDecoder,
@@ -246,7 +247,7 @@ impl From<(Compression, CompressionLimits)> for Decompressor {
 
 #[cfg(test)]
 mod tests {
-    use vector_common::decompression::CompressionLimits;
+    use vector_common::limits::CompressionLimits;
     use std::io::Write;
 
     use crate::sink::compression::CompressionLevel;

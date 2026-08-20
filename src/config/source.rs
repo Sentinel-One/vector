@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use vector_common::decompression::OperationalLimitsOverride;
+use vector_common::limits::OperationalLimitsOverride;
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;

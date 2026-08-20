@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use vector_common::decompression::OperationalLimitsOverride;
+use vector_common::limits::OperationalLimitsOverride;
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;

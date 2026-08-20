@@ -12,7 +12,8 @@
 use std::io;
 
 use snap::raw::{decompress_len, Decoder, Encoder};
-use vector_common::decompression::{CompressionLimits, DecompressedSizeLimitExceeded};
+use vector_common::decompression::DecompressedSizeLimitExceeded;
+use vector_common::limits::CompressionLimits;
 
 pub struct SnappyEncoder<W: io::Write> {
     writer: W,
