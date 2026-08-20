@@ -99,7 +99,10 @@ async fn listen(
 
                 let payload = buf.split_to(byte_size);
 
-                let mut stream = FramedRead::new(payload.as_ref(), decoder.clone());
+                // Unix datagram sockets have no IP-based peer identity to scope Netflow templates
+                // to, so each datagram gets its own fresh scope instead — `clone_for_connection`
+                // is a no-op for every other framer.
+                let mut stream = FramedRead::new(payload.as_ref(), decoder.clone_for_connection());
 
                 loop {
                     match stream.next().await {

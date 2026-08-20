@@ -8,7 +8,6 @@ mod common;
 pub mod decoding;
 pub mod encoding;
 pub mod gelf;
-pub mod max_length;
 
 pub use decoding::{
     BytesDecoder, BytesDecoderConfig, BytesDeserializer, BytesDeserializerConfig,

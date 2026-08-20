@@ -122,6 +122,7 @@ impl SourceConfig for SocketConfig {
                     decoding,
                     log_namespace,
                 )
+                .with_operational_limits(cx.globals.limits)
                 .build()?;
 
                 let tcp = tcp::RawTcpSource::new(config.clone(), decoder, log_namespace);
@@ -155,7 +156,9 @@ impl SourceConfig for SocketConfig {
                     .framing()
                     .clone()
                     .unwrap_or_else(|| decoding.default_message_based_framing());
-                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build()?;
+                let decoder = DecodingConfig::new(framing, decoding, log_namespace)
+                    .with_operational_limits(cx.globals.limits)
+                    .build()?;
                 Ok(udp::udp(
                     config,
                     decoder,
@@ -172,7 +175,9 @@ impl SourceConfig for SocketConfig {
                     .framing
                     .clone()
                     .unwrap_or_else(|| decoding.default_message_based_framing());
-                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build()?;
+                let decoder = DecodingConfig::new(framing, decoding, log_namespace)
+                    .with_operational_limits(cx.globals.limits)
+                    .build()?;
 
                 unix::unix_datagram(config, decoder, cx.shutdown, cx.out, log_namespace)
             }
@@ -189,6 +194,7 @@ impl SourceConfig for SocketConfig {
                     decoding,
                     log_namespace,
                 )
+                .with_operational_limits(cx.globals.limits)
                 .build()?;
 
                 unix::unix_stream(config, decoder, cx.shutdown, cx.out, log_namespace)

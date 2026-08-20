@@ -1,6 +1,6 @@
 use crate::decoding::{DeserializerConfig, FramingConfig};
 use serde::{Deserialize, Serialize};
-use vector_common::decompression::CompressionLimits;
+use vector_common::decompression::OperationalLimits;
 use vector_core::config::LogNamespace;
 
 use super::Decoder;
@@ -14,18 +14,18 @@ pub struct DecodingConfig {
     decoding: DeserializerConfig,
     /// The namespace used when decoding.
     log_namespace: LogNamespace,
-    /// Limits applied by framers that decompress.
+    /// Limits applied by framers that decompress or buffer an incomplete frame.
     ///
-    /// Defaults to the documented cap; a component with access to its context should override this
-    /// with `GlobalOptions`' value via [`Self::with_compression_limits`].
+    /// Defaults to the documented caps; a component with access to its context should override
+    /// this with `GlobalOptions`' value via [`Self::with_operational_limits`].
     #[serde(default, skip)]
-    compression_limits: CompressionLimits,
+    operational_limits: OperationalLimits,
 }
 
 impl DecodingConfig {
     /// Creates a new `DecodingConfig` with the provided `FramingConfig` and
     /// `DeserializerConfig`.
-    pub const fn new(
+    pub fn new(
         framing: FramingConfig,
         decoding: DeserializerConfig,
         log_namespace: LogNamespace,
@@ -34,19 +34,17 @@ impl DecodingConfig {
             framing,
             decoding,
             log_namespace,
-            compression_limits: CompressionLimits::with_max_decompressed_size_bytes(
-                vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES,
-            ),
+            operational_limits: OperationalLimits::default(),
         }
     }
 
-    /// Sets the compression limits framers should decompress under.
+    /// Sets the operational limits framers should run under.
     ///
-    /// Take these from the component's context (`cx.globals.limits.compression`) so the deployment
-    /// controls the cap rather than a process-wide default.
+    /// Take these from the component's context (`cx.globals.limits`) so the deployment controls
+    /// the caps rather than a process-wide default.
     #[must_use]
-    pub const fn with_compression_limits(mut self, limits: CompressionLimits) -> Self {
-        self.compression_limits = limits;
+    pub const fn with_operational_limits(mut self, limits: OperationalLimits) -> Self {
+        self.operational_limits = limits;
         self
     }
 
@@ -63,7 +61,7 @@ impl DecodingConfig {
     /// Builds a `Decoder` from the provided configuration.
     pub fn build(&self) -> vector_common::Result<Decoder> {
         // Build the framer.
-        let framer = self.framing.build(self.compression_limits);
+        let framer = self.framing.build(self.operational_limits);
 
         // Build the deserializer.
         let deserializer = self.decoding.build()?;

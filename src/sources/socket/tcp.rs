@@ -4,7 +4,7 @@ use vector_lib::ipallowlist::IpAllowlistConfig;
 use chrono::Utc;
 use serde_with::serde_as;
 use smallvec::SmallVec;
-use vector_lib::codecs::decoding::{DeserializerConfig, Framer, FramingConfig};
+use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
 use vector_lib::config::{LegacyKey, LogNamespace};
 use vector_lib::configurable::configurable_component;
 use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path};
@@ -213,14 +213,8 @@ impl TcpSource for RawTcpSource {
     type Acker = TcpNullAcker;
 
     fn decoder(&self) -> Self::Decoder {
-        // Called once per accepted connection. Netflow templates are scoped to the connection so
-        // one peer cannot redefine the template ids another peer's records decode against;
-        // without this every connection would inherit the configured decoder's single scope.
-        let mut decoder = self.decoder.clone();
-        if let Framer::Netflow(netflow) = &mut decoder.framer {
-            netflow.set_new_connection_scope();
-        }
-        decoder
+        // Called once per accepted connection.
+        self.decoder.clone_for_connection()
     }
 
     fn handle_events(&self, events: &mut [Event], host: std::net::SocketAddr) {

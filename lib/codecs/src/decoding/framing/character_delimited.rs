@@ -6,7 +6,7 @@ use vector_config::configurable_component;
 
 use super::{BoxedFramingError, FramingError};
 use crate::decoding::StreamDecodingError;
-use crate::max_length::max_frame_length_bytes;
+use vector_common::decompression::{FramingLimits, DEFAULT_MAX_FRAME_LENGTH_BYTES};
 
 /// A frame exceeded `max_length`.
 ///
@@ -72,15 +72,18 @@ impl CharacterDelimitedDecoderConfig {
         }
     }
     /// Build the `CharacterDelimitedDecoder` from this configuration.
-    pub fn build(&self) -> CharacterDelimitedDecoder {
-        if let Some(max_length) = self.character_delimited.max_length {
-            CharacterDelimitedDecoder::new_with_max_length(
-                self.character_delimited.delimiter,
-                max_length,
-            )
-        } else {
-            CharacterDelimitedDecoder::new(self.character_delimited.delimiter)
-        }
+    ///
+    /// Falls back to `limits.max_frame_length_bytes` (the deployment's configured cap) when this
+    /// component has not set its own `max_length`.
+    pub fn build(&self, limits: FramingLimits) -> CharacterDelimitedDecoder {
+        let max_length = self
+            .character_delimited
+            .max_length
+            .unwrap_or(limits.max_frame_length_bytes);
+        CharacterDelimitedDecoder::new_with_max_length(
+            self.character_delimited.delimiter,
+            max_length,
+        )
     }
 }
 
@@ -97,9 +100,10 @@ pub struct CharacterDelimitedDecoderOptions {
     ///
     /// This length does *not* include the trailing delimiter.
     ///
-    /// Defaults to the global frame length cap, set by `--max-frame-length-bytes` (or
-    /// `VECTOR_MAX_FRAME_LENGTH_BYTES`), which is 100 KiB unless overridden. Set this to override
-    /// the cap for this component alone.
+    /// Defaults to the deployment's configured frame length cap
+    /// (`limits.framing.max_frame_length_bytes`, 1 MiB unless overridden). Set this field to
+    /// override the cap for this component alone; unlike `sources.<name>.limits.framing`, it is
+    /// applied exactly as given, not clamped by `--allow-component-limit-overrides`.
     ///
     /// A frame longer than the limit is a fatal decode error and the connection is reset, whether
     /// or not its delimiter had arrived.
@@ -127,10 +131,14 @@ pub struct CharacterDelimitedDecoder {
 }
 
 impl CharacterDelimitedDecoder {
-    /// Creates a `CharacterDelimitedDecoder` with the specified delimiter, using the global frame
-    /// length cap (see [`crate::max_length`]).
-    pub fn new(delimiter: u8) -> Self {
-        Self::new_with_max_length(delimiter, max_frame_length_bytes())
+    /// Creates a `CharacterDelimitedDecoder` with the specified delimiter, using the documented
+    /// default frame length cap.
+    ///
+    /// Callers that have access to a component's context (i.e. everything reached through
+    /// [`CharacterDelimitedDecoderConfig::build`]) should prefer that instead, so the deployment's
+    /// configured limit applies rather than this hardcoded default.
+    pub const fn new(delimiter: u8) -> Self {
+        Self::new_with_max_length(delimiter, DEFAULT_MAX_FRAME_LENGTH_BYTES)
     }
 
     /// Creates a `CharacterDelimitedDecoder` with a maximum frame length limit.
@@ -382,15 +390,31 @@ mod tests {
         );
     }
 
-    /// `new()` must pick up the global cap rather than the old unbounded default.
+    /// `new()` must pick up the documented default cap rather than the old unbounded default.
     #[test]
-    fn new_uses_the_global_frame_length_cap() {
+    fn new_uses_the_default_frame_length_cap() {
         let codec = CharacterDelimitedDecoder::new(b'\n');
-        assert_eq!(
-            codec.max_length(),
-            crate::max_length::max_frame_length_bytes()
-        );
+        assert_eq!(codec.max_length(), DEFAULT_MAX_FRAME_LENGTH_BYTES);
         assert_ne!(codec.max_length(), usize::MAX);
+    }
+
+    /// `build()` must fall back to the deployment's configured cap, not the hardcoded default,
+    /// when the component has not set its own `max_length`.
+    #[test]
+    fn build_falls_back_to_the_deployment_configured_cap() {
+        let config = CharacterDelimitedDecoderConfig::new(b'\n');
+        let codec = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        assert_eq!(codec.max_length(), 4096);
+    }
+
+    /// An explicit `max_length` on the component always wins over the deployment's cap.
+    #[test]
+    fn build_prefers_an_explicit_max_length_over_the_deployment_cap() {
+        let config = CharacterDelimitedDecoderConfig {
+            character_delimited: CharacterDelimitedDecoderOptions::new(b'\n', Some(64)),
+        };
+        let codec = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        assert_eq!(codec.max_length(), 64);
     }
 
     #[test]

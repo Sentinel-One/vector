@@ -6,7 +6,7 @@ use ipnet::IpNet;
 use listenfd::ListenFd;
 use tokio_util::codec::FramedRead;
 use vector_lib::codecs::{
-    decoding::{DeserializerConfig, Framer, FramingConfig},
+    decoding::{DeserializerConfig, FramingConfig},
     StreamDecodingError,
 };
 use vector_lib::configurable::configurable_component;
@@ -219,13 +219,7 @@ pub(super) fn udp(
                     bytes_received.emit(ByteSize(byte_size));
                     let payload = buf.split_to(byte_size);
                     let truncated = byte_size == max_length + 1;
-                    // Scope netflow templates to the sending exporter. Without this every peer
-                    // shares one template cache, so any host able to reach this port could
-                    // redefine the template ids another exporter's data records decode against.
-                    let mut datagram_decoder = decoder.clone();
-                    if let Framer::Netflow(netflow) = &mut datagram_decoder.framer {
-                        netflow.set_datagram_peer(address.ip());
-                    }
+                    let datagram_decoder = decoder.clone_for_datagram_peer(address.ip());
                     let mut stream = FramedRead::new(payload.as_ref(), datagram_decoder).peekable();
 
                     while let Some(result) = stream.next().await {
