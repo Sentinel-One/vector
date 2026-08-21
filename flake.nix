@@ -66,6 +66,8 @@
               ''}
             elif [[ "${system}" == *"darwin"* ]]; then
               export RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld'
+              export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+              export TESTCONTAINERS_RYUK_DISABLED=true
               # rdkafka-sys builds librdkafka.dylib which links vendored libsasl2.a (with GSSAPI).
               # On macOS, dylib links must resolve all symbols; the MIT Kerberos symbols
               # (_krb5_gss_register_acceptor_identity, _GSS_C_SEC_CONTEXT_SASL_SSF, etc.) are

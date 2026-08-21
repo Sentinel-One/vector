@@ -31,7 +31,7 @@ testcontainers-modules = { version = "0.7", features = ["postgres"], optional = 
 
 [features]
 default = []
-pg-integration-tests = ["dep:testcontainers-modules"]
+integration-tests = ["dep:testcontainers-modules"]
 
 [dev-dependencies]
 assert_matches = { version = "1.5" }
