@@ -1922,4 +1922,18 @@ op = "explode"
         let events = parse_all(&config, r#"{"a": {"b": 5, "c": 6}}"#);
         assert_eq!(events, vec![("a.b".to_string(), Value::from(5))]);
     }
+
+    #[test]
+    fn test_top_level_array_emits_nothing_and_does_not_underflow_path() {
+        let config = wildcard_config(&[(".", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"[1, 2, 3]"#);
+        assert_eq!(events, vec![]);
+    }
+
+    #[test]
+    fn test_top_level_array_does_not_corrupt_path_for_following_object() {
+        let config = wildcard_config(&[("a", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"[1, 2, 3]{"a": 5}"#);
+        assert_eq!(events, vec![("a".to_string(), Value::from(5))]);
+    }
 }
