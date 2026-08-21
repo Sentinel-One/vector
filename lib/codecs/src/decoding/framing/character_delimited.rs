@@ -6,7 +6,7 @@ use vector_config::configurable_component;
 
 use super::{BoxedFramingError, FramingError};
 use crate::decoding::StreamDecodingError;
-use vector_common::decompression::{FramingLimits, DEFAULT_MAX_FRAME_LENGTH_BYTES};
+use vector_common::limits::{FramingLimits, DEFAULT_MAX_FRAME_LENGTH_BYTES};
 
 /// A frame exceeded `max_length`.
 ///

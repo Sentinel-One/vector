@@ -104,6 +104,8 @@ where
         log_namespace: LogNamespace,
     ) -> crate::Result<crate::sources::Source> {
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
+        let ack_write_timeout =
+            Duration::from_secs(cx.globals.limits.connection.ack_write_timeout_secs);
 
         Ok(Box::pin(async move {
             let listenfd = ListenFd::from_env();
@@ -194,6 +196,7 @@ where
                                 tls_client_metadata_key.clone(),
                                 source_name,
                                 log_namespace,
+                                ack_write_timeout,
                             );
 
                             tokio::spawn(
@@ -228,6 +231,7 @@ async fn handle_stream<T>(
     tls_client_metadata_key: Option<OwnedValuePath>,
     source_name: &'static str,
     log_namespace: LogNamespace,
+    ack_write_timeout: Duration,
 ) where
     <<T as TcpSource>::Decoder as tokio_util::codec::Decoder>::Item: std::marker::Send,
     T: TcpSource,
@@ -376,10 +380,32 @@ async fn handle_stream<T>(
                                             }
                                         }
                                 };
+                                // The permit bounds in-flight *decoded events*, and that work is
+                                // finished: the batch is in the pipeline and has been acknowledged.
+                                // Holding it across the ack write lets a peer that stops reading pin
+                                // it forever, because `write_all` makes progress only as the peer's
+                                // TCP receive window opens. Permits are replenished (and grown) only
+                                // on drop and one limiter is shared per source, so a couple of such
+                                // connections freeze ingestion for every other client.
+                                drop(permit.take());
+
                                 if let Some(ack_bytes) = acker.build_ack(ack){
                                     let stream = reader.get_mut().get_mut();
-                                    if let Err(error) = stream.write_all(&ack_bytes).await {
-                                        emit!(TcpSendAckError{ error });
+                                    // Releasing the permit stops the source-wide freeze but would
+                                    // still leak this task, its socket and its fd to a peer that
+                                    // never drains. Time the write out and treat expiry as fatal.
+                                    let write_result = match tokio::time::timeout(ack_write_timeout, stream.write_all(&ack_bytes)).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            format!(
+                                                "peer did not accept the acknowledgement within {}s",
+                                                ack_write_timeout.as_secs()
+                                            ),
+                                        )),
+                                    };
+                                    if let Err(error) = write_result {
+                                        emit!(TcpSendAckError { error });
                                         break;
                                     }
                                 }

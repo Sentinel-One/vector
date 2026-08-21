@@ -1,6 +1,6 @@
 use crate::decoding::{DeserializerConfig, FramingConfig};
 use serde::{Deserialize, Serialize};
-use vector_common::decompression::OperationalLimits;
+use vector_common::limits::OperationalLimits;
 use vector_core::config::LogNamespace;
 
 use super::Decoder;

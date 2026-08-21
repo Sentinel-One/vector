@@ -11,7 +11,7 @@ use tokio::{
     time::{timeout, Duration},
 };
 use tracing::Instrument;
-use vector_common::decompression::OperationalLimitsOverride;
+use vector_common::limits::OperationalLimitsOverride;
 use vector_config::NamedComponent;
 use vector_lib::config::GlobalOptions;
 use vector_lib::config::LogNamespace;
@@ -1140,7 +1140,7 @@ fn resolve_globals(
 
 #[cfg(test)]
 mod limit_override_tests {
-    use vector_common::decompression::{
+    use vector_common::limits::{
         CompressionLimits, CompressionLimitsOverride, OperationalLimits, OperationalLimitsOverride,
     };
 

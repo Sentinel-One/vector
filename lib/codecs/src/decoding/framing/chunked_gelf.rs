@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use vector_common::constants::{GZIP_MAGIC, ZLIB_MAGIC};
-use vector_common::decompression::{CappedDecoder, CompressionLimits};
+use vector_common::decompression::CappedDecoder;
+use vector_common::limits::CompressionLimits;
 use vector_config::configurable_component;
 
 const GELF_MAGIC: &[u8] = &[0x1e, 0x0f];
@@ -1287,7 +1288,7 @@ mod tests {
     /// is enough to exceed it — no single oversized member required.
     #[test]
     fn gzip_decompression_is_capped() {
-        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+        use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
         let member = Compression::Gzip.compress(&vec![0u8; 1024 * 1024]);
         let members = DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1;
@@ -1320,7 +1321,7 @@ mod tests {
     fn zlib_decompression_is_capped() {
         use std::io::Write as IoWrite;
 
-        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+        use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
         let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         let chunk = vec![0u8; 1024 * 1024];

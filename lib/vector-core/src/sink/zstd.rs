@@ -1,7 +1,8 @@
 use std::fmt::Display;
 use std::io;
 use std::io::{Read, Write};
-use vector_common::decompression::{CappedDecoder, CappedZstdReader, CompressionLimits};
+use vector_common::decompression::{CappedDecoder, CappedZstdReader};
+use vector_common::limits::CompressionLimits;
 use crate::sink::compression::CompressionLevel;
 
 #[derive(Debug)]

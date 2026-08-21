@@ -17,7 +17,7 @@ use vector_lib::{
     request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
 };
 
-use vector_common::decompression::CompressionLimits;
+use vector_common::limits::CompressionLimits;
 use super::{ElasticsearchCommon, ElasticsearchConfig, RejectionReport};
 use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},

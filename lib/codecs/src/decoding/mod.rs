@@ -32,7 +32,7 @@ pub use framing::{
 };
 use smallvec::SmallVec;
 use std::fmt::Debug;
-use vector_common::decompression::OperationalLimits;
+use vector_common::limits::OperationalLimits;
 use vector_config::configurable_component;
 use vector_core::{
     config::{DataType, LogNamespace},

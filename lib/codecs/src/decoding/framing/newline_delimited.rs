@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use derivative::Derivative;
 use tokio_util::codec::Decoder;
-use vector_common::decompression::FramingLimits;
+use vector_common::limits::FramingLimits;
 use vector_config::configurable_component;
 
 use super::{BoxedFramingError, CharacterDelimitedDecoder};

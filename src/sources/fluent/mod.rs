@@ -735,6 +735,13 @@ impl Decoder for FluentEntryStreamDecoder {
     }
 }
 
+/// Fluentd's `chunk` is a base64-encoded unique id - 24 bytes in practice.
+///
+/// The ack echoes it back verbatim, so without a cap a client can make Vector write an
+/// arbitrarily large ack to a socket it never reads from, parking that write indefinitely.
+/// A single 1 MiB chunk id is enough to stall the very first `write_all`.
+const MAX_CHUNK_ID_BYTES: usize = 256;
+
 struct FluentAcker {
     chunks: Vec<String>,
 }
@@ -742,7 +749,24 @@ struct FluentAcker {
 impl FluentAcker {
     fn new(frames: &[FluentFrame]) -> Self {
         Self {
-            chunks: frames.iter().filter_map(|f| f.chunk.clone()).collect(),
+            chunks: frames
+                .iter()
+                .filter_map(|f| f.chunk.clone())
+                .filter(|chunk| {
+                    if chunk.len() > MAX_CHUNK_ID_BYTES {
+                        tracing::warn!(
+                            message =
+                                "Fluent chunk id exceeds the maximum length; not acknowledging it.",
+                            chunk_id_bytes = chunk.len(),
+                            max_chunk_id_bytes = MAX_CHUNK_ID_BYTES,
+                            internal_log_rate_limit = true,
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -1359,7 +1383,7 @@ mod tests {
         use std::collections::BTreeMap;
         use std::io::Write as _;
 
-        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+        use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
@@ -1432,6 +1456,87 @@ mod tests {
         assert_eq!(result.unwrap().unwrap(), output.len());
         let expected: Vec<u8> = vec![0x80]; // { }
         assert_eq!(output, expected);
+    }
+
+    // OBE-11555: the ack echoes the client-supplied chunk id verbatim, so an oversized id makes
+    // Vector write a huge ack to a socket the peer never reads - parking the write, and (before
+    // the permit was scoped to end first) pinning a request-limiter permit for the whole source.
+    mod ack_size_bounds {
+        use super::*;
+
+        fn frame_with_chunk(chunk: Option<String>) -> FluentFrame {
+            FluentFrame {
+                events: SmallVec::new(),
+                chunk,
+            }
+        }
+
+        fn ack_bytes_for(chunk: Option<String>) -> Option<Bytes> {
+            FluentAcker::new(&[frame_with_chunk(chunk)]).build_ack(TcpSourceAck::Ack)
+        }
+
+        #[test]
+        fn ordinary_chunk_id_is_acknowledged() {
+            // What a real fluent client sends: base64 of a uuid, 24 bytes.
+            let chunk = BASE64_STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+            assert!(chunk.len() <= MAX_CHUNK_ID_BYTES);
+
+            let ack = ack_bytes_for(Some(chunk.clone())).expect("a normal chunk id must be acked");
+            assert!(
+                ack.windows(chunk.len()).any(|w| w == chunk.as_bytes()),
+                "the ack must echo the chunk id back"
+            );
+        }
+
+        #[test]
+        fn chunk_id_at_the_cap_is_still_acknowledged() {
+            let chunk = "a".repeat(MAX_CHUNK_ID_BYTES);
+            assert!(
+                ack_bytes_for(Some(chunk)).is_some(),
+                "a chunk id exactly at the cap must be acked"
+            );
+        }
+
+        #[test]
+        fn oversized_chunk_id_is_not_echoed() {
+            let chunk = "a".repeat(MAX_CHUNK_ID_BYTES + 1);
+            assert!(
+                ack_bytes_for(Some(chunk)).is_none(),
+                "an over-cap chunk id must not produce an ack"
+            );
+        }
+
+        #[test]
+        fn ack_size_stays_bounded_for_a_huge_chunk_id() {
+            // The measured attack: one 1 MiB chunk id stalls the very first write_all, because a
+            // single ack exceeds the combined send and receive buffers.
+            let chunk = "a".repeat(1024 * 1024);
+
+            let ack_len = ack_bytes_for(Some(chunk)).map_or(0, |ack| ack.len());
+
+            assert!(
+                ack_len <= MAX_CHUNK_ID_BYTES + 64,
+                "a 1 MiB chunk id produced a {ack_len}-byte ack"
+            );
+        }
+
+        #[test]
+        fn oversized_chunk_id_does_not_suppress_a_valid_one() {
+            let good = BASE64_STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+            let acker = FluentAcker::new(&[
+                frame_with_chunk(Some("a".repeat(MAX_CHUNK_ID_BYTES + 1))),
+                frame_with_chunk(Some(good.clone())),
+            ]);
+
+            let ack = acker
+                .build_ack(TcpSourceAck::Ack)
+                .expect("the well-formed chunk id must still be acked");
+            assert!(
+                ack.windows(good.len()).any(|w| w == good.as_bytes()),
+                "the valid chunk id must be echoed even alongside an oversized one"
+            );
+            assert!(ack.len() <= MAX_CHUNK_ID_BYTES + 64);
+        }
     }
 
     async fn check_acknowledgements(

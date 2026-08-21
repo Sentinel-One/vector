@@ -23,6 +23,199 @@ fn exclude_self() {
     assert!(!source.exclude_self("a29d569bd46c"));
 }
 
+// OBE-11563: a container that writes without ever emitting a newline folds every frame into a
+// per-stream merge buffer and returns nothing to the pipeline, so bounded-channel backpressure
+// never engages and the buffer grows until the process dies.
+mod partial_merge_bounds {
+    use super::*;
+
+    const LOG_TIMESTAMP: &str = "2026-08-08T12:00:00.000000000Z";
+
+    fn container_log_info() -> ContainerLogInfo {
+        let created = DateTime::parse_from_rfc3339("2026-08-08T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        ContainerLogInfo::new(
+            ContainerId::new("test-container-id".to_owned()),
+            ContainerMetadata {
+                labels: HashMap::new(),
+                name: "/test".into(),
+                name_str: "/test".to_owned(),
+                image: "test-image".into(),
+                created_at: created,
+            },
+            created,
+        )
+    }
+
+    /// A frame as Docker delivers it: RFC3339 timestamp, a space, then the payload. Without a
+    /// trailing newline the source treats it as a partial line and merges it.
+    fn frame(payload: &str, terminated: bool) -> LogOutput {
+        let mut message = format!("{LOG_TIMESTAMP} {payload}");
+        if terminated {
+            message.push('\n');
+        }
+        LogOutput::StdOut {
+            message: Bytes::from(message),
+        }
+    }
+
+    struct Harness {
+        info: ContainerLogInfo,
+        bytes_received: Registered<BytesReceived>,
+        merge_state: Option<LogEventMergeState>,
+        max_merged_line_bytes: usize,
+    }
+
+    impl Harness {
+        fn new(max_merged_line_bytes: usize) -> Self {
+            Self {
+                info: container_log_info(),
+                bytes_received: register!(BytesReceived::from(Protocol::HTTP)),
+                merge_state: None,
+                max_merged_line_bytes,
+            }
+        }
+
+        fn feed(&mut self, payload: &str, terminated: bool) -> Option<LogEvent> {
+            self.info.new_event(
+                frame(payload, terminated),
+                Some(event::PARTIAL.to_string()),
+                true,
+                self.max_merged_line_bytes,
+                &mut self.merge_state,
+                &self.bytes_received,
+                LogNamespace::Legacy,
+            )
+        }
+
+        fn buffered_bytes(&self) -> usize {
+            self.merge_state
+                .as_ref()
+                .map_or(0, LogEventMergeState::merged_bytes)
+        }
+    }
+
+    fn message_of(event: &LogEvent) -> String {
+        String::from_utf8_lossy(&event.get("message").unwrap().coerce_to_bytes()).into_owned()
+    }
+
+    #[test]
+    fn unterminated_line_is_flushed_instead_of_buffered_forever() {
+        let max_merged_line_bytes = 4096;
+        let frame_payload = "a".repeat(512);
+        let mut harness = Harness::new(max_merged_line_bytes);
+
+        let mut emitted = Vec::new();
+        let mut high_water = 0;
+        for _ in 0..200 {
+            if let Some(event) = harness.feed(&frame_payload, false) {
+                emitted.push(event);
+            }
+            high_water = high_water.max(harness.buffered_bytes());
+        }
+
+        assert!(
+            !emitted.is_empty(),
+            "a line that never terminates must still be emitted"
+        );
+        assert!(
+            high_water <= max_merged_line_bytes,
+            "the merge buffer reached {high_water} bytes against a {max_merged_line_bytes}-byte budget"
+        );
+    }
+
+    #[test]
+    fn flushed_events_carry_the_partial_marker_and_lose_no_data() {
+        let max_merged_line_bytes = 2048;
+        let frame_payload = "b".repeat(512);
+        let mut harness = Harness::new(max_merged_line_bytes);
+
+        let mut emitted = Vec::new();
+        for _ in 0..20 {
+            if let Some(event) = harness.feed(&frame_payload, false) {
+                emitted.push(event);
+            }
+        }
+        // Terminate the line so the tail is emitted too.
+        if let Some(event) = harness.feed(&frame_payload, true) {
+            emitted.push(event);
+        }
+
+        assert!(emitted.len() > 1, "the line should have been split");
+
+        // Every event except the last continues into the next one, so each is marked partial.
+        for event in &emitted[..emitted.len() - 1] {
+            assert_eq!(
+                event.get(event::PARTIAL).map(|v| v == &Value::from(true)),
+                Some(true),
+                "a flushed fragment must be marked partial so consumers can rejoin it"
+            );
+        }
+
+        // No payload bytes were dropped by the split.
+        let recovered: usize = emitted.iter().map(|event| message_of(event).len()).sum();
+        assert_eq!(
+            recovered,
+            frame_payload.len() * 21,
+            "splitting the line must not lose data"
+        );
+    }
+
+    #[test]
+    fn ordinary_multi_frame_line_still_merges_into_one_event() {
+        let mut harness = Harness::new(default_max_merged_line_bytes());
+
+        assert!(harness.feed("hel", false).is_none());
+        assert!(harness.feed("lo ", false).is_none());
+        let event = harness
+            .feed("world", true)
+            .expect("the terminated line should be emitted as a single event");
+
+        assert_eq!(message_of(&event), "hello world");
+        assert!(
+            event.get(event::PARTIAL).is_none(),
+            "a line that fit within the budget is not partial"
+        );
+        assert!(harness.merge_state.is_none(), "merge state should be reset");
+    }
+
+    #[test]
+    fn default_budget_is_finite() {
+        assert_eq!(
+            DockerLogsConfig::default().max_merged_line_bytes,
+            default_max_merged_line_bytes()
+        );
+        assert!(default_max_merged_line_bytes() > 0);
+    }
+
+    // The budget check used to run only once a merge state already existed, so a first partial
+    // frame that alone exceeded the budget was buffered unchecked instead of being flushed.
+    #[test]
+    fn oversized_first_frame_is_flushed_immediately() {
+        let max_merged_line_bytes = 10;
+        let frame_payload = "c".repeat(1000);
+        let mut harness = Harness::new(max_merged_line_bytes);
+
+        let event = harness.feed(&frame_payload, false).expect(
+            "a first frame already over budget must be flushed immediately, not buffered unchecked",
+        );
+
+        assert_eq!(message_of(&event), frame_payload, "no data must be lost");
+        assert_eq!(
+            harness.buffered_bytes(),
+            0,
+            "the merge state must be cleared once the oversized first frame is flushed"
+        );
+        assert_eq!(
+            event.get(event::PARTIAL).map(|v| v == &Value::from(true)),
+            Some(true),
+            "the flushed fragment continues in the next event, so it must be marked partial"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "docker-logs-integration-tests"))]
 mod integration_tests {
     use bollard::{

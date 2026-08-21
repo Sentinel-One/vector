@@ -30,7 +30,7 @@ use crate::{
         UriParseSnafu,
     },
 };
-use vector_common::decompression::CompressionLimits;
+use vector_common::limits::CompressionLimits;
 
 pub struct HecRejectionContext {
     pub rejected: Counter,
@@ -372,7 +372,7 @@ impl HttpRequestBuilder {
 
 #[cfg(test)]
 mod tests {
-    use vector_common::decompression::CompressionLimits;
+    use vector_common::limits::CompressionLimits;
 
     use std::{
         collections::HashMap,

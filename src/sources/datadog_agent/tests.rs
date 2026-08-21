@@ -14,7 +14,7 @@ use ordered_float::NotNan;
 use prost::Message;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use similar_asserts::assert_eq;
-use vector_common::decompression::CompressionLimits;
+use vector_common::limits::CompressionLimits;
 use vector_lib::{
     codecs::{decoding::CharacterDelimitedDecoderOptions, CharacterDelimitedDecoderConfig},
     lookup::{owned_value_path, OwnedTargetPath},
@@ -2646,10 +2646,10 @@ mod decompression_caps {
     use std::io::Write as _;
 
     use similar_asserts::assert_eq;
-    use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+    use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
     use super::*;
-    use vector_common::decompression::CompressionLimits;
+    use vector_common::limits::CompressionLimits;
     use crate::sources::datadog_agent::DatadogAgentSource;
 
     fn test_source() -> DatadogAgentSource {

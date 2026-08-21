@@ -144,6 +144,19 @@ pub struct DockerLogsConfig {
     /// Enables automatic merging of partial events.
     auto_partial_merge: bool,
 
+    /// The maximum size, in bytes, that a single merged log line may reach before it is emitted.
+    ///
+    /// Only applies when `auto_partial_merge` is enabled. A container that writes without ever
+    /// emitting a newline would otherwise grow the per-stream merge buffer without limit: partial
+    /// frames are folded in and nothing is returned to the pipeline, so bounded-channel
+    /// backpressure never engages. On reaching this size the accumulated line is emitted (marked
+    /// with `partial_event_marker_field`, since the line continues) and merging restarts, so no
+    /// data is lost - an over-long line is split across several events rather than buffered.
+    #[serde(default = "default_max_merged_line_bytes")]
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    #[configurable(metadata(docs::human_name = "Max Merged Line Size"))]
+    max_merged_line_bytes: usize,
+
     /// The amount of time to wait before retrying after an error.
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_retry_backoff_secs")]
@@ -177,6 +190,7 @@ impl Default for DockerLogsConfig {
             include_images: None,
             partial_event_marker_field: default_partial_event_marker_field(),
             auto_partial_merge: true,
+            max_merged_line_bytes: default_max_merged_line_bytes(),
             multiline: None,
             retry_backoff_secs: default_retry_backoff_secs(),
             log_namespace: None,
@@ -186,6 +200,14 @@ impl Default for DockerLogsConfig {
 
 fn default_partial_event_marker_field() -> Option<String> {
     Some(event::PARTIAL.to_string())
+}
+
+/// Docker's json-file and local drivers split output into 16 KiB frames, so this allows a single
+/// logical line to span 64 of them - far more than any real log line - while capping the per-stream
+/// buffer. It also bounds the quadratic re-copy that merging performs: the cost of a merge cycle is
+/// a function of this limit rather than of how long a container keeps writing.
+const fn default_max_merged_line_bytes() -> usize {
+    1024 * 1024
 }
 
 const fn default_retry_backoff_secs() -> Duration {
@@ -765,6 +787,7 @@ impl EventStreamBuilder {
                         message,
                         core.config.partial_event_marker_field.clone(),
                         core.config.auto_partial_merge,
+                        core.config.max_merged_line_bytes,
                         &mut partial_event_merge_state,
                         &bytes_received,
                         self.log_namespace,
@@ -979,6 +1002,7 @@ impl ContainerLogInfo {
         log_output: LogOutput,
         partial_event_marker_field: Option<String>,
         auto_partial_merge: bool,
+        max_merged_line_bytes: usize,
         partial_event_merge_state: &mut Option<LogEventMergeState>,
         bytes_received: &Registered<BytesReceived>,
         log_namespace: LogNamespace,
@@ -1167,55 +1191,100 @@ impl ContainerLogInfo {
         let log = if auto_partial_merge {
             // Partial event events merging logic.
 
-            // If event is partial, stash it and return `None`.
+            // If event is partial, stash it and return `None` - unless the line being
+            // accumulated has outgrown its budget, in which case emit what we have.
             if is_partial {
                 // If we already have a partial event merge state, the current
-                // message has to be merged into that existing state.
-                // Otherwise, create a new partial event merge state with the
-                // current message being the initial one.
-                if let Some(partial_event_merge_state) = partial_event_merge_state {
+                // message has to be merged into that existing state. Otherwise,
+                // start a new one with the current message as the initial one -
+                // still subject to the same budget check below, since a single
+                // first frame can already exceed it.
+                match partial_event_merge_state.as_mut() {
+                    Some(merge_state) => {
+                        // Depending on the log namespace the actual contents of the log "message" will be
+                        // found in either the root of the event ("."), or at the globally configured "message_key".
+                        match log_namespace {
+                            LogNamespace::Vector => {
+                                merge_state.merge_in_next_event(log, &["."]);
+                            }
+                            LogNamespace::Legacy => {
+                                merge_state.merge_in_next_event(
+                                    log,
+                                    &[log_schema()
+                                        .message_key()
+                                        .expect("global log_schema.message_key to be valid path")
+                                        .to_string()],
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        *partial_event_merge_state = Some(LogEventMergeState::new(log));
+                    }
+                }
+
+                let merged_bytes = partial_event_merge_state
+                    .as_ref()
+                    .expect("just set above")
+                    .merged_bytes();
+                if merged_bytes <= max_merged_line_bytes {
+                    return None;
+                }
+
+                // Nothing is returned to the pipeline while a merge is in progress, so bounded-
+                // channel backpressure cannot engage: a container that never emits a newline
+                // would grow this buffer until the process is OOM-killed. Emit the accumulated
+                // line instead and start a fresh merge, so an over-long line is split across
+                // several events rather than buffered without limit.
+                warn!(
+                    message = "Merged log line exceeded the maximum size. Emitting it and continuing the merge in a new event.",
+                    max_merged_line_bytes = max_merged_line_bytes,
+                    container_id = self.id.as_str(),
+                    internal_log_rate_limit = true,
+                );
+
+                let mut merged = partial_event_merge_state
+                    .take()
+                    .expect("merge state was just observed to be present")
+                    .into_merged_event();
+
+                // The line continues in the next event, so mark this one the same way an
+                // unmerged partial event would be marked.
+                if let Some(partial_event_marker_field) = partial_event_marker_field {
+                    log_namespace.insert_source_metadata(
+                        DockerLogsConfig::NAME,
+                        &mut merged,
+                        Some(LegacyKey::Overwrite(path!(
+                            partial_event_marker_field.as_str()
+                        ))),
+                        path!(event::PARTIAL),
+                        true,
+                    );
+                }
+
+                merged
+            } else {
+                // This is not a partial event. If we have a partial event merge
+                // state from before, the current event must be a final event, that
+                // would give us a merged event we can return.
+                // Otherwise it's just a regular event that we return as-is.
+                match partial_event_merge_state.take() {
                     // Depending on the log namespace the actual contents of the log "message" will be
                     // found in either the root of the event ("."), or at the globally configured "message_key".
-                    match log_namespace {
+                    Some(partial_event_merge_state) => match log_namespace {
                         LogNamespace::Vector => {
-                            partial_event_merge_state.merge_in_next_event(log, &["."]);
+                            partial_event_merge_state.merge_in_final_event(log, &["."])
                         }
-                        LogNamespace::Legacy => {
-                            partial_event_merge_state.merge_in_next_event(
-                                log,
-                                &[log_schema()
-                                    .message_key()
-                                    .expect("global log_schema.message_key to be valid path")
-                                    .to_string()],
-                            );
-                        }
-                    }
-                } else {
-                    *partial_event_merge_state = Some(LogEventMergeState::new(log));
-                };
-                return None;
-            };
-
-            // This is not a partial event. If we have a partial event merge
-            // state from before, the current event must be a final event, that
-            // would give us a merged event we can return.
-            // Otherwise it's just a regular event that we return as-is.
-            match partial_event_merge_state.take() {
-                // Depending on the log namespace the actual contents of the log "message" will be
-                // found in either the root of the event ("."), or at the globally configured "message_key".
-                Some(partial_event_merge_state) => match log_namespace {
-                    LogNamespace::Vector => {
-                        partial_event_merge_state.merge_in_final_event(log, &["."])
-                    }
-                    LogNamespace::Legacy => partial_event_merge_state.merge_in_final_event(
-                        log,
-                        &[log_schema()
-                            .message_key()
-                            .expect("global log_schema.message_key to be valid path")
-                            .to_string()],
-                    ),
-                },
-                None => log,
+                        LogNamespace::Legacy => partial_event_merge_state.merge_in_final_event(
+                            log,
+                            &[log_schema()
+                                .message_key()
+                                .expect("global log_schema.message_key to be valid path")
+                                .to_string()],
+                        ),
+                    },
+                    None => log,
+                }
             }
         } else {
             // If the event is partial, just set the partial event marker field.
