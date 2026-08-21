@@ -2,11 +2,9 @@ use super::{BoxedFramingError, FramingError};
 use crate::{BytesDecoder, StreamDecodingError};
 use bytes::{Buf, Bytes, BytesMut};
 use derivative::Derivative;
-use flate2::read::{MultiGzDecoder, ZlibDecoder};
 use snafu::{ensure, ResultExt, Snafu};
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio;
@@ -14,31 +12,15 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use vector_common::constants::{GZIP_MAGIC, ZLIB_MAGIC};
+use vector_common::decompression::{CappedDecoder, CompressionLimits};
 use vector_config::configurable_component;
 
 const GELF_MAGIC: &[u8] = &[0x1e, 0x0f];
 const GELF_MAX_TOTAL_CHUNKS: u8 = 128;
 const DEFAULT_TIMEOUT_SECS: f64 = 5.0;
-/// Cap on concurrent incomplete messages, bounding the reassembly map.
-/// Graylog Server itself has no such cap, so this is sized well above what a
-/// legitimate sender holds in flight within the 5s reassembly window.
-pub const DEFAULT_PENDING_MESSAGES_LIMIT: usize = 10_000;
-/// Cap on one reassembled message. The protocol ceiling is 128 chunks
-/// (`GELF_MAX_TOTAL_CHUNKS`) times the 65507-byte max UDP payload, so 8 MiB is
-/// above anything the wire format can produce. Matches Graylog's own
-/// `decompress_size_limit` default.
-pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 8 * 1024 * 1024;
 
 const fn default_timeout_secs() -> f64 {
     DEFAULT_TIMEOUT_SECS
-}
-
-const fn default_pending_messages_limit() -> Option<usize> {
-    Some(DEFAULT_PENDING_MESSAGES_LIMIT)
-}
-
-const fn default_max_message_length() -> Option<usize> {
-    Some(DEFAULT_MAX_MESSAGE_LENGTH)
 }
 
 /// Config used to build a `ChunkedGelfDecoder`.
@@ -52,12 +34,13 @@ pub struct ChunkedGelfDecoderConfig {
 
 impl ChunkedGelfDecoderConfig {
     /// Build the `ChunkedGelfDecoder` from this configuration.
-    pub fn build(&self) -> ChunkedGelfDecoder {
+    pub fn build(&self, compression_limits: CompressionLimits) -> ChunkedGelfDecoder {
         ChunkedGelfDecoder::new(
             self.chunked_gelf.timeout_secs,
             self.chunked_gelf.pending_messages_limit,
             self.chunked_gelf.max_length,
             self.chunked_gelf.decompression,
+            compression_limits,
         )
     }
 }
@@ -75,22 +58,21 @@ pub struct ChunkedGelfDecoderOptions {
 
     /// The maximum number of pending incomplete messages. If this limit is reached, the decoder starts
     /// dropping chunks of new messages, ensuring the memory usage of the decoder's state is bounded.
-    /// Defaults to 10000. Set explicitly to raise or lower it.
-    #[serde(default = "default_pending_messages_limit")]
-    #[derivative(Default(value = "default_pending_messages_limit()"))]
+    /// If this option is not set, the decoder does not limit the number of pending messages and the memory usage
+    /// of its messages buffer can grow unbounded. This matches Graylog Server's behavior.
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub pending_messages_limit: Option<usize>,
 
     /// The maximum length of a single GELF message, in bytes. Messages longer than this length will
-    /// be dropped. Defaults to 8 MiB, which is above the protocol's own ceiling of 128 chunks per
-    /// message.
+    /// be dropped. If this option is not set, the decoder does not limit the length of messages and
+    /// the per-message memory is unbounded.
     ///
     /// Note that a message can be composed of multiple chunks and this limit is applied to the whole
     /// message, not to individual chunks.
     ///
     /// This limit takes only into account the message's payload and the GELF header bytes are excluded from the calculation.
     /// The message's payload is the concatenation of all the chunks' payloads.
-    #[serde(default = "default_max_message_length")]
-    #[derivative(Default(value = "default_max_message_length()"))]
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub max_length: Option<usize>,
 
     /// Decompression configuration for GELF messages.
@@ -226,24 +208,20 @@ impl ChunkedGelfDecompression {
         Self::None
     }
 
-    pub fn decompress(&self, data: Bytes) -> Result<Bytes, ChunkedGelfDecompressionError> {
+    pub fn decompress(
+        &self,
+        data: Bytes,
+        limits: &CompressionLimits,
+    ) -> Result<Bytes, ChunkedGelfDecompressionError> {
         let decompressed = match self {
-            Self::Gzip => {
-                let mut decoder = MultiGzDecoder::new(data.reader());
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .context(GzipDecompressionSnafu)?;
-                Bytes::from(decompressed)
-            }
-            Self::Zlib => {
-                let mut decoder = ZlibDecoder::new(data.reader());
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .context(ZlibDecompressionSnafu)?;
-                Bytes::from(decompressed)
-            }
+            Self::Gzip => CappedDecoder::gzip(data.reader(), limits)
+                .decompress()
+                .map(Bytes::from)
+                .context(GzipDecompressionSnafu)?,
+            Self::Zlib => CappedDecoder::zlib(data.reader(), limits)
+                .decompress()
+                .map(Bytes::from)
+                .context(ZlibDecompressionSnafu)?,
             Self::None => data,
         };
         Ok(decompressed)
@@ -316,6 +294,8 @@ impl FramingError for ChunkedGelfDecoderError {
 /// and [Graylog's go-gelf library](https://github.com/Graylog2/go-gelf/blob/v1/gelf/reader.go).
 #[derive(Debug, Clone)]
 pub struct ChunkedGelfDecoder {
+    /// Limits to decompress a reassembled message under.
+    compression_limits: CompressionLimits,
     // We have to use this decoder to read all the bytes from the buffer first and don't let tokio
     // read it buffered, as tokio FramedRead will not always call the decode method with the
     // whole message. (see https://docs.rs/tokio-util/latest/src/tokio_util/codec/framed_impl.rs.html#26).
@@ -336,10 +316,12 @@ impl ChunkedGelfDecoder {
         pending_messages_limit: Option<usize>,
         max_length: Option<usize>,
         decompression_config: ChunkedGelfDecompressionConfig,
+        compression_limits: CompressionLimits,
     ) -> Self {
         Self {
             bytes_decoder: BytesDecoder::new(),
             decompression_config,
+            compression_limits,
             state: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs_f64(timeout_secs),
             pending_messages_limit,
@@ -493,7 +475,7 @@ impl ChunkedGelfDecoder {
             .map(|message| {
                 self.decompression_config
                     .get_decompression(&message)
-                    .decompress(message)
+                    .decompress(message, &self.compression_limits)
                     .context(DecompressionSnafu)
             })
             .transpose()
@@ -504,9 +486,10 @@ impl Default for ChunkedGelfDecoder {
     fn default() -> Self {
         Self::new(
             DEFAULT_TIMEOUT_SECS,
-            default_pending_messages_limit(),
-            default_max_message_length(),
+            None,
+            None,
             ChunkedGelfDecompressionConfig::Auto,
+            CompressionLimits::default(),
         )
     }
 }
@@ -1297,37 +1280,84 @@ mod tests {
         assert_eq!(detected_compression, ChunkedGelfDecompression::None);
     }
 
-    #[tokio::test]
-    async fn defaults_are_finite_and_above_the_protocol_ceiling() {
-        let options = ChunkedGelfDecoderOptions::default();
-        assert_eq!(
-            options.pending_messages_limit,
-            Some(DEFAULT_PENDING_MESSAGES_LIMIT)
-        );
-        assert_eq!(options.max_length, Some(DEFAULT_MAX_MESSAGE_LENGTH));
+    /// OBE-10706: a GELF payload used to be inflated with an unbounded `read_to_end`, so a small
+    /// datagram could drive an arbitrarily large allocation.
+    ///
+    /// `MultiGzDecoder` walks every concatenated member, so one cheap member repeated past the cap
+    /// is enough to exceed it — no single oversized member required.
+    #[test]
+    fn gzip_decompression_is_capped() {
+        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
-        // 128 chunks x the 65507-byte max UDP payload is the most the wire format can carry,
-        // so the default can never reject a well-formed message.
-        let protocol_ceiling = GELF_MAX_TOTAL_CHUNKS as usize * 65_507;
-        assert!(DEFAULT_MAX_MESSAGE_LENGTH >= protocol_ceiling);
+        let member = Compression::Gzip.compress(&vec![0u8; 1024 * 1024]);
+        let members = DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1;
+        let mut bomb = BytesMut::new();
+        for _ in 0..members {
+            bomb.put_slice(&member);
+        }
+        let bomb = bomb.freeze();
+
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+            bomb.len()
+        );
+
+        let error = ChunkedGelfDecompression::Gzip
+            .decompress(bomb, &CompressionLimits::default())
+            .expect_err("a payload inflating past the cap must be rejected");
+
+        assert!(matches!(
+            error,
+            ChunkedGelfDecompressionError::GzipDecompression { .. }
+        ));
     }
 
-    #[tokio::test]
-    async fn limits_are_per_message_and_do_not_kill_the_stream() {
-        // Both are per-message conditions; tearing down the connection would let one bad sender
-        // drop every other message multiplexed over it.
-        assert!(ChunkedGelfDecoderError::MaxLengthExceed {
-            message_id: 1,
-            sequence_number: 0,
-            length: 10,
-            max_length: 5,
+    /// The zlib arm needs its own bomb: unlike gzip, zlib has no concatenated-stream form, so the
+    /// payload must be a single oversized stream. Fed to the encoder in chunks to keep the test's
+    /// own memory bounded.
+    #[test]
+    fn zlib_decompression_is_capped() {
+        use std::io::Write as IoWrite;
+
+        use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            encoder.write_all(&chunk).unwrap();
         }
-        .can_continue());
-        assert!(ChunkedGelfDecoderError::PendingMessagesLimitReached {
-            message_id: 1,
-            sequence_number: 0,
-            pending_messages_limit: 1,
-        }
-        .can_continue());
+        let bomb = Bytes::from(encoder.finish().unwrap());
+
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+            bomb.len()
+        );
+
+        let error = ChunkedGelfDecompression::Zlib
+            .decompress(bomb, &CompressionLimits::default())
+            .expect_err("a payload inflating past the cap must be rejected");
+
+        assert!(matches!(
+            error,
+            ChunkedGelfDecompressionError::ZlibDecompression { .. }
+        ));
+    }
+
+    /// The cap must not disturb ordinary traffic. Zlib shares the same `CappedDecoder` wrapper as
+    /// gzip, so exercising both here covers the wiring of each arm.
+    #[rstest]
+    #[case(Compression::Gzip)]
+    #[case(Compression::Zlib)]
+    fn decompression_under_the_cap_is_unaffected(#[case] compression: Compression) {
+        let payload = "the quick brown fox".repeat(1024);
+        let compressed = compression.compress(&payload);
+
+        let decompressed = ChunkedGelfDecompression::from_magic(&compressed)
+            .decompress(compressed, &CompressionLimits::default())
+            .expect("a payload within the cap must decompress");
+
+        assert_eq!(decompressed, Bytes::from(payload));
     }
 }

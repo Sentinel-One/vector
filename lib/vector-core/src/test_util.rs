@@ -1,4 +1,16 @@
 #![allow(missing_docs)]
+// Tests decode payloads this process just encoded, so there is no untrusted input and nothing to
+// cap. They deliberately keep using the raw decoders: leaving them untouched means they stay an
+// independent regression check on the capped wrappers, rather than testing those wrappers against
+// themselves.
+//
+// Caveat: unlike the other test modules this one is declared as a plain `pub mod test_util` with
+// no `cfg`, so it compiles into the library and this allow is broader than it looks. The helpers
+// below only read files this process wrote, so nothing here touches untrusted input — but if a
+// caller outside the tests ever uses them, the disallowed-types lint will not object. Gate the
+// module (as `inet_test_util` above it is) if that becomes a concern.
+#![allow(clippy::disallowed_types)]
+
 use std::{
     collections::HashMap,
     convert::Infallible,

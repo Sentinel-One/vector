@@ -213,7 +213,8 @@ impl TcpSource for RawTcpSource {
     type Acker = TcpNullAcker;
 
     fn decoder(&self) -> Self::Decoder {
-        self.decoder.clone()
+        // Called once per accepted connection.
+        self.decoder.clone_for_connection()
     }
 
     fn handle_events(&self, events: &mut [Event], host: std::net::SocketAddr) {

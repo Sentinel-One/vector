@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
     convert::Infallible,
-    io::Read,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -9,7 +8,6 @@ use std::{
 
 use bytes::{Buf, Bytes};
 use chrono::{DateTime, TimeZone, Utc};
-use flate2::read::MultiGzDecoder;
 use futures::{FutureExt, StreamExt};
 use http::StatusCode;
 use hyper::{service::make_service_fn, Server};
@@ -54,8 +52,10 @@ use crate::{
         EventsReceived, HttpBytesReceived, SplunkHecRequestBodyInvalidError, SplunkHecRequestError,
     },
     serde::bool_or_struct,
-    sources::util::handle_accept_error,
     source_sender::ClosedError,
+    sources::util::{
+        decompression::{CappedDecoder, CompressionLimits}, handle_accept_error, http::capped_body, http::ErrorMessage,
+    },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
     SourceSender,
 };
@@ -299,6 +299,8 @@ impl SourceConfig for SplunkConfig {
 
 /// Shared data for responding to requests.
 struct SplunkSource {
+    /// Limits to decompress under, from this component's context.
+    compression_limits: CompressionLimits,
     valid_tokens: Arc<BTreeSet<String>>,
     protocol: &'static str,
     idx_ack: Option<Arc<IndexerAcknowledgement>>,
@@ -310,6 +312,7 @@ struct SplunkSource {
 impl SplunkSource {
     fn new(config: &SplunkConfig, protocol: &'static str, cx: SourceContext) -> Self {
         let log_namespace = cx.log_namespace(config.log_namespace);
+        let compression_limits = cx.globals.limits.compression;
         let acknowledgements = cx.do_acknowledgements(config.acknowledgements.enabled.into());
         let shutdown = cx.shutdown;
         let valid_tokens: BTreeSet<String> = config
@@ -328,6 +331,7 @@ impl SplunkSource {
         });
 
         SplunkSource {
+            compression_limits,
             valid_tokens: Arc::new(valid_tokens),
             protocol,
             idx_ack,
@@ -343,6 +347,7 @@ impl SplunkSource {
         let store_hec_token = self.store_hec_token;
         let log_namespace = self.log_namespace;
         let events_received = self.events_received.clone();
+        let compression_limits = self.compression_limits;
 
         warp::post()
             .and(
@@ -355,7 +360,7 @@ impl SplunkSource {
             .and(warp::addr::remote())
             .and(warp::header::optional::<String>("X-Forwarded-For"))
             .and(self.gzip())
-            .and(warp::body::bytes())
+            .and(capped_body(&self.compression_limits))
             .and(warp::path::full())
             .and_then(
                 move |_,
@@ -375,10 +380,10 @@ impl SplunkSource {
                             return Err(Rejection::from(ApiError::MissingChannel));
                         }
 
-                        let mut data = Vec::new();
+                        let data;
                         let (byte_size, body) = if gzip {
-                            MultiGzDecoder::new(body.reader())
-                                .read_to_end(&mut data)
+                            data = CappedDecoder::gzip(body.reader(), &compression_limits)
+                                .decompress()
                                 .map_err(|_| Rejection::from(ApiError::BadRequest))?;
                             (data.len(), String::from_utf8_lossy(data.as_slice()))
                         } else {
@@ -451,6 +456,7 @@ impl SplunkSource {
         let store_hec_token = self.store_hec_token;
         let events_received = self.events_received.clone();
         let log_namespace = self.log_namespace;
+        let compression_limits = self.compression_limits;
 
         warp::post()
             .and(path!("raw" / "1.0").or(path!("raw")))
@@ -459,7 +465,7 @@ impl SplunkSource {
             .and(warp::addr::remote())
             .and(warp::header::optional::<String>("X-Forwarded-For"))
             .and(self.gzip())
-            .and(warp::body::bytes())
+            .and(capped_body(&self.compression_limits))
             .and(warp::path::full())
             .and_then(
                 move |_,
@@ -498,6 +504,7 @@ impl SplunkSource {
                             batch,
                             log_namespace,
                             &events_received,
+                            &compression_limits,
                         )?;
                         if let Some(token) = token.filter(|_| store_hec_token) {
                             event.metadata_mut().set_splunk_hec_token(token.into());
@@ -537,10 +544,15 @@ impl SplunkSource {
             .and(path!("ack"))
             .and(self.authorization())
             .and(SplunkSource::required_channel())
-            .and(warp::body::json())
-            .and_then(move |_, channel_id: String, body: HecAckStatusRequest| {
+            // `warp::body::json()` aggregates the whole body unbounded; cap it first and parse the
+            // bytes ourselves. Token auth is optional in config, so this endpoint can be reached
+            // unauthenticated.
+            .and(capped_body(&self.compression_limits))
+            .and_then(move |_, channel_id: String, body: Bytes| {
                 let idx_ack = idx_ack.clone();
                 async move {
+                    let body: HecAckStatusRequest = serde_json::from_slice(&body)
+                        .map_err(|_| Rejection::from(ApiError::BadRequest))?;
                     if let Some(idx_ack) = idx_ack {
                         let ack_statuses = idx_ack
                             .get_acks_status_from_channel(channel_id, &body.acks)
@@ -1042,13 +1054,13 @@ fn raw_event(
     batch: Option<BatchNotifier>,
     log_namespace: LogNamespace,
     events_received: &Registered<EventsReceived>,
+    compression_limits: &CompressionLimits,
 ) -> Result<Event, Rejection> {
     // Process gzip
     let message: Value = if gzip {
-        let mut data = Vec::new();
-        match MultiGzDecoder::new(bytes.reader()).read_to_end(&mut data) {
-            Ok(0) => return Err(ApiError::NoData.into()),
-            Ok(_) => Value::from(Bytes::from(data)),
+        match CappedDecoder::gzip(bytes.reader(), compression_limits).decompress() {
+            Ok(data) if data.is_empty() => return Err(ApiError::NoData.into()),
+            Ok(data) => Value::from(Bytes::from(data)),
             Err(error) => {
                 emit!(SplunkHecRequestBodyInvalidError { error });
                 return Err(ApiError::InvalidDataFormat { event: 0 }.into());
@@ -1249,6 +1261,11 @@ async fn finish_err(rejection: Rejection) -> Result<(Response,), Rejection> {
                 response_json(StatusCode::BAD_REQUEST, splunk_response::ACK_IS_DISABLED)
             }
         },))
+    } else if let Some(error) = rejection.find::<ErrorMessage>() {
+        // `capped_body()` rejects an oversized request body with an `ErrorMessage` carrying a
+        // 413. Without this arm warp would fall through to a generic 500, which would misreport
+        // a client error as a server fault.
+        Ok((empty_response(error.status_code()),))
     } else {
         Err(rejection)
     }
@@ -2911,6 +2928,192 @@ mod tests {
         assert_eq!(
             log_event.as_log()[log_schema().message_key().unwrap().to_string()],
             "allowed".into()
+        );
+    }
+
+    /// OBE-11554: both HEC handlers inflated a client-supplied gzip body with an unbounded
+    /// `read_to_end`. Amplification was measured at 1029:1 on a listener that accepts
+    /// unauthenticated requests by default, so ~4 MiB of upload exceeded a 4Gi pod limit.
+    mod gzip_bomb {
+        use super::*;
+
+        /// One cheap gzip member repeated past the cap. `MultiGzDecoder` walks every concatenated
+        /// member, so a single member's size does not bound the attack.
+        fn gzip_bomb() -> Vec<u8> {
+            use std::io::Write as _;
+
+            use vector_common::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+            let member = encoder.finish().unwrap();
+
+            let mut bomb = Vec::new();
+            for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+                bomb.extend_from_slice(&member);
+            }
+            assert!(
+                bomb.len() < 1024 * 1024,
+                "the bomb must stay small on the wire to be a meaningful test, got {} bytes",
+                bomb.len()
+            );
+            bomb
+        }
+
+        fn gzip(payload: &[u8]) -> Vec<u8> {
+            use std::io::Write as _;
+
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(payload).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        async fn post_gzip(address: SocketAddr, api: &str, body: Vec<u8>) -> Response {
+            reqwest::Client::new()
+                .post(format!("http://{}/{}", address, api))
+                .header("Authorization", format!("Splunk {}", TOKEN))
+                .header("Content-Encoding", "gzip")
+                .header("x-splunk-request-channel", "channel")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn event_endpoint_rejects_gzip_bomb() {
+            let (_source, address) = source(None).await;
+
+            let response = post_gzip(address, "services/collector/event", gzip_bomb()).await;
+
+            assert_eq!(400, response.status().as_u16());
+            // Both the cap trip and a merely unparseable body answer 400, so the status alone
+            // would pass even with the cap removed. They differ in the body: `ApiError::BadRequest`
+            // (the cap trip) is empty, while `InvalidDataFormat` carries a JSON document.
+            assert!(
+                response.bytes().await.unwrap().is_empty(),
+                "expected the empty-bodied BadRequest raised by the cap, not a parse failure"
+            );
+        }
+
+        #[tokio::test]
+        async fn raw_endpoint_rejects_gzip_bomb() {
+            let (_source, address) = source(None).await;
+
+            let response = post_gzip(address, "services/collector/raw", gzip_bomb()).await;
+
+            assert_eq!(400, response.status().as_u16());
+        }
+
+        /// The compressed body itself is now bounded, not just the decompressed output.
+        ///
+        /// Sends a handcrafted request declaring an enormous `Content-Length` with no body, so
+        /// `capped_body()`'s declared-length guard fires before a single body byte is read. This
+        /// keeps the test free of a real multi-gigabyte upload while still exercising the filter
+        /// and the `ErrorMessage` arm of `finish_err`.
+        #[tokio::test]
+        async fn oversized_declared_body_is_rejected_with_413() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (_source, address) = source(None).await;
+
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let request = format!(
+                "POST /services/collector/raw HTTP/1.1\r\n\
+                 Host: {address}\r\n\
+                 Authorization: Splunk {TOKEN}\r\n\
+                 x-splunk-request-channel: channel\r\n\
+                 Content-Length: 999999999999\r\n\
+                 \r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Without the declared-length guard the server waits for the body that never comes,
+            // so bound the read: a regression must fail here rather than hang the suite.
+            let mut response = vec![0u8; 128];
+            let n = tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                stream.read(&mut response),
+            )
+            .await
+            .expect("server must answer without waiting for the declared body")
+            .unwrap();
+            let status_line = String::from_utf8_lossy(&response[..n]);
+
+            assert!(
+                status_line.starts_with("HTTP/1.1 413"),
+                "expected 413 Payload Too Large, got: {status_line}"
+            );
+        }
+
+        /// The cap must not disturb ordinary gzip traffic on either handler.
+        #[tokio::test]
+        async fn ordinary_gzip_body_is_accepted() {
+            let (_source, address) = source(None).await;
+
+            let event = post_gzip(
+                address,
+                "services/collector/event",
+                gzip(br#"{"event":"hello"}"#),
+            )
+            .await;
+            assert_eq!(200, event.status().as_u16());
+
+            let raw = post_gzip(address, "services/collector/raw", gzip(b"hello")).await;
+            assert_eq!(200, raw.status().as_u16());
+        }
+    }
+
+    /// `capped_body()` replaced `warp::body::bytes()` on both HEC handlers. It collects the body
+    /// by streaming chunks rather than letting hyper buffer it in one shot, so it is worth pinning
+    /// that this does not add per-request latency.
+    ///
+    /// Measured at 0-3 ms when this was written; the 100 ms bound is deliberately loose so the
+    /// test catches a systematic regression (a stall waiting on end-of-stream would cost hundreds
+    /// of ms) without tripping on CI scheduling noise. The median is used so one stalled sample
+    /// cannot fail the run.
+    #[cfg(feature = "performance-tests")]
+    #[tokio::test]
+    async fn capped_body_does_not_add_request_latency() {
+        const SAMPLES: usize = 9;
+        const MAX_MEDIAN: Duration = Duration::from_millis(100);
+
+        let (_source, address) = source(None).await;
+        let client = reqwest::Client::new();
+
+        let post = |client: reqwest::Client, address: SocketAddr| async move {
+            client
+                .post(format!("http://{}/services/collector/event", address))
+                .header("Authorization", format!("Splunk {}", TOKEN))
+                .header("x-splunk-request-channel", "channel")
+                .body(r#"{"event":"hello"}"#)
+                .send()
+                .await
+                .unwrap()
+        };
+
+        // Warm the connection pool so we measure the filter, not TCP setup.
+        assert_eq!(200, post(client.clone(), address).await.status().as_u16());
+
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = std::time::Instant::now();
+            let response = post(client.clone(), address).await;
+            let elapsed = started.elapsed();
+            assert_eq!(200, response.status().as_u16());
+            samples.push(elapsed);
+        }
+
+        samples.sort_unstable();
+        let median = samples[SAMPLES / 2];
+
+        assert!(
+            median < MAX_MEDIAN,
+            "capped_body() added per-request latency: median {median:?} over {SAMPLES} requests \
+             exceeds {MAX_MEDIAN:?} (samples: {samples:?})"
         );
     }
 

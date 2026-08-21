@@ -174,6 +174,8 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
             .flatten()
             .chain(self.access_key.iter());
 
+        // From this component's context, so the deployment controls the cap.
+        let compression_limits = cx.globals.limits.compression;
         let svc = filters::firehose(
             access_keys.map(|key| key.inner().to_string()).collect(),
             self.store_access_key,
@@ -182,6 +184,7 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
             acknowledgements,
             cx.out,
             log_namespace,
+            compression_limits,
         );
 
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
@@ -301,7 +304,7 @@ mod tests {
         event::{Event, EventStatus},
         log_event,
         test_util::{
-            collect_ready,
+            collect_n,
             components::{assert_source_compliance, SOURCE_TAGS},
             next_addr, wait_for_tcp,
         },
@@ -431,6 +434,137 @@ mod tests {
         builder.send().await
     }
 
+    /// Request-level caps, distinct from the per-record caps covered in `handlers::tests`.
+    mod request_body_caps {
+        use futures::StreamExt;
+        use similar_asserts::assert_eq;
+
+        use super::*;
+
+        /// The source is built with `acknowledgements: true`, and `new_test_finalize` only marks
+        /// an event acknowledged once it is dropped. So a test that awaits the HTTP response must
+        /// drain the pipeline concurrently, or the handler waits forever for an ack that cannot
+        /// arrive.
+        fn drain(rx: impl Stream<Item = Event> + Unpin + Send + 'static) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                let mut rx = rx;
+                while rx.next().await.is_some() {}
+            })
+        }
+
+        fn post(address: SocketAddr) -> reqwest::RequestBuilder {
+            reqwest::Client::new()
+                .post(format!("http://{}", address))
+                .header("host", address.to_string())
+                .header("x-amz-firehose-protocol-version", "1.0")
+                .header("x-amz-firehose-request-id", REQUEST_ID.to_string())
+                .header("x-amz-firehose-source-arn", SOURCE_ARN.to_string())
+                .header("content-type", "application/json")
+        }
+
+        /// A `Content-Encoding: gzip` bomb on the request body must be refused rather than
+        /// inflated. `MultiGzDecoder` walks every concatenated member, so one cheap member
+        /// repeated past the cap suffices.
+        #[tokio::test]
+        async fn gzip_encoded_request_body_over_the_cap_is_rejected() {
+            use crate::sources::util::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
+
+            let (rx, address) = source(None, None, false, Compression::None, true, false).await;
+            let draining = drain(rx);
+
+            let mut encoder =
+                GzEncoder::new(Cursor::new(vec![0u8; 1024 * 1024]), flate2::Compression::best());
+            let mut member = Vec::new();
+            encoder.read_to_end(&mut member).unwrap();
+
+            let mut bomb = Vec::new();
+            for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+                bomb.extend_from_slice(&member);
+            }
+            assert!(bomb.len() < 1024 * 1024, "bomb must stay small on the wire");
+
+            let response = post(address)
+                .header("content-encoding", "gzip")
+                .body(bomb)
+                .send()
+                .await
+                .unwrap();
+
+            // Asserting only `!= 200` would pass for the wrong reason: with the cap removed the
+            // bomb inflates to ~101 MiB, `serde_json` then fails to parse it and the handler
+            // answers 401 (`RequestError::Parse`), which is also non-200. Pin the decode failure
+            // specifically, which only the cap can produce.
+            assert_eq!(400, response.status().as_u16());
+            let body = response.text().await.unwrap();
+            assert!(
+                body.contains("Could not decode record"),
+                "expected the capped-decompression error, got: {body}"
+            );
+            draining.abort();
+        }
+
+        /// `capped_body()` refuses an oversized declared `Content-Length` before reading any body
+        /// bytes. Sent over a raw socket so the test does not have to upload gigabytes.
+        #[tokio::test]
+        async fn oversized_declared_content_length_is_rejected() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (_rx, address) = source(None, None, false, Compression::None, true, false).await;
+
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let request = format!(
+                "POST / HTTP/1.1\r\n\
+                 Host: {address}\r\n\
+                 x-amz-firehose-protocol-version: 1.0\r\n\
+                 x-amz-firehose-request-id: {REQUEST_ID}\r\n\
+                 x-amz-firehose-source-arn: {SOURCE_ARN}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 999999999999\r\n\
+                 \r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Without the declared-length guard the server waits for a body that never arrives,
+            // so bound the read: a regression must fail here rather than hang the suite.
+            let mut response = vec![0u8; 128];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                stream.read(&mut response),
+            )
+            .await
+            .expect("server must answer without waiting for the declared body")
+            .unwrap();
+            let status_line = String::from_utf8_lossy(&response[..n]);
+
+            assert!(
+                status_line.starts_with("HTTP/1.1 413"),
+                "expected 413 Payload Too Large, got: {status_line}"
+            );
+        }
+
+        /// An ordinary gzip-encoded request must still be accepted.
+        #[tokio::test]
+        async fn ordinary_gzip_encoded_request_is_accepted() {
+            let (rx, address) = source(None, None, false, Compression::None, true, false).await;
+            let draining = drain(rx);
+
+            let response = send(
+                address,
+                Utc::now(),
+                vec![RECORD.as_bytes()],
+                None,
+                true,
+                Compression::None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(200, response.status().as_u16());
+            draining.abort();
+        }
+    }
+
     async fn spawn_send(
         address: SocketAddr,
         timestamp: DateTime<Utc>,
@@ -541,7 +675,10 @@ mod tests {
             .await;
 
             if success {
-                let events = collect_ready(rx).await;
+                // collect_n drives the ack handshake: new_test_finalize only marks events
+                // acknowledged when they are polled, so the handler (which awaits the ack
+                // before returning 200) must see events drained here first.
+                let events = collect_n(rx, 1).await;
 
                 let res = res.await.unwrap().unwrap();
                 assert_eq!(200, res.status().as_u16());
@@ -641,7 +778,7 @@ mod tests {
             .await;
 
             if success {
-                let events = collect_ready(rx).await;
+                let events = collect_n(rx, 1).await;
 
                 let res = res.await.unwrap().unwrap();
                 assert_eq!(200, res.status().as_u16());
@@ -711,7 +848,7 @@ mod tests {
             )
             .await;
 
-            let events = collect_ready(rx).await;
+            let events = collect_n(rx, 1).await;
             let res = res.await.unwrap().unwrap();
             assert_eq!(200, res.status().as_u16());
 
@@ -871,7 +1008,7 @@ mod tests {
         )
         .await;
 
-        let events = collect_ready(rx).await;
+        let events = collect_n(rx, 1).await;
 
         let res = res.await.unwrap().unwrap();
         assert_eq!(406, res.status().as_u16());
@@ -915,7 +1052,7 @@ mod tests {
         )
         .await;
 
-        let events = collect_ready(rx).await;
+        let events = collect_n(rx, 1).await;
         let access_key = events[0]
             .metadata()
             .secrets()
@@ -940,7 +1077,7 @@ mod tests {
         )
         .await;
 
-        let events = collect_ready(rx).await;
+        let events = collect_n(rx, 1).await;
 
         assert!(events[0]
             .metadata()
@@ -998,7 +1135,6 @@ mod tests {
 
     #[tokio::test]
     async fn permit_origin_allows_matching_ip() {
-        use crate::test_util::collect_n;
         let (recv, address) = spawn_with_permit_origin(&["127.0.0.1"]).await;
         // Run concurrently: the server waits for event ack before sending the HTTP
         // response, so collecting must happen in parallel with the request.

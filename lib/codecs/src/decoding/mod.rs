@@ -32,6 +32,7 @@ pub use framing::{
 };
 use smallvec::SmallVec;
 use std::fmt::Debug;
+use vector_common::decompression::OperationalLimits;
 use vector_config::configurable_component;
 use vector_core::{
     config::{DataType, LogNamespace},
@@ -175,10 +176,16 @@ impl From<StrataSnappyDecoderConfig> for FramingConfig {
 
 impl FramingConfig {
     /// Build the `Framer` from this configuration.
-    pub fn build(&self) -> Framer {
+    ///
+    /// `limits` is only consumed by framers that decompress (currently `chunked_gelf`) or buffer
+    /// an incomplete frame (`character_delimited`, `newline_delimited`); it is threaded through
+    /// here so no framer has to reach for process state.
+    pub fn build(&self, limits: OperationalLimits) -> Framer {
         match self {
             FramingConfig::Bytes => Framer::Bytes(BytesDecoderConfig.build()),
-            FramingConfig::CharacterDelimited(config) => Framer::CharacterDelimited(config.build()),
+            FramingConfig::CharacterDelimited(config) => {
+                Framer::CharacterDelimited(config.build(limits.framing))
+            }
             FramingConfig::LengthDelimited(config) => Framer::LengthDelimited(config.build()),
             FramingConfig::Netflow { netflow_decoder } => Framer::Netflow(
                 NetflowDecoderConfig {
@@ -186,9 +193,13 @@ impl FramingConfig {
                 }
                 .build(),
             ),
-            FramingConfig::NewlineDelimited(config) => Framer::NewlineDelimited(config.build()),
+            FramingConfig::NewlineDelimited(config) => {
+                Framer::NewlineDelimited(config.build(limits.framing))
+            }
             FramingConfig::OctetCounting(config) => Framer::OctetCounting(config.build()),
-            FramingConfig::ChunkedGelf(config) => Framer::ChunkedGelf(config.build()),
+            FramingConfig::ChunkedGelf(config) => {
+                Framer::ChunkedGelf(config.build(limits.compression))
+            }
             FramingConfig::StrataSnappy(config) => Framer::StrataSnappy(config.build()),
         }
     }

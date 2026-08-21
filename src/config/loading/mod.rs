@@ -137,6 +137,7 @@ pub async fn load_from_paths_with_provider_and_secrets(
     config_paths: &[ConfigPath],
     signal_handler: &mut signal::SignalHandler,
     allow_empty: bool,
+    allow_component_limit_overrides: bool,
 ) -> Result<Config, Vec<String>> {
     // Load secret backends first
     let mut secrets_backends_loader = load_secret_backends_from_paths(config_paths)?;
@@ -163,6 +164,10 @@ pub async fn load_from_paths_with_provider_and_secrets(
         builder = provider.build(signal_handler).await?;
         debug!(message = "Provider configured.", provider = ?provider.get_component_name());
     }
+
+    // Set after the provider swap above, which replaces the whole builder: a start option must
+    // survive a config that came from a provider.
+    builder.allow_component_limit_overrides = allow_component_limit_overrides;
 
     let (new_config, build_warnings) = builder.build_with_warnings()?;
 

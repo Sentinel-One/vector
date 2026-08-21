@@ -162,6 +162,11 @@ impl Batch for Buffer {
 
 #[cfg(test)]
 mod test {
+    // Tests decode payloads this process just encoded, so there is no untrusted input and nothing
+    // to cap. They deliberately keep using the raw decoders: leaving them untouched means they
+    // stay an independent regression check on the capped wrappers.
+    #![allow(clippy::disallowed_types)]
+
     use std::{
         io::Read,
         sync::{Arc, Mutex},

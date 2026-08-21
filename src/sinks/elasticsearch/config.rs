@@ -546,6 +546,8 @@ impl DataStreamConfig {
 #[typetag::serde(name = "elasticsearch")]
 impl SinkConfig for ElasticsearchConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        // From this component's context, so the deployment controls the cap.
+        let compression_limits = cx.globals.limits.compression;
         let commons = ElasticsearchCommon::parse_many(self, cx.proxy()).await?;
         let common = commons[0].clone();
         let app_info = crate::app_info();
@@ -581,7 +583,8 @@ impl SinkConfig for ElasticsearchConfig {
                     http_request_builder,
                     self.rejection_report.clone(),
                     self.compression.clone(),
-                    rej_ctx);
+                    rej_ctx,
+                    compression_limits);
 
                 (endpoint, service)
             })

@@ -1838,6 +1838,61 @@ mod tests {
         spawn_simple_http_source(address, permit_origin, context).await;
     }
 
+    /// The shared `HttpSource` filter now collects the body through `capped_body()`, which
+    /// refuses an oversized declared `Content-Length` before reading any body bytes. Sent over a
+    /// raw socket so the test does not have to upload gigabytes.
+    ///
+    /// This covers `http_server` and, through the same prelude filter, `heroku_logs`.
+    #[tokio::test]
+    async fn oversized_declared_body_is_rejected_with_413() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (sender, _recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let address = next_addr();
+        spawn_simple_http_source(address, None, SourceContext::new_test(sender, None)).await;
+        wait_for_tcp(address).await;
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Content-Length: 999999999999\r\n\
+             \r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Without the declared-length guard the server waits for a body that never arrives, so
+        // bound the read: a regression must fail here rather than hang the suite.
+        let mut response = vec![0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read(&mut response),
+        )
+        .await
+        .expect("server must answer without waiting for the declared body")
+        .unwrap();
+        let status_line = String::from_utf8_lossy(&response[..n]);
+
+        assert!(
+            status_line.starts_with("HTTP/1.1 413"),
+            "expected 413 Payload Too Large, got: {status_line}"
+        );
+    }
+
+    /// An ordinary body must still be accepted through the same filter.
+    #[tokio::test]
+    async fn ordinary_body_is_accepted() {
+        let (sender, _recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let address = next_addr();
+        spawn_simple_http_source(address, None, SourceContext::new_test(sender, None)).await;
+        wait_for_tcp(address).await;
+
+        let response = send_http_event(address, "hello").await.unwrap();
+
+        assert_eq!(200, response.status().as_u16());
+    }
+
     async fn send_http_event(
         address: std::net::SocketAddr,
         body: &'static str,

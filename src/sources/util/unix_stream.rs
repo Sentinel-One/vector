@@ -98,7 +98,10 @@ pub fn build_unix_stream_source(
                     bytes_received.emit(ByteSize(byte_size));
                 })
                 .allow_read_until(shutdown.clone().map(|_| ()));
-            let mut stream = FramedRead::new(stream, decoder.clone());
+            // `clone_for_connection` gives Netflow framing (if configured) a fresh, unshared
+            // template scope per accepted connection; a no-op for every other framer. Without it,
+            // every connection built from the same configured decoder would share one scope.
+            let mut stream = FramedRead::new(stream, decoder.clone_for_connection());
 
             let connection_open = connection_open.clone();
             let mut out = out.clone();

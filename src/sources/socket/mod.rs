@@ -122,6 +122,7 @@ impl SourceConfig for SocketConfig {
                     decoding,
                     log_namespace,
                 )
+                .with_operational_limits(cx.globals.limits)
                 .build()?;
 
                 let tcp = tcp::RawTcpSource::new(config.clone(), decoder, log_namespace);
@@ -155,7 +156,9 @@ impl SourceConfig for SocketConfig {
                     .framing()
                     .clone()
                     .unwrap_or_else(|| decoding.default_message_based_framing());
-                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build()?;
+                let decoder = DecodingConfig::new(framing, decoding, log_namespace)
+                    .with_operational_limits(cx.globals.limits)
+                    .build()?;
                 Ok(udp::udp(
                     config,
                     decoder,
@@ -172,7 +175,9 @@ impl SourceConfig for SocketConfig {
                     .framing
                     .clone()
                     .unwrap_or_else(|| decoding.default_message_based_framing());
-                let decoder = DecodingConfig::new(framing, decoding, log_namespace).build()?;
+                let decoder = DecodingConfig::new(framing, decoding, log_namespace)
+                    .with_operational_limits(cx.globals.limits)
+                    .build()?;
 
                 unix::unix_datagram(config, decoder, cx.shutdown, cx.out, log_namespace)
             }
@@ -189,6 +194,7 @@ impl SourceConfig for SocketConfig {
                     decoding,
                     log_namespace,
                 )
+                .with_operational_limits(cx.globals.limits)
                 .build()?;
 
                 unix::unix_stream(config, decoder, cx.shutdown, cx.out, log_namespace)
@@ -458,6 +464,62 @@ mod test {
         .await;
     }
 
+    /// End-to-end proof that the frame length cap actually terminates the connection rather than
+    /// just erroring internally: a peer that streams past the limit without ever sending a newline
+    /// must have its socket closed by the server, so the buffer cannot keep growing.
+    #[tokio::test]
+    async fn tcp_over_long_frame_closes_the_connection() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (tx, _rx) = SourceSender::new_test();
+        let addr = next_addr();
+
+        let mut conf = TcpConfig::from_address(addr.into());
+        conf.set_framing(Some(
+            NewlineDelimitedDecoderConfig::new_with_max_length(1024).into(),
+        ));
+
+        let server = SocketConfig::from(conf)
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        wait_for_tcp(addr).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // Never send a newline. Write until the peer closes on us, or we have clearly exceeded
+        // the limit without being closed (which is the failure this test guards against).
+        let chunk = vec![b'x'; 4096];
+        let mut written = 0usize;
+        let mut closed = false;
+        for _ in 0..64 {
+            match stream.write_all(&chunk).await {
+                Ok(()) => written += chunk.len(),
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+
+        if !closed {
+            // The write side may still buffer locally after the server drops the connection, so
+            // confirm via the read side: a closed connection reads EOF.
+            let mut buf = [0u8; 1];
+            closed = matches!(
+                timeout(Duration::from_secs(10), stream.read(&mut buf)).await,
+                Ok(Ok(0)) | Ok(Err(_))
+            );
+        }
+
+        assert!(
+            closed,
+            "connection stayed open after streaming {written} bytes with no delimiter \
+             against a 1024-byte max_length",
+        );
+    }
+
     #[tokio::test]
     async fn tcp_it_includes_vector_namespaced_fields() {
         assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
@@ -557,44 +619,50 @@ mod test {
     }
 
     #[tokio::test]
-    async fn tcp_continue_after_long_line() {
-        assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async {
-            let (tx, mut rx) = SourceSender::new_test();
-            let addr = next_addr();
+    /// A *terminated* over-long line is fatal too: even though its delimiter tells us exactly
+    /// where it ended and we could resync, the connection is reset. Asserted on the socket itself
+    /// rather than on event delivery — clearing the buffer would drop later events either way, so
+    /// only checking for EOF distinguishes "connection reset" from "frame skipped".
+    async fn tcp_resets_connection_after_long_line() {
+        use tokio::io::AsyncWriteExt as _;
 
-            let mut config = TcpConfig::from_address(addr.into());
-            config.set_framing(Some(
-                NewlineDelimitedDecoderConfig::new_with_max_length(10).into(),
-            ));
+        let (tx, mut rx) = SourceSender::new_test();
+        let addr = next_addr();
 
-            let server = SocketConfig::from(config)
-                .build(SourceContext::new_test(tx, None))
-                .await
-                .unwrap();
-            tokio::spawn(server);
+        let mut config = TcpConfig::from_address(addr.into());
+        config.set_framing(Some(
+            NewlineDelimitedDecoderConfig::new_with_max_length(10).into(),
+        ));
 
-            let lines = vec![
-                "short".to_owned(),
-                "this is too long".to_owned(),
-                "more short".to_owned(),
-            ];
+        let server = SocketConfig::from(config)
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        wait_for_tcp(addr).await;
 
-            wait_for_tcp(addr).await;
-            send_lines(addr, lines.into_iter()).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
 
-            let event = rx.next().await.unwrap();
-            assert_eq!(
-                event.as_log()[log_schema().message_key().unwrap().to_string()],
-                "short".into()
-            );
+        // A line within the limit is delivered as normal.
+        stream.write_all(b"short\n").await.unwrap();
+        let event = rx.next().await.unwrap();
+        assert_eq!(
+            event.as_log()[log_schema().message_key().unwrap().to_string()],
+            "short".into()
+        );
 
-            let event = rx.next().await.unwrap();
-            assert_eq!(
-                event.as_log()[log_schema().message_key().unwrap().to_string()],
-                "more short".into()
-            );
-        })
-        .await;
+        // A terminated line over the limit resets the connection.
+        stream.write_all(b"this is too long\n").await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let closed = matches!(
+            timeout(Duration::from_secs(10), stream.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            closed,
+            "connection should have been reset by the over-long terminated line",
+        );
     }
 
     #[tokio::test]

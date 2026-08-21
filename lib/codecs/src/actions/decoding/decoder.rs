@@ -5,6 +5,7 @@ use crate::decoding::{
 use crate::internal_events::codecs::{DecoderDeserializeError, DecoderFramingError};
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
+use std::net::IpAddr;
 use vector_core::config::LogNamespace;
 use vector_core::emit;
 use vector_core::event::Event;
@@ -47,6 +48,39 @@ impl Decoder {
     pub const fn with_log_namespace(mut self, log_namespace: LogNamespace) -> Self {
         self.log_namespace = log_namespace;
         self
+    }
+
+    /// Clones this decoder for a newly accepted connection.
+    ///
+    /// If the configured framer is [`Framer::Netflow`], gives the clone a fresh template scope so
+    /// it does not share a template cache with any other connection built from the same configured
+    /// decoder — see `NetflowDecoder::set_new_connection_scope`. A no-op for every other framer.
+    ///
+    /// Call this (not a plain `.clone()`) once per accepted stream connection, whether TCP or Unix
+    /// domain.
+    #[must_use]
+    pub fn clone_for_connection(&self) -> Self {
+        let mut decoder = self.clone();
+        if let Framer::Netflow(netflow) = &mut decoder.framer {
+            netflow.set_new_connection_scope();
+        }
+        decoder
+    }
+
+    /// Clones this decoder for a single datagram received from `peer`.
+    ///
+    /// If the configured framer is [`Framer::Netflow`], scopes the clone's template cache to that
+    /// peer so one exporter cannot redefine the template ids another exporter's records decode
+    /// against — see `NetflowDecoder::set_datagram_peer`. A no-op for every other framer.
+    ///
+    /// Call this (not a plain `.clone()`) once per received UDP datagram.
+    #[must_use]
+    pub fn clone_for_datagram_peer(&self, peer: IpAddr) -> Self {
+        let mut decoder = self.clone();
+        if let Framer::Netflow(netflow) = &mut decoder.framer {
+            netflow.set_datagram_peer(peer);
+        }
+        decoder
     }
 
     /// Handles the framing result and parses it into a structured event, if
