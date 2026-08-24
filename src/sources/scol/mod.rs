@@ -23,7 +23,7 @@ impl SourceConfig for Config {
         let chkptr = cx.checkpoint_accessor().await;
         let src = self
             .clone()
-            .build_source(cx.out, cx.shutdown, chkptr, lns)
+            .build_source(cx.out, cx.shutdown, chkptr, lns, cx.globals.limits.compression)
             .map(|r| match r {
                 Ok(_) => Ok(()),
                 Err(e) => {

@@ -10534,6 +10534,7 @@ dependencies = [
  "arc-swap",
  "assert_matches",
  "async-channel 2.5.0",
+ "async-compression",
  "async-recursion",
  "async-trait",
  "aws-sdk-s3",
@@ -10546,6 +10547,7 @@ dependencies = [
  "chrono",
  "cron",
  "dashmap 5.5.3",
+ "flate2",
  "futures 0.3.31",
  "futures-util",
  "http 0.2.9",
@@ -10580,6 +10582,7 @@ dependencies = [
  "serde_with",
  "smallvec",
  "snafu 0.7.5",
+ "snap",
  "stream-cancel",
  "tempfile",
  "test-case",
@@ -10599,6 +10602,7 @@ dependencies = [
  "vector-core",
  "vector-lib",
  "vrl",
+ "zstd 0.13.2",
 ]
 
 [[package]]

@@ -66,6 +66,8 @@ reqwest = { version = "0.12", default-features = false }
 # core). Pull hyper 1 under an alias so retry classification can downcast `object_store::Error`
 # sources to the *matching* `hyper::Error` type (see objstore::is_retriable).
 hyper1 = { package = "hyper", version = "1", default-features = false }
+async-compression = { workspace = true }
+snap.workspace = true
 
 # Optional dependencies for testing (below)
 testcontainers = { version = "0.19", optional = true }
@@ -96,6 +98,8 @@ test-case = { version = "3.3" }
 tokio = { version = "1.43.0", features = ["test-util"] }
 scol = { path = ".", features = ["test-scenarios"] }
 chkpts = { path = "../chkpts" }
+flate2 = { workspace = true }
+zstd = { workspace = true }
 
 [features]
 test-scenarios = ["vector-lib/test", "dep:textwrap", "dep:rstest", "dep:oxide-auth",
