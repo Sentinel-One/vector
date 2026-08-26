@@ -198,17 +198,23 @@ impl SourceConfig for DatadogAgentConfig {
             self.parse_ddtags,
             cx.globals.limits.compression,
         );
-        let listener = tls.bind(&self.address).await?;
-        let listener = listener
-            .with_allowlist(self.permit_origin.clone().map(Into::into));
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let filters = source.build_warp_filters(cx.out, acknowledgements, self)?;
         let shutdown = cx.shutdown;
+        let address = self.address;
+        let permit_origin = self.permit_origin.clone();
         let keepalive_settings = self.keepalive.clone();
 
-        info!(message = "Building HTTP server.", address = %self.address);
-
         Ok(Box::pin(async move {
+            info!(message = "Building HTTP server.", address = %address);
+
+            // Bind when the source starts, not when it is built: `vector validate` builds
+            // sources without running them, so binding here would collide with a live instance.
+            let listener = tls.bind(&address).await.map_err(|err| {
+                error!("An error occurred: {:?}.", err);
+            })?;
+            let listener = listener.with_allowlist(permit_origin.map(Into::into));
+
             let routes = filters.recover(|r: Rejection| async move {
                 if let Some(e_msg) = r.find::<ErrorMessage>() {
                     let json = warp::reply::json(e_msg);

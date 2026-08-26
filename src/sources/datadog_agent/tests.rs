@@ -209,6 +209,33 @@ fn generate_config() {
     crate::test_util::test_generate_config::<DatadogAgentConfig>();
 }
 
+/// OBE-11881: `build()` must not bind the listen port. In a containerized site the
+/// control-agent runs `dataplane validate` in the same network namespace as the live
+/// dataplane, so binding during config validation collides with the already-running
+/// pipeline and fails the deploy with "Address already in use".
+#[tokio::test]
+async fn build_does_not_bind_the_listen_port() {
+    let address = next_addr();
+    let _occupied = tokio::net::TcpListener::bind(address).await.unwrap();
+
+    let (sender, _recv) = SourceSender::new_test();
+    let config = toml::from_str::<DatadogAgentConfig>(&format!(
+        indoc! { r#"
+            address = "{}"
+        "#},
+        address
+    ))
+    .unwrap();
+
+    assert!(
+        config
+            .build(SourceContext::new_test(sender, None))
+            .await
+            .is_ok(),
+        "build() must succeed while the port is already bound",
+    );
+}
+
 async fn source(
     status: EventStatus,
     acknowledgements: bool,
