@@ -39,6 +39,24 @@ pub enum ChkptErr {
     Unknown(crate::Error)
 }
 
+/// Precondition guarding a `compare_and_set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetCond<'a> {
+    /// The checkpoint must exist and its latest value must equal this.
+    Old(Cow<'a, str>),
+    /// The checkpoint must not exist.
+    Absent,
+}
+
+impl SetCond<'_> {
+    pub fn into_owned(self) -> SetCond<'static> {
+        match self {
+            SetCond::Old(v) => SetCond::Old(Cow::Owned(v.into_owned())),
+            SetCond::Absent => SetCond::Absent,
+        }
+    }
+}
+
 impl Display for ChkptErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -58,7 +76,7 @@ impl Error for ChkptErr {
 pub trait Accessor: Send + dyn_clone::DynClone + Sync {
     async fn get(&self, id: Cow<'_, str>) -> Result<Value, ChkptErr>;
     async fn set(&self, id: Cow<'_, str>, value: Cow<'_, str>, ctx: Cow<'_, str>) -> Result<(), ChkptErr>;
-    async fn compare_and_set(&self, id: Cow<'_, str>, value: Cow<'_, str>, if_old: Cow<'_, str>, ctx: Cow<'_, str>) -> Result<(), ChkptErr>;
+    async fn compare_and_set(&self, id: Cow<'_, str>, value: Cow<'_, str>, cond: SetCond<'_>, ctx: Cow<'_, str>) -> Result<(), ChkptErr>;
     async fn del(&self, id: Cow<'_, str>) -> Result<(), ChkptErr>;
     async fn compare_and_del(&self, id: Cow<'_, str>, if_old: Cow<'_, str>) -> Result<(), ChkptErr>;
     async fn del_range(&self, from: Cow<'_, str>, to: Cow<'_, str>) -> Result<u64, ChkptErr>;
