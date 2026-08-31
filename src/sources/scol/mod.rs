@@ -74,6 +74,7 @@ mod tests {
     use crate::test_util::components::{assert_source_compliance, SOURCE_TAGS};
     use scol::test_scenarios as s;
     use vector_common::await_result;
+    use vector_common::limits::CompressionLimits;
     use vector_lib::config::LogNamespace;
     use vector_lib::event::Event;
     use vector_lib::shutdown::ShutdownSignal;
@@ -97,7 +98,13 @@ mod tests {
             let (tx, rx) = SourceSender::new_test();
             let (trigger, signal, _) = ShutdownSignal::new_wired();
             let config: Config = toml::from_str(config.as_str()).unwrap();
-            let src = Box::pin(config.build_source(tx, signal, chkptr, LogNamespace::Legacy));
+            let src = Box::pin(config.build_source(
+                tx,
+                signal,
+                chkptr,
+                LogNamespace::Legacy,
+                CompressionLimits::default(),
+            ));
             let evts = Box::pin(rx.take(n_evts as usize).collect::<Vec<_>>());
 
             match await_result!(future::select(src, evts), Duration::from_secs(5)) {
