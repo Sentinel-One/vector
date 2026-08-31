@@ -1,8 +1,4 @@
-use std::{
-    net::{SocketAddr, TcpListener},
-    num::NonZeroU64,
-    time::Duration,
-};
+use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use futures::StreamExt;
 use tokio::time::sleep;
@@ -49,6 +45,21 @@ fn splunk_source_config(addr: SocketAddr) -> SplunkConfig {
     config
 }
 
+// A splunk source whose TLS cert does not exist. Splunk loads TLS eagerly in `build()`, so this
+// fails to build (the listen-port bind is deferred to source startup and never reached). Built via
+// serde because `SplunkConfig::tls` is private.
+fn splunk_source_unbuildable(addr: SocketAddr) -> SplunkConfig {
+    toml::from_str(&format!(
+        r#"
+        address = "{addr}"
+        tls.enabled = true
+        tls.crt_file = "/nonexistent/reload-test-does-not-exist.crt"
+        tls.key_file = "/nonexistent/reload-test-does-not-exist.key"
+        "#
+    ))
+    .unwrap()
+}
+
 #[tokio::test]
 async fn topology_reuse_old_port() {
     test_util::trace_init();
@@ -81,12 +92,11 @@ async fn topology_rebuild_old() {
     old_config.add_source("in", splunk_source_config(address_0));
     old_config.add_sink("out", &["in"], basic_sink(1).1);
 
+    // The new source fails to build (nonexistent TLS cert), so the reload must roll back and
+    // report failure, leaving the old topology running.
     let mut new_config = Config::builder();
-    new_config.add_source("in", splunk_source_config(address_1));
+    new_config.add_source("in", splunk_source_unbuildable(address_1));
     new_config.add_sink("out", &["in"], basic_sink(1).1);
-
-    // Will cause the new_config to fail on build
-    let _bind = TcpListener::bind(address_1).unwrap();
 
     let (mut topology, _) = start_topology(old_config.build().unwrap(), false).await;
     assert!(!topology
