@@ -631,6 +631,15 @@ impl IngestorProcess {
 
         let object = object_result?;
 
+        info!(
+            message = "Got S3 object from SQS notification.",
+            bucket = s3_event.s3.bucket.name,
+            key = s3_event.s3.object.key,
+            content_length = object.content_length,
+            content_type = object.content_type,
+            last_modified = ?object.last_modified,
+        );
+
         let metadata = object.metadata;
 
         let timestamp = object.last_modified.map(|ts| {
@@ -638,15 +647,6 @@ impl IngestorProcess {
                 .single()
                 .expect("invalid timestamp")
         });
-
-        info!(
-            message = "Got S3 object from SQS notification.",
-            bucket = s3_event.s3.bucket.name,
-            key = s3_event.s3.object.key,
-            content_length = object.content_length,
-            content_type = object.content_type,
-            last_modified = format!("{timestamp:?}"),
-        );
 
         let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(self.acknowledgements);
         let object_reader = super::s3_object_decoder(
