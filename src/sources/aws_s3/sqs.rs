@@ -436,7 +436,7 @@ impl IngestorProcess {
                                 error = %err,
                                 internal_log_rate_limit = true,
                         );
-                        
+
                         // Make sleep cancellable by shutdown
                         select! {
                             _ = &mut shutdown => break,
@@ -462,13 +462,13 @@ impl IngestorProcess {
                 let meta = err.meta();
                 let aws_error_code = meta.code();
                 let aws_error_message = meta.message();
-                
+
                 emit!(SqsMessageReceiveError {
                     error: &err,
                     aws_error_code,
                     aws_error_message,
                 });
-                
+
                 // Propagate the original SDK error to preserve error context
                 return Err(err.into());
             }
@@ -634,7 +634,10 @@ impl IngestorProcess {
         info!(
             message = "Got S3 object from SQS notification.",
             bucket = s3_event.s3.bucket.name,
-            key = s3_event.s3.object.key
+            key = s3_event.s3.object.key,
+            content_length = object.content_length,
+            content_type = object.content_type,
+            last_modified = ?object.last_modified,
         );
 
         let metadata = object.metadata;
