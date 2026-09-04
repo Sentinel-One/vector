@@ -220,6 +220,21 @@ impl Template {
         (!parts.is_empty()).then_some(parts)
     }
 
+    /// Returns the literal text that precedes the first field reference (or
+    /// time-format specifier) in this template.
+    ///
+    /// This is the longest prefix of the rendered output that is guaranteed
+    /// not to depend on the input event, and is used by sinks to derive a
+    /// confinement base directory for templated filesystem paths. A `{{ ... }}`
+    /// reference or a `%`-style strftime specifier both stop accumulation,
+    /// since neither is known statically.
+    pub fn literal_prefix(&self) -> &str {
+        match self.parts.first() {
+            Some(Part::Literal(lit)) => lit.as_str(),
+            _ => "",
+        }
+    }
+
     /// Returns a reference to the template string.
     pub fn get_ref(&self) -> &str {
         &self.src

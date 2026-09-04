@@ -13,9 +13,10 @@ pub mod http;
 pub mod metadata;
 pub mod normalizer;
 pub mod partitioner;
+pub mod path_confinement;
 pub mod processed_event;
-pub mod request_builder;
 pub mod rejection_report;
+pub mod request_builder;
 pub mod retries;
 pub mod service;
 pub mod sink;
@@ -45,13 +46,13 @@ pub use buffer::{
     Buffer, Compression, PartitionBuffer, PartitionInnerBuffer,
 };
 pub use builder::SinkBuilderExt;
+pub use compressor::Compressor;
+pub use compressor::Decompressor;
 pub use jwt_auth::AuthTokenConfig;
 #[cfg(feature = "sinks-vector")]
 pub use jwt_auth::{AuthState, AuthToken};
-pub use compressor::Compressor;
-pub use compressor::Decompressor;
-pub use rejection_report::{emit_rejection_error, RejectionContext, RejectionReport};
 pub use normalizer::Normalizer;
+pub use rejection_report::{emit_rejection_error, RejectionContext, RejectionReport};
 pub use request_builder::{IncrementalRequestBuilder, RequestBuilder};
 pub use service::{
     Concurrency, ServiceBuilderExt, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,

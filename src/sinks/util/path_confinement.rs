@@ -1,0 +1,437 @@
+//! Shared infrastructure for confining templated sink outputs to an
+//! operator-authored boundary.
+//!
+//! Sinks that render templates into filesystem paths use the helpers in this
+//! module to ensure the rendered value cannot escape the literal portion the
+//! operator wrote.
+
+use std::path::{Component, Path, PathBuf};
+
+use snafu::Snafu;
+
+use crate::template::Template;
+
+/// Maximum byte length of a rendered path before it is rejected.
+///
+/// Bounds per-event cost (path canonicalization, directory creation) and
+/// provides a coarse cap on memory blow-up from attacker-controlled fields.
+pub const MAX_RENDERED_PATH_LEN: usize = 1024;
+
+/// Errors raised while building a [`PathConfinement`] from a template.
+#[derive(Debug, Snafu)]
+pub enum BuildError {
+    #[snafu(display(
+        "path template references event fields ({fields:?}) but has no \
+         literal directory prefix to derive a base directory from. Set \
+         `base_dir` explicitly, or set \
+         `dangerously_allow_unconfined_template_resolution: true` to opt out of path \
+         confinement (not recommended)."
+    ))]
+    NoDerivableBase { fields: Vec<String> },
+
+    #[snafu(display(
+        "path template literal prefix {prefix:?} normalizes to a filesystem \
+         root, which would permit writes anywhere on disk. Set `base_dir` \
+         explicitly (for example `base_dir: /var/log/vector`), or set \
+         `dangerously_allow_unconfined_template_resolution: true` to opt out of path \
+         confinement (not recommended)."
+    ))]
+    DerivedBaseIsRoot { prefix: String },
+
+    #[snafu(display("`base_dir` must be an absolute path, got {path:?}"))]
+    BaseNotAbsolute { path: PathBuf },
+}
+
+/// Errors raised while confining a rendered path against a base directory.
+#[derive(Debug, Snafu)]
+pub enum ConfineError {
+    #[snafu(display("rendered path contains a NUL byte"))]
+    NulByte,
+
+    #[snafu(display(
+        "rendered path {rendered:?} resolves outside the configured base \
+         directory {base:?}"
+    ))]
+    OutsideBase { rendered: PathBuf, base: PathBuf },
+
+    #[snafu(display("rendered path is {len} bytes; maximum allowed is {max}"))]
+    TooLong { len: usize, max: usize },
+
+    #[cfg(windows)]
+    #[snafu(display("rendered path contains a forbidden Windows component: {component:?}"))]
+    ForbiddenComponent { component: String },
+}
+
+/// Lexically resolve `.` and `..` in a path without touching the
+/// filesystem.
+///
+/// This is pure: it never follows symlinks, never reads the FS, and never
+/// pops past a root or prefix component. The result has the same root /
+/// prefix as the input.
+pub fn normalize_lexically(p: &Path) -> PathBuf {
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for component in p.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                out.push(component);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let pop_idx = out.iter().rposition(|c| matches!(c, Component::Normal(_)));
+                match pop_idx {
+                    Some(idx) if idx == out.len() - 1 => {
+                        out.pop();
+                    }
+                    _ => {
+                        let has_anchor = out
+                            .iter()
+                            .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir));
+                        if !has_anchor {
+                            out.push(component);
+                        }
+                    }
+                }
+            }
+            Component::Normal(_) => {
+                out.push(component);
+            }
+        }
+    }
+    let mut buf = PathBuf::new();
+    for c in out {
+        buf.push(c.as_os_str());
+    }
+    if buf.as_os_str().is_empty() {
+        buf.push(".");
+    }
+    buf
+}
+
+/// Returns `true` if `p` is exactly a filesystem root (no normal segments
+/// below the root or drive prefix).
+fn is_filesystem_root(p: &Path) -> bool {
+    let mut had_anchor = false;
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => had_anchor = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    had_anchor
+}
+
+/// Truncate a literal-prefix string to the last path-separator boundary so
+/// that the returned slice is a clean directory prefix (no trailing partial
+/// component like `srv-` in `"/srv-{{id}}"`).
+fn truncate_to_separator(prefix: &str) -> &str {
+    let bytes = prefix.as_bytes();
+    let mut cut = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'/' || (cfg!(windows) && *b == b'\\') {
+            cut = i + 1;
+        }
+    }
+    prefix.split_at(cut).0
+}
+
+/// Confines a rendered filesystem path to a base directory derived from a
+/// template's literal prefix.
+///
+/// Build with [`PathConfinement::for_template`] at sink construction time
+/// (no FS I/O). Use [`PathConfinement::confine`] before any FS mutation,
+/// and [`PathConfinement::verify_parent`] after `create_dir_all` to catch
+/// intermediate symlinks.
+#[derive(Debug)]
+pub struct PathConfinement {
+    base_lexical: PathBuf,
+}
+
+impl PathConfinement {
+    /// Build a confinement for `tpl`. Returns:
+    /// - `Ok(None)` if the template has no field references (nothing to confine).
+    /// - `Ok(Some(_))` with a base derived from `explicit` (if set) or from
+    ///   the template's literal prefix.
+    /// - `Err(_)` if no usable base can be derived and `explicit` is unset.
+    ///
+    /// Performs no filesystem I/O.
+    pub fn for_template(
+        tpl: &Template,
+        explicit: Option<&Path>,
+    ) -> Result<Option<Self>, BuildError> {
+        let fields = match tpl.get_fields() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        let base_path = match explicit {
+            Some(p) => {
+                if !p.is_absolute() {
+                    return Err(BuildError::BaseNotAbsolute {
+                        path: p.to_path_buf(),
+                    });
+                }
+                normalize_lexically(p)
+            }
+            None => {
+                let raw = tpl.literal_prefix();
+                let dir_prefix = truncate_to_separator(raw);
+                if dir_prefix.is_empty() {
+                    return Err(BuildError::NoDerivableBase { fields });
+                }
+                let candidate = normalize_lexically(Path::new(dir_prefix));
+                if !candidate.is_absolute() {
+                    return Err(BuildError::NoDerivableBase { fields });
+                }
+                if is_filesystem_root(&candidate) {
+                    return Err(BuildError::DerivedBaseIsRoot {
+                        prefix: dir_prefix.to_owned(),
+                    });
+                }
+                candidate
+            }
+        };
+
+        if explicit.is_some() && is_filesystem_root(&base_path) {
+            warn!(
+                message = "Configured `base_dir` is a filesystem root; path \
+                           confinement is effectively disabled.",
+                base_dir = ?base_path,
+            );
+        }
+
+        Ok(Some(Self {
+            base_lexical: base_path,
+        }))
+    }
+
+    /// The lexical base directory used for containment checks.
+    pub fn base_dir(&self) -> &Path {
+        &self.base_lexical
+    }
+
+    /// Apply lexical confinement to a rendered path. Pure — runs before
+    /// any FS mutation.
+    pub fn confine(&self, rendered: &Path) -> Result<PathBuf, ConfineError> {
+        let raw_bytes = path_bytes(rendered);
+        if raw_bytes.contains(&0) {
+            return Err(ConfineError::NulByte);
+        }
+        if raw_bytes.len() > MAX_RENDERED_PATH_LEN {
+            return Err(ConfineError::TooLong {
+                len: raw_bytes.len(),
+                max: MAX_RENDERED_PATH_LEN,
+            });
+        }
+
+        let absolute = if rendered.is_absolute() {
+            rendered.to_path_buf()
+        } else {
+            self.base_lexical.join(rendered)
+        };
+        let normalized = normalize_lexically(&absolute);
+
+        #[cfg(windows)]
+        {
+            for c in normalized.components() {
+                if let Component::Normal(os) = c {
+                    let s = os.to_string_lossy();
+                    if s.contains(':') {
+                        return Err(ConfineError::ForbiddenComponent {
+                            component: s.into_owned(),
+                        });
+                    }
+                    if is_windows_reserved_name(&s) {
+                        return Err(ConfineError::ForbiddenComponent {
+                            component: s.into_owned(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !normalized.starts_with(&self.base_lexical) {
+            return Err(ConfineError::OutsideBase {
+                rendered: normalized,
+                base: self.base_lexical.clone(),
+            });
+        }
+
+        Ok(normalized)
+    }
+
+    /// Strip the base prefix from an already-confined absolute path to
+    /// produce a path suitable for cap-std relative operations.
+    pub fn relative_path<'a>(&self, confined: &'a Path) -> &'a Path {
+        confined
+            .strip_prefix(&self.base_lexical)
+            .unwrap_or(confined)
+    }
+}
+
+#[cfg(unix)]
+fn path_bytes(p: &Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(p: &Path) -> &[u8] {
+    p.as_os_str().to_str().map(str::as_bytes).unwrap_or(&[])
+}
+
+#[cfg(windows)]
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(name)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.starts_with("COM")
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'0'..=b'9' | 0xB9 | 0xB2 | 0xB3))
+        || (stem.starts_with("LPT")
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'0'..=b'9' | 0xB9 | 0xB2 | 0xB3))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pb(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn normalize_lexically_cases() {
+        let cases: &[(&str, &str)] = &[
+            ("/a/b/../c", "/a/c"),
+            ("/a/./b", "/a/b"),
+            ("/a//b", "/a/b"),
+            ("/..", "/"),
+            ("/../../etc", "/etc"),
+            ("../a", "../a"),
+            ("a/../../b", "../b"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_lexically(&pb(input)),
+                pb(expected),
+                "input = {input:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_blocks_dotdot_traversal() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        let tpl = Template::try_from("/var/log/apps/{{ appname }}/%Y-%m-%d.log").unwrap();
+        let pc = PathConfinement::for_template(&tpl, None).unwrap().unwrap();
+        assert_eq!(pc.base_dir(), pb("/var/log/apps"));
+
+        assert!(pc
+            .confine(&pb("/var/log/apps/myapp/2026-01-01.log"))
+            .is_ok());
+        assert!(pc
+            .confine(&pb("/var/log/apps/../../../../etc/cron.d/v/2026-01-01.log"))
+            .is_err());
+        assert!(pc
+            .confine(&pb("/var/log/apps/../etc/passwd/2026-01-01.log"))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_rejects_injected_separator() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        let tpl = Template::try_from("/var/log/apps/{{ appname }}.log").unwrap();
+        let pc = PathConfinement::for_template(&tpl, None).unwrap().unwrap();
+
+        assert!(pc.confine(&pb("/var/log/apps/safe.log")).is_ok());
+        // A separator injected via appname still can't escape if it doesn't use ..
+        assert!(pc.confine(&pb("/var/log/apps/sub/safe.log")).is_ok());
+        // But traversal with injected separator is blocked
+        assert!(pc
+            .confine(&pb("/var/log/apps/sub/../../etc/evil.log"))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_derivable_base_for_relative_template() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        let tpl = Template::try_from("{{ appname }}.log").unwrap();
+        let err = PathConfinement::for_template(&tpl, None).unwrap_err();
+        assert!(matches!(err, BuildError::NoDerivableBase { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_only_prefix_rejected() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        let tpl = Template::try_from("/{{ tenant }}/app.log").unwrap();
+        let err = PathConfinement::for_template(&tpl, None).unwrap_err();
+        assert!(matches!(err, BuildError::DerivedBaseIsRoot { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_template_returns_none() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        let tpl = Template::try_from("/var/log/vector/output.log").unwrap();
+        let result = PathConfinement::for_template(&tpl, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_base_dir_overrides_prefix() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        let tpl = Template::try_from("{{ appname }}.log").unwrap();
+        let base = pb("/data/logs");
+        let pc = PathConfinement::for_template(&tpl, Some(&base))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pc.base_dir(), pb("/data/logs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_rejects_too_long_path() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        let tpl = Template::try_from("/var/log/apps/{{ appname }}.log").unwrap();
+        let pc = PathConfinement::for_template(&tpl, None).unwrap().unwrap();
+
+        let long_component = "a".repeat(MAX_RENDERED_PATH_LEN + 1);
+        let long_path = pb(&format!("/var/log/apps/{long_component}.log"));
+        let err = pc.confine(&long_path).unwrap_err();
+        assert!(matches!(err, ConfineError::TooLong { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_rejects_nul_byte() {
+        use crate::template::Template;
+        use std::convert::TryFrom;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tpl = Template::try_from("/var/log/apps/{{ appname }}.log").unwrap();
+        let pc = PathConfinement::for_template(&tpl, None).unwrap().unwrap();
+
+        let raw = b"/var/log/apps/evil\0.log";
+        let path = Path::new(OsStr::from_bytes(raw));
+        let err = pc.confine(path).unwrap_err();
+        assert!(matches!(err, ConfineError::NulByte));
+    }
+}
