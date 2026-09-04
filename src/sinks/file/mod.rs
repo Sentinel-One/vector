@@ -1,4 +1,5 @@
 use std::convert::TryFrom;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_compression::tokio::write::{GzipEncoder, ZstdEncoder};
@@ -33,7 +34,10 @@ use crate::{
     internal_events::{
         FileBytesSent, FileInternalMetricsConfig, FileIoError, FileOpen, TemplateRenderingError,
     },
-    sinks::util::{timezone_to_offset, StreamSink},
+    sinks::util::{
+        path_confinement::{ConfineError, PathConfinement},
+        timezone_to_offset, StreamSink,
+    },
     template::Template,
 };
 
@@ -56,6 +60,29 @@ pub struct FileSinkConfig {
     ))]
     #[configurable(metadata(docs::examples = "/tmp/vector-%Y-%m-%d.log.zst"))]
     pub path: Template,
+
+    /// Base directory used to confine templated `path` values.
+    ///
+    /// When `path` references event fields, Vector rejects any rendered path
+    /// that resolves outside of this directory (for example, via a `../`
+    /// sequence in the field's value), preventing writes outside the
+    /// intended log directory. If unset, the base directory is derived from
+    /// the literal prefix of the `path` template, up to the last `/` before
+    /// the first field reference.
+    #[configurable(metadata(docs::examples = "/var/log/vector"))]
+    #[serde(default)]
+    pub base_dir: Option<PathBuf>,
+
+    /// Disables confinement of templated `path` values to a base directory.
+    ///
+    /// This field only has an effect when `path` references event fields.
+    ///
+    /// **Warning**: enabling this allows any event field referenced by
+    /// `path` to place the output file anywhere on the filesystem the
+    /// Vector process can write to. Only enable this if every field
+    /// referenced in `path` is fully trusted.
+    #[serde(default)]
+    pub dangerously_allow_unconfined_template_resolution: bool,
 
     /// The amount of time that a file can be idle and stay open.
     ///
@@ -95,6 +122,8 @@ impl GenerateConfig for FileSinkConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
             path: Template::try_from("/tmp/vector-%Y-%m-%d.log").unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Default::default(),
@@ -204,6 +233,7 @@ impl SinkConfig for FileSinkConfig {
 
 pub struct FileSink {
     path: Template,
+    path_confinement: Option<PathConfinement>,
     transformer: Transformer,
     encoder: Encoder<Framer>,
     idle_timeout: Duration,
@@ -224,8 +254,20 @@ impl FileSink {
             .or(cx.globals.timezone)
             .and_then(timezone_to_offset);
 
+        let path_confinement = if config.dangerously_allow_unconfined_template_resolution {
+            warn!(
+                message = "Path confinement is disabled for this file sink; templated \
+                           `path` values can write anywhere the Vector process has \
+                           filesystem access to.",
+            );
+            None
+        } else {
+            PathConfinement::for_template(&config.path, config.base_dir.as_deref())?
+        };
+
         Ok(Self {
             path: config.path.clone().with_tz_offset(offset),
+            path_confinement,
             transformer,
             encoder,
             idle_timeout: config.idle_timeout,
@@ -252,6 +294,18 @@ impl FileSink {
         };
 
         Some(bytes)
+    }
+
+    /// Confines the rendered `path` bytes to the sink's configured base
+    /// directory, if confinement is enabled. Returns an owned, normalized
+    /// path suitable for filesystem operations.
+    fn confine_path(&self, path: &Bytes) -> Result<PathBuf, ConfineError> {
+        let bytes_path = BytesPath::new(path.clone());
+        let rendered: &Path = bytes_path.as_ref();
+        match &self.path_confinement {
+            Some(confinement) => confinement.confine(rendered),
+            None => Ok(rendered.to_path_buf()),
+        }
     }
 
     fn deadline_at(&self) -> Instant {
@@ -345,7 +399,24 @@ impl FileSink {
             file
         } else {
             trace!(message = "Opening new file.", ?path);
-            let file = match open_file(BytesPath::new(path.clone())).await {
+            let confined_path = match self.confine_path(&path) {
+                Ok(confined_path) => confined_path,
+                Err(error) => {
+                    // The rendered path escapes the sink's confinement base
+                    // directory (or otherwise fails validation); refuse to
+                    // touch the filesystem and drop the event.
+                    emit!(FileIoError {
+                        code: "path_confinement_violation",
+                        message: "Rendered path failed confinement check.",
+                        error: std::io::Error::new(std::io::ErrorKind::InvalidInput, error),
+                        path: &path,
+                        dropped_events: 1,
+                    });
+                    event.metadata().update_status(EventStatus::Errored);
+                    return;
+                }
+            };
+            let file = match open_file(confined_path).await {
                 Ok(file) => file,
                 Err(error) => {
                     // We couldn't open the file for this event.
@@ -399,6 +470,13 @@ impl FileSink {
     }
 }
 
+// `path` is confined (see `FileSink::confine_path`), so this rejects `../`
+// escapes. It still resolves through `std::fs`'s plain `open`/`create_dir_all`
+// (not `openat`-relative), so a symlink planted at an intermediate component
+// before `create_dir_all` runs would still be followed. Closing that
+// TOCTOU gap would mean resolving relative to a directory handle instead of
+// a path string — evaluate `cap-std` (https://github.com/bytecodealliance/cap-std)
+// for that if it's ever worth the added (sync, spawn_blocking-bridged) dependency.
 async fn open_file(path: impl AsRef<std::path::Path>) -> std::io::Result<File> {
     let parent = path.as_ref().parent();
 
@@ -448,7 +526,7 @@ mod tests {
     use similar_asserts::assert_eq;
     use vector_lib::{
         codecs::JsonSerializerConfig,
-        event::{LogEvent, TraceEvent},
+        event::{BatchNotifier, BatchStatus, LogEvent, TraceEvent},
         sink::VectorSink,
     };
 
@@ -474,6 +552,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.clone().try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -500,6 +580,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.clone().try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::Gzip,
@@ -526,6 +608,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.clone().try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::Zstd,
@@ -557,6 +641,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -639,6 +725,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.clone().try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: Duration::from_secs(1),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -695,6 +783,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.clone().try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -726,6 +816,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -777,6 +869,8 @@ mod tests {
 
         let config = FileSinkConfig {
             path: template.clone().try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
             idle_timeout: default_idle_timeout(),
             encoding: (None::<FramingConfig>, JsonSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -826,5 +920,162 @@ mod tests {
                 .expect("Running sink failed")
         })
         .await;
+    }
+
+    fn confinement_test_config(
+        path: Template,
+        base_dir: Option<std::path::PathBuf>,
+    ) -> FileSinkConfig {
+        FileSinkConfig {
+            path,
+            base_dir,
+            dangerously_allow_unconfined_template_resolution: false,
+            idle_timeout: default_idle_timeout(),
+            encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+            compression: Compression::None,
+            acknowledgements: Default::default(),
+            timezone: Default::default(),
+            internal_metrics: FileInternalMetricsConfig {
+                include_file_tag: true,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn path_confinement_rejects_traversal() {
+        trace_init();
+
+        // `allowed` is the derived confinement base (the template's literal
+        // prefix); `secret` is a sibling directory that a `../` escape would
+        // land in if confinement didn't reject it.
+        let scratch = temp_dir();
+        let allowed = scratch.join("allowed");
+        let secret = scratch.join("secret");
+
+        let mut template = allowed.to_string_lossy().to_string();
+        template.push_str("/{{ appname }}.log");
+        let config = confinement_test_config(template.try_into().unwrap(), None);
+
+        let sink = FileSink::new(&config, SinkContext::default()).unwrap();
+
+        let (legit_batch, mut legit_receiver) = BatchNotifier::new_with_receiver();
+        let mut legit_event = LogEvent::from("safe line").with_batch_notifier(&legit_batch);
+        legit_event.insert("appname", "safe");
+
+        let (evil_batch, mut evil_receiver) = BatchNotifier::new_with_receiver();
+        let mut evil_event = LogEvent::from("evil line").with_batch_notifier(&evil_batch);
+        evil_event.insert("appname", "../secret/evil");
+
+        drop(legit_batch);
+        drop(evil_batch);
+
+        let events = vec![Event::Log(legit_event), Event::Log(evil_event)];
+
+        VectorSink::from_event_streamsink(sink)
+            .run(Box::pin(stream::iter(events).map(Into::into)))
+            .await
+            .expect("Running sink failed");
+
+        assert_eq!(legit_receiver.try_recv(), Ok(BatchStatus::Delivered));
+        assert_eq!(evil_receiver.try_recv(), Ok(BatchStatus::Errored));
+
+        assert_eq!(
+            lines_from_file(allowed.join("safe.log")),
+            vec!["safe line".to_string()]
+        );
+        assert!(
+            !secret.exists(),
+            "confinement should have prevented the `../` escape from creating {secret:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_confinement_disabled_by_flag_allows_traversal() {
+        trace_init();
+
+        let scratch = temp_dir();
+        let allowed = scratch.join("allowed");
+        let secret = scratch.join("secret");
+
+        let mut template = allowed.to_string_lossy().to_string();
+        template.push_str("/{{ appname }}.log");
+        let mut config = confinement_test_config(template.try_into().unwrap(), None);
+        config.dangerously_allow_unconfined_template_resolution = true;
+
+        let sink = FileSink::new(&config, SinkContext::default()).unwrap();
+
+        let (evil_batch, mut evil_receiver) = BatchNotifier::new_with_receiver();
+        let mut evil_event = LogEvent::from("evil line").with_batch_notifier(&evil_batch);
+        evil_event.insert("appname", "../secret/evil");
+
+        drop(evil_batch);
+
+        VectorSink::from_event_streamsink(sink)
+            .run(Box::pin(
+                stream::iter(vec![Event::Log(evil_event)]).map(Into::into),
+            ))
+            .await
+            .expect("Running sink failed");
+
+        assert_eq!(evil_receiver.try_recv(), Ok(BatchStatus::Delivered));
+        assert_eq!(
+            lines_from_file(secret.join("evil.log")),
+            vec!["evil line".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn path_confinement_base_dir_override() {
+        trace_init();
+
+        let base = temp_dir();
+        let config = confinement_test_config(
+            Template::try_from("{{ appname }}.log").unwrap(),
+            Some(base.clone()),
+        );
+
+        let sink = FileSink::new(&config, SinkContext::default()).unwrap();
+
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+        let mut event = LogEvent::from("hello").with_batch_notifier(&batch);
+        event.insert("appname", "safe");
+
+        drop(batch);
+
+        VectorSink::from_event_streamsink(sink)
+            .run(Box::pin(
+                stream::iter(vec![Event::Log(event)]).map(Into::into),
+            ))
+            .await
+            .expect("Running sink failed");
+
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+        assert_eq!(
+            lines_from_file(base.join("safe.log")),
+            vec!["hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_confinement_build_error_without_derivable_base() {
+        let config =
+            confinement_test_config(Template::try_from("{{ appname }}.log").unwrap(), None);
+
+        let error = FileSink::new(&config, SinkContext::default())
+            .err()
+            .expect("expected sink construction to fail without a derivable base directory");
+        assert!(
+            error.to_string().contains("no literal directory prefix"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn dangerously_allow_unconfined_skips_confinement_build() {
+        let mut config =
+            confinement_test_config(Template::try_from("{{ appname }}.log").unwrap(), None);
+        config.dangerously_allow_unconfined_template_resolution = true;
+
+        assert!(FileSink::new(&config, SinkContext::default()).is_ok());
     }
 }
