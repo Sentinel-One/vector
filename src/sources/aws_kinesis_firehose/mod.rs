@@ -175,7 +175,7 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
             .chain(self.access_key.iter());
 
         // From this component's context, so the deployment controls the cap.
-        let compression_limits = cx.globals.limits.compression;
+        let compression_limits = cx.globals.ops_limits.compression;
         let svc = filters::firehose(
             access_keys.map(|key| key.inner().to_string()).collect(),
             self.store_access_key,

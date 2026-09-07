@@ -168,7 +168,7 @@ impl SourceConfig for OpentelemetryConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
         // Taken from this component's context rather than process state, so the deployment
         // controls the cap. `CompressionLimits` is `Copy`, so it can be captured freely below.
-        let compression_limits: CompressionLimits = cx.globals.limits.compression;
+        let compression_limits: CompressionLimits = cx.globals.ops_limits.compression;
 
         let grpc_config_exists = self.grpc.is_some();
         let http_config_exists = self.http.is_some();

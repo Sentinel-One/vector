@@ -101,7 +101,7 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
         let path = path.to_owned();
         // Limits come from this component's context, so a deployment controls the cap.
         // `CompressionLimits` is `Copy`, so it can simply be captured by the filter closures.
-        let compression_limits = cx.globals.limits.compression;
+        let compression_limits = cx.globals.ops_limits.compression;
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
         let enable_source_ip = self.enable_source_ip();
 

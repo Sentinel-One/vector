@@ -637,13 +637,13 @@ mod tests {
     async fn a_component_raising_a_limit_warns() {
         let warnings = load(
             indoc! {r#"
-            [limits.compression]
+            [ops_limits.compression]
             max_decompressed_size_bytes = 1024
 
             [sources.in]
             type = "test_basic"
 
-            [sources.in.limits.compression]
+            [sources.in.ops_limits.compression]
             max_decompressed_size_bytes = 1048576
 
             [sinks.out]
@@ -659,7 +659,7 @@ mod tests {
         let warning = &warnings[0];
         assert!(warning.contains(r#"Source "in""#), "got: {warning}");
         assert!(
-            warning.contains("limits.compression.max_decompressed_size_bytes = 1048576"),
+            warning.contains("ops_limits.compression.max_decompressed_size_bytes = 1048576"),
             "the warning must name what was asked for, got: {warning}"
         );
         assert!(
@@ -677,13 +677,13 @@ mod tests {
     async fn a_component_lowering_a_limit_is_silent() {
         let warnings = load(
             indoc! {r#"
-            [limits.compression]
+            [ops_limits.compression]
             max_decompressed_size_bytes = 1048576
 
             [sources.in]
             type = "test_basic"
 
-            [sources.in.limits.compression]
+            [sources.in.ops_limits.compression]
             max_decompressed_size_bytes = 1024
 
             [sinks.out]
@@ -704,7 +704,7 @@ mod tests {
     async fn a_component_with_no_override_is_silent() {
         let warnings = load(
             indoc! {r#"
-            [limits.compression]
+            [ops_limits.compression]
             max_decompressed_size_bytes = 1024
 
             [sources.in]
@@ -732,7 +732,7 @@ mod tests {
     async fn transforms_and_sinks_carry_the_override_too() {
         let warnings = load(
             indoc! {r#"
-            [limits.compression]
+            [ops_limits.compression]
             max_decompressed_size_bytes = 1024
 
             [sources.in]
@@ -744,14 +744,14 @@ mod tests {
             suffix = "foo"
             increase = 1.25
 
-            [transforms.mid.limits.compression]
+            [transforms.mid.ops_limits.compression]
             max_decompressed_size_bytes = 2048
 
             [sinks.out]
             type = "test_basic"
             inputs = ["mid"]
 
-            [sinks.out.limits.compression]
+            [sinks.out.ops_limits.compression]
             max_decompressed_size_bytes = 4096
             "#},
             Format::Toml,
@@ -769,13 +769,13 @@ mod tests {
     #[tokio::test]
     async fn a_permitted_raise_reports_that_it_was_granted() {
         let toml = indoc! {r#"
-            [limits.compression]
+            [ops_limits.compression]
             max_decompressed_size_bytes = 1024
 
             [sources.in]
             type = "test_basic"
 
-            [sources.in.limits.compression]
+            [sources.in.ops_limits.compression]
             max_decompressed_size_bytes = 1048576
 
             [sinks.out]
@@ -805,13 +805,13 @@ mod tests {
     #[tokio::test]
     async fn an_unpermitted_raise_reports_that_it_was_clamped() {
         let toml = indoc! {r#"
-            [limits.compression]
+            [ops_limits.compression]
             max_decompressed_size_bytes = 1024
 
             [sources.in]
             type = "test_basic"
 
-            [sources.in.limits.compression]
+            [sources.in.ops_limits.compression]
             max_decompressed_size_bytes = 1048576
 
             [sinks.out]

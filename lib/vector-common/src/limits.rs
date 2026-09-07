@@ -137,7 +137,7 @@ impl CompressionLimits {
 /// decode without a pipeline author needing to raise it, while still bounding a peer that never
 /// sends a delimiter. Deployments with routinely larger single-line records (e.g.
 /// CloudTrail-via-`aws_s3`, which can exceed 10 MB) still need to raise this via
-/// `limits.framing.max_frame_length_bytes` or a component's own `max_length`.
+/// `ops_limits.framing.max_frame_length_bytes` or a component's own `max_length`.
 pub const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 1024 * 1024;
 
 /// Limits applied by delimited framers (`character_delimited`, `newline_delimited`,
@@ -364,7 +364,7 @@ impl OperationalLimits {
             let allowed = self.compression.max_decompressed_size_bytes;
             if requested > allowed {
                 raises.push(LimitRaise {
-                    field: "limits.compression.max_decompressed_size_bytes",
+                    field: "ops_limits.compression.max_decompressed_size_bytes",
                     requested: requested as u64,
                     allowed: allowed as u64,
                 });
@@ -381,7 +381,7 @@ impl OperationalLimits {
             let allowed = self.framing.max_frame_length_bytes;
             if requested > allowed {
                 raises.push(LimitRaise {
-                    field: "limits.framing.max_frame_length_bytes",
+                    field: "ops_limits.framing.max_frame_length_bytes",
                     requested: requested as u64,
                     allowed: allowed as u64,
                 });
@@ -397,7 +397,7 @@ impl OperationalLimits {
             let allowed = self.connection.ack_write_timeout_secs;
             if requested > allowed {
                 raises.push(LimitRaise {
-                    field: "limits.connection.ack_write_timeout_secs",
+                    field: "ops_limits.connection.ack_write_timeout_secs",
                     requested,
                     allowed,
                 });
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(
             raises,
             vec![LimitRaise {
-                field: "limits.compression.max_decompressed_size_bytes",
+                field: "ops_limits.compression.max_decompressed_size_bytes",
                 requested: 4096,
                 allowed: 1024,
             }]
@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(
             raises,
             vec![LimitRaise {
-                field: "limits.framing.max_frame_length_bytes",
+                field: "ops_limits.framing.max_frame_length_bytes",
                 requested: 4096,
                 allowed: 1024,
             }]
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(
             raises,
             vec![LimitRaise {
-                field: "limits.connection.ack_write_timeout_secs",
+                field: "ops_limits.connection.ack_write_timeout_secs",
                 requested: 120,
                 allowed: 30,
             }]

@@ -25,8 +25,8 @@ pub struct NewlineDelimitedDecoderOptions {
     /// This length does *not* include the trailing delimiter.
     ///
     /// Defaults to the deployment's configured frame length cap
-    /// (`limits.framing.max_frame_length_bytes`, 1 MiB unless overridden). Set this field to
-    /// override the cap for this component alone; unlike `sources.<name>.limits.framing`, it is
+    /// (`ops_limits.framing.max_frame_length_bytes`, 1 MiB unless overridden). Set this field to
+    /// override the cap for this component alone; unlike `sources.<name>.ops_limits.framing`, it is
     /// applied exactly as given, not clamped by `--allow-component-limit-overrides`.
     ///
     /// A frame longer than the limit is a fatal decode error and the connection is reset, whether

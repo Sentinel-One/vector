@@ -144,7 +144,7 @@ impl SourceConfig for LogstashConfig {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let source = LogstashSource {
             // From this component's context, so the deployment controls the cap.
-            compression_limits: cx.globals.limits.compression,
+            compression_limits: cx.globals.ops_limits.compression,
             timestamp_converter: types::Conversion::Timestamp(cx.globals.timezone()),
             legacy_host_key_path: log_schema().host_key().cloned(),
             log_namespace,

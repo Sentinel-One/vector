@@ -105,7 +105,7 @@ where
     ) -> crate::Result<crate::sources::Source> {
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
         let ack_write_timeout =
-            Duration::from_secs(cx.globals.limits.connection.ack_write_timeout_secs);
+            Duration::from_secs(cx.globals.ops_limits.connection.ack_write_timeout_secs);
 
         Ok(Box::pin(async move {
             let listenfd = ListenFd::from_env();

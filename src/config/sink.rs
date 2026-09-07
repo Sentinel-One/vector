@@ -87,7 +87,7 @@ where
     /// with `--allow-component-limit-overrides`; a stricter one always applies.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
-    pub limits: OperationalLimitsOverride,
+    pub ops_limits: OperationalLimitsOverride,
 
     #[serde(flatten)]
     #[configurable(metadata(docs::hidden))]
@@ -110,7 +110,7 @@ where
             healthcheck_uri: None,
             inner: inner.into(),
             proxy: Default::default(),
-            limits: Default::default(),
+            ops_limits: Default::default(),
             graph: Default::default(),
         }
     }
@@ -168,7 +168,7 @@ where
             healthcheck: self.healthcheck,
             healthcheck_uri: self.healthcheck_uri,
             proxy: self.proxy,
-            limits: self.limits,
+            ops_limits: self.ops_limits,
             graph: self.graph,
         }
     }
