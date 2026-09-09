@@ -237,7 +237,7 @@ pub struct FileSink {
     transformer: Transformer,
     encoder: Encoder<Framer>,
     idle_timeout: Duration,
-    files: ExpiringHashMap<Bytes, OutFile>,
+    files: ExpiringHashMap<PathBuf, OutFile>,
     compression: Compression,
     events_sent: Registered<EventsSent>,
     include_file_metric_tag: bool,
@@ -391,32 +391,38 @@ impl FileSink {
             }
         };
 
-        let next_deadline = self.deadline_at();
-        trace!(message = "Computed next deadline.", next_deadline = ?next_deadline, path = ?path);
+        // Confinement is checked up front, on every event, and its result is
+        // what we key `self.files` by. Two raw rendered paths that fold to
+        // the same on-disk location via lexical normalization (e.g. `x` and
+        // `x/../x`) must land in the same cache entry — otherwise they'd get
+        // independent `OutFile` handles writing to the same underlying file.
+        let confined_path = match self.confine_path(&path) {
+            Ok(confined_path) => confined_path,
+            Err(error) => {
+                // The rendered path escapes the sink's confinement base
+                // directory (or otherwise fails validation); refuse to
+                // touch the filesystem and drop the event.
+                emit!(FileIoError {
+                    code: "path_confinement_violation",
+                    message: "Rendered path failed confinement check.",
+                    error: std::io::Error::new(std::io::ErrorKind::InvalidInput, error),
+                    path: &path,
+                    dropped_events: 1,
+                });
+                event.metadata().update_status(EventStatus::Errored);
+                return;
+            }
+        };
 
-        let file = if let Some(file) = self.files.reset_at(&path, next_deadline) {
-            trace!(message = "Working with an already opened file.", path = ?path);
+        let next_deadline = self.deadline_at();
+        trace!(message = "Computed next deadline.", next_deadline = ?next_deadline, path = ?confined_path);
+
+        let file = if let Some(file) = self.files.reset_at(&confined_path, next_deadline) {
+            trace!(message = "Working with an already opened file.", path = ?confined_path);
             file
         } else {
-            trace!(message = "Opening new file.", ?path);
-            let confined_path = match self.confine_path(&path) {
-                Ok(confined_path) => confined_path,
-                Err(error) => {
-                    // The rendered path escapes the sink's confinement base
-                    // directory (or otherwise fails validation); refuse to
-                    // touch the filesystem and drop the event.
-                    emit!(FileIoError {
-                        code: "path_confinement_violation",
-                        message: "Rendered path failed confinement check.",
-                        error: std::io::Error::new(std::io::ErrorKind::InvalidInput, error),
-                        path: &path,
-                        dropped_events: 1,
-                    });
-                    event.metadata().update_status(EventStatus::Errored);
-                    return;
-                }
-            };
-            let file = match open_file(confined_path).await {
+            trace!(message = "Opening new file.", ?confined_path);
+            let file = match open_file(&confined_path).await {
                 Ok(file) => file,
                 Err(error) => {
                     // We couldn't open the file for this event.
@@ -426,7 +432,7 @@ impl FileSink {
                         code: "failed_opening_file",
                         message: "Unable to open the file.",
                         error,
-                        path: &path,
+                        path: &confined_path,
                         dropped_events: 1,
                     });
                     event.metadata().update_status(EventStatus::Errored);
@@ -436,14 +442,15 @@ impl FileSink {
 
             let outfile = OutFile::new(file, self.compression);
 
-            self.files.insert_at(path.clone(), outfile, next_deadline);
+            self.files
+                .insert_at(confined_path.clone(), outfile, next_deadline);
             emit!(FileOpen {
                 count: self.files.len()
             });
-            self.files.get_mut(&path).unwrap()
+            self.files.get_mut(&confined_path).unwrap()
         };
 
-        trace!(message = "Writing an event to file.", path = ?path);
+        trace!(message = "Writing an event to file.", path = ?confined_path);
         let event_size = event.estimated_json_encoded_size_of();
         let finalizers = event.take_finalizers();
         match write_event_to_file(file, event, &self.transformer, &mut self.encoder).await {
@@ -452,7 +459,7 @@ impl FileSink {
                 self.events_sent.emit(CountByteSize(1, event_size));
                 emit!(FileBytesSent {
                     byte_size,
-                    file: String::from_utf8_lossy(&path),
+                    file: confined_path.to_string_lossy(),
                     include_file_metric_tag: self.include_file_metric_tag,
                 });
             }
@@ -462,7 +469,7 @@ impl FileSink {
                     code: "failed_writing_file",
                     message: "Failed to write the file.",
                     error,
-                    path: &path,
+                    path: &confined_path,
                     dropped_events: 1,
                 });
             }
@@ -1077,5 +1084,44 @@ mod tests {
         config.dangerously_allow_unconfined_template_resolution = true;
 
         assert!(FileSink::new(&config, SinkContext::default()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn confined_paths_that_normalize_equal_share_one_cache_entry() {
+        trace_init();
+
+        // `x` and `x/../x` are different raw rendered paths but normalize to
+        // the same confined, on-disk path. `self.files` must be keyed by the
+        // confined path, not the raw one, or these would get independent
+        // `OutFile` handles writing to the same underlying file.
+        let scratch = temp_dir();
+        let mut template = scratch.to_string_lossy().to_string();
+        template.push_str("/{{ appname }}.log");
+        let config = confinement_test_config(template.try_into().unwrap(), None);
+
+        let mut sink = FileSink::new(&config, SinkContext::default()).unwrap();
+
+        let mut first = LogEvent::from("first line");
+        first.insert("appname", "x");
+        let mut second = LogEvent::from("second line");
+        second.insert("appname", "x/../x");
+
+        sink.process_event(Event::Log(first)).await;
+        sink.process_event(Event::Log(second)).await;
+
+        assert_eq!(
+            sink.files.len(),
+            1,
+            "two raw paths that normalize to the same on-disk file must share one cache entry"
+        );
+
+        for (_, file) in sink.files.iter_mut() {
+            file.close().await.unwrap();
+        }
+
+        assert_eq!(
+            lines_from_file(scratch.join("x.log")),
+            vec!["first line".to_string(), "second line".to_string()]
+        );
     }
 }

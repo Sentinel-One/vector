@@ -259,14 +259,6 @@ impl PathConfinement {
 
         Ok(normalized)
     }
-
-    /// Strip the base prefix from an already-confined absolute path to
-    /// produce a path suitable for cap-std relative operations.
-    pub fn relative_path<'a>(&self, confined: &'a Path) -> &'a Path {
-        confined
-            .strip_prefix(&self.base_lexical)
-            .unwrap_or(confined)
-    }
 }
 
 #[cfg(unix)]
@@ -282,18 +274,26 @@ fn path_bytes(p: &Path) -> &[u8] {
 
 #[cfg(windows)]
 fn is_windows_reserved_name(name: &str) -> bool {
-    let stem = name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(name)
-        .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.starts_with("COM")
-            && stem.len() == 4
-            && matches!(stem.as_bytes()[3], b'0'..=b'9' | 0xB9 | 0xB2 | 0xB3))
-        || (stem.starts_with("LPT")
-            && stem.len() == 4
-            && matches!(stem.as_bytes()[3], b'0'..=b'9' | 0xB9 | 0xB2 | 0xB3))
+    // Operate on chars, not bytes: the superscript digits Windows treats as
+    // equivalent to '1'/'2'/'3' in device names (¹ ² ³) are multi-byte in
+    // UTF-8, so a byte-length check like `stem.len() == 4` silently fails to
+    // recognize e.g. "COM¹" as reserved.
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    let chars: Vec<char> = stem.chars().collect();
+
+    match chars.len() {
+        3 => {
+            let upper: String = chars.iter().collect::<String>().to_ascii_uppercase();
+            matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        }
+        4 => {
+            let prefix: String = chars[..3].iter().collect::<String>().to_ascii_uppercase();
+            let is_digit_suffix =
+                chars[3].is_ascii_digit() || matches!(chars[3], '\u{B9}' | '\u{B2}' | '\u{B3}');
+            (prefix == "COM" || prefix == "LPT") && is_digit_suffix
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -433,5 +433,25 @@ mod tests {
         let path = Path::new(OsStr::from_bytes(raw));
         let err = pc.confine(path).unwrap_err();
         assert!(matches!(err, ConfineError::NulByte));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserved_name_detection() {
+        assert!(is_windows_reserved_name("CON"));
+        assert!(is_windows_reserved_name("con"));
+        assert!(is_windows_reserved_name("NUL.txt"));
+        assert!(is_windows_reserved_name("COM1"));
+        assert!(is_windows_reserved_name("lpt9"));
+        // Superscript digits (¹ ² ³) are multi-byte in UTF-8; Windows still
+        // treats these as equivalent to COM1/COM2/COM3.
+        assert!(is_windows_reserved_name("COM\u{B9}"));
+        assert!(is_windows_reserved_name("LPT\u{B2}"));
+        assert!(is_windows_reserved_name("com\u{B3}.log"));
+
+        assert!(!is_windows_reserved_name("COMPANY"));
+        assert!(!is_windows_reserved_name("COM"));
+        assert!(!is_windows_reserved_name("COM10"));
+        assert!(!is_windows_reserved_name("safe.log"));
     }
 }
