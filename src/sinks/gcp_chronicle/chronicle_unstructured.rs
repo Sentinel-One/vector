@@ -241,7 +241,7 @@ impl SinkConfig for ChronicleUnstructuredConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let creds = self
             .auth
-            .build(Scope::MalachiteIngestion, &APP_INFO)
+            .build(Scope::MalachiteIngestion)
             .await?;
 
         let tls = TlsSettings::from_options(self.tls.as_ref())?;

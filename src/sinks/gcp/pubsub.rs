@@ -164,7 +164,7 @@ struct PubsubSink {
 impl PubsubSink {
     async fn from_config(config: &PubsubConfig) -> crate::Result<Self> {
         // We only need to load the credentials if we are not targeting an emulator.
-        let auth = config.auth.build(Scope::PubSub, &APP_INFO).await?;
+        let auth = config.auth.build(Scope::PubSub).await?;
 
         let uri_base = format!(
             "{}/v1/projects/{}/topics/{}",

@@ -95,7 +95,7 @@ mod proto {
 pub(crate) enum PubsubError {
     #[snafu(display("Invalid endpoint URI: {}", source))]
     Uri { source: InvalidUri },
-    #[snafu(display("Could not create endpoint: {}", source))]
+#[snafu(display("Could not create endpoint: {}", source))]
     Endpoint { source: tonic::transport::Error },
     #[snafu(display("Could not set up endpoint TLS settings: {}", source))]
     EndpointTls { source: tonic::transport::Error },
@@ -266,7 +266,7 @@ impl SourceConfig for PubsubConfig {
             }
         };
 
-        let auth = self.auth.build(Scope::PubSub, &APP_INFO).await?;
+        let auth = self.auth.build(Scope::PubSub).await?;
 
         let mut uri: Uri = self.endpoint.parse().context(UriSnafu)?;
         auth.apply_uri(&mut uri);
