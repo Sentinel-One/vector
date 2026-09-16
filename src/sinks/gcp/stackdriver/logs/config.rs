@@ -202,8 +202,7 @@ impl_generate_config_from_default!(StackdriverConfig);
 #[typetag::serde(name = "gcp_stackdriver_logs")]
 impl SinkConfig for StackdriverConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let app_info = crate::app_info();
-        let auth = self.auth.build(Scope::LoggingWrite, &app_info).await?;
+        let auth = self.auth.build(Scope::LoggingWrite).await?;
 
         let request_builder = StackdriverLogsRequestBuilder {
             encoder: StackdriverLogsEncoder::new(

@@ -103,7 +103,7 @@ pub struct GcpAuthConfig {
 }
 
 impl GcpAuthConfig {
-    pub async fn build(&self, scope: Scope, app_info: &AppInfo) -> crate::Result<GcpAuthenticator> {
+    pub async fn build(&self, scope: Scope) -> crate::Result<GcpAuthenticator> {
         Ok(if self.skip_authentication {
             GcpAuthenticator::None
         } else {
@@ -112,7 +112,7 @@ impl GcpAuthConfig {
             match (&creds_path, &self.api_key) {
                 (Some(path), _) => GcpAuthenticator::from_file(path, scope).await?,
                 (None, Some(api_key)) => GcpAuthenticator::from_api_key(api_key.inner())?,
-                (None, None) => GcpAuthenticator::new_implicit(app_info).await?,
+                (None, None) => GcpAuthenticator::new_implicit().await?,
             }
         })
     }
@@ -128,21 +128,24 @@ pub enum GcpAuthenticator {
 #[derive(Debug)]
 pub struct InnerCreds {
     creds: Option<(Credentials, Scope)>,
-    token: RwLock<Token>,
+    token: RwLock<Option<Token>>,
 }
 
 impl GcpAuthenticator {
     async fn from_file(path: &str, scope: Scope) -> crate::Result<Self> {
         let creds = Credentials::from_file(path).context(InvalidCredentialsSnafu)?;
-        let token = RwLock::new(fetch_token(&creds, &scope).await?);
         let creds = Some((creds, scope));
-        Ok(Self::Credentials(Arc::new(InnerCreds { creds, token })))
+        Ok(Self::Credentials(Arc::new(InnerCreds {
+            creds,
+            token: RwLock::new(None),
+        })))
     }
 
-    async fn new_implicit(app_info: &AppInfo) -> crate::Result<Self> {
-        let token = RwLock::new(get_token_implicit(app_info).await?);
-        let creds = None;
-        Ok(Self::Credentials(Arc::new(InnerCreds { creds, token })))
+    async fn new_implicit() -> crate::Result<Self> {
+        Ok(Self::Credentials(Arc::new(InnerCreds {
+            creds: None,
+            token: RwLock::new(None),
+        })))
     }
 
     fn from_api_key(api_key: &str) -> crate::Result<Self> {
@@ -154,7 +157,7 @@ impl GcpAuthenticator {
 
     pub fn make_token(&self) -> Option<String> {
         match self {
-            Self::Credentials(inner) => Some(inner.make_token()),
+            Self::Credentials(inner) => inner.make_token(),
             Self::ApiKey(_) | Self::None => None,
         }
     }
@@ -198,33 +201,35 @@ impl GcpAuthenticator {
     async fn token_regenerator(self, sender: watch::Sender<()>, app_info: &'static AppInfo) {
         match self {
             Self::Credentials(inner) => {
-                let expires_in = inner.token.read().unwrap().expires_in() as u64;
-                let mut deadline =
-                    Duration::from_secs(expires_in - METADATA_TOKEN_EXPIRY_MARGIN_SECS);
                 loop {
-                    tokio::time::sleep(deadline).await;
-                    debug!("Renewing GCP authentication token.");
+                    debug!("Fetching GCP authentication token.");
                     match inner.regenerate_token(app_info).await {
                         Ok(()) => {
                             sender.send_replace(());
-                            let expires_in = inner.token.read().unwrap().expires_in() as u64;
+                            let expires_in = inner
+                                .token
+                                .read()
+                                .unwrap()
+                                .as_ref()
+                                .map_or(METADATA_TOKEN_ERROR_RETRY_SECS, |t| t.expires_in() as u64);
                             // Rather than an expected fresh token, the Metadata Server may return
                             // the same (cached) token during the last 300 seconds of its lifetime.
                             // This scenario is handled by retrying the token refresh after the
                             // METADATA_TOKEN_ERROR_RETRY_SECS period when a fresh token is expected
-                            let new_deadline = if expires_in <= METADATA_TOKEN_EXPIRY_MARGIN_SECS {
+                            let deadline = if expires_in <= METADATA_TOKEN_EXPIRY_MARGIN_SECS {
                                 METADATA_TOKEN_ERROR_RETRY_SECS
                             } else {
                                 expires_in - METADATA_TOKEN_EXPIRY_MARGIN_SECS
                             };
-                            deadline = Duration::from_secs(new_deadline);
+                            tokio::time::sleep(Duration::from_secs(deadline)).await;
                         }
                         Err(error) => {
                             error!(
-                                message = "Failed to update GCP authentication token.",
+                                message = "Failed to fetch GCP authentication token.",
                                 %error
                             );
-                            deadline = Duration::from_secs(METADATA_TOKEN_ERROR_RETRY_SECS);
+                            tokio::time::sleep(Duration::from_secs(METADATA_TOKEN_ERROR_RETRY_SECS))
+                                .await;
                         }
                     }
                 }
@@ -245,13 +250,15 @@ impl InnerCreds {
             Some((creds, scope)) => fetch_token(creds, scope).await?,
             None => get_token_implicit(app_info).await?,
         };
-        *self.token.write().unwrap() = token;
+        *self.token.write().unwrap() = Some(token);
         Ok(())
     }
 
-    fn make_token(&self) -> String {
+    fn make_token(&self) -> Option<String> {
         let token = self.token.read().unwrap();
-        format!("{} {}", token.token_type(), token.access_token())
+        token
+            .as_ref()
+            .map(|t| format!("{} {}", t.token_type(), t.access_token()))
     }
 }
 
@@ -307,10 +314,13 @@ mod tests {
     use crate::assert_downcast_matches;
 
     #[tokio::test]
-    async fn fails_missing_creds() {
-        let error = build_auth("").await.expect_err("build failed to error");
-        assert_downcast_matches!(error, GcpError, GcpError::GetImplicitToken { .. });
-        // This should be a more relevant error
+    async fn defers_implicit_auth_when_no_creds() {
+        // With lazy token fetching, building with no credentials succeeds immediately.
+        // The first token fetch attempt happens in the background via token_regenerator.
+        let auth = build_auth("").await.expect("build should succeed with deferred auth");
+        assert!(matches!(auth, GcpAuthenticator::Credentials(..)));
+        // No token yet — make_token returns None until the background fetch succeeds.
+        assert!(auth.make_token().is_none());
     }
 
     #[tokio::test]
@@ -369,10 +379,6 @@ mod tests {
 
     async fn build_auth(toml: &str) -> crate::Result<GcpAuthenticator> {
         let config: GcpAuthConfig = toml::from_str(toml).expect("Invalid TOML");
-        let app_info = vector_common::AppInfo {
-            name: "vector",
-            version: String::from("0.44.5"),
-        };
-        config.build(Scope::Compute, &app_info).await
+        config.build(Scope::Compute).await
     }
 }
