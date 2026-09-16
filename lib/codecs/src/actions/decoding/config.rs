@@ -40,7 +40,7 @@ impl DecodingConfig {
 
     /// Sets the operational limits framers should run under.
     ///
-    /// Take these from the component's context (`cx.globals.limits`) so the deployment controls
+    /// Take these from the component's context (`cx.globals.ops_limits`) so the deployment controls
     /// the caps rather than a process-wide default.
     #[must_use]
     pub const fn with_operational_limits(mut self, limits: OperationalLimits) -> Self {

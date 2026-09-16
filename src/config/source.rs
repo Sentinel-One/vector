@@ -62,7 +62,7 @@ pub struct SourceOuter {
     /// with `--allow-component-limit-overrides`; a stricter one always applies.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
-    pub limits: OperationalLimitsOverride,
+    pub ops_limits: OperationalLimitsOverride,
 
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
@@ -80,7 +80,7 @@ impl SourceOuter {
     pub(crate) fn new<I: Into<BoxedSource>>(inner: I) -> Self {
         Self {
             proxy: Default::default(),
-            limits: Default::default(),
+            ops_limits: Default::default(),
             graph: Default::default(),
             sink_acknowledgements: false,
             inner: inner.into(),

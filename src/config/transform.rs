@@ -68,7 +68,7 @@ where
     /// with `--allow-component-limit-overrides`; a stricter one always applies.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
-    pub limits: OperationalLimitsOverride,
+    pub ops_limits: OperationalLimitsOverride,
 
     #[configurable(derived)]
     pub inputs: Inputs<T>,
@@ -92,7 +92,7 @@ where
         TransformOuter {
             inputs,
             inner,
-            limits: Default::default(),
+            ops_limits: Default::default(),
             graph: Default::default(),
         }
     }
@@ -113,7 +113,7 @@ where
         TransformOuter {
             inputs: Inputs::from_iter(inputs),
             inner: self.inner,
-            limits: self.limits,
+            ops_limits: self.ops_limits,
             graph: self.graph,
         }
     }

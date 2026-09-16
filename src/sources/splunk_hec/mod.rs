@@ -317,7 +317,7 @@ struct SplunkSource {
 impl SplunkSource {
     fn new(config: &SplunkConfig, protocol: &'static str, cx: SourceContext) -> Self {
         let log_namespace = cx.log_namespace(config.log_namespace);
-        let compression_limits = cx.globals.limits.compression;
+        let compression_limits = cx.globals.ops_limits.compression;
         let acknowledgements = cx.do_acknowledgements(config.acknowledgements.enabled.into());
         let shutdown = cx.shutdown;
         let valid_tokens: BTreeSet<String> = config

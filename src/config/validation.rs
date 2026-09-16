@@ -383,18 +383,18 @@ fn component_limit_warnings(config: &Config) -> Vec<String> {
     let components = config
         .sources
         .iter()
-        .map(|(key, outer)| ("Source", key, &outer.limits))
+        .map(|(key, outer)| ("Source", key, &outer.ops_limits))
         .chain(
             config
                 .transforms
                 .iter()
-                .map(|(key, outer)| ("Transform", key, &outer.limits)),
+                .map(|(key, outer)| ("Transform", key, &outer.ops_limits)),
         )
         .chain(
             config
                 .sinks
                 .iter()
-                .map(|(key, outer)| ("Sink", key, &outer.limits)),
+                .map(|(key, outer)| ("Sink", key, &outer.ops_limits)),
         );
 
     let mut warnings = vec![];
@@ -403,7 +403,7 @@ fn component_limit_warnings(config: &Config) -> Vec<String> {
             continue;
         }
         let allowed = config.allow_component_limit_overrides;
-        let (_, raises) = config.global.limits.resolve(over, allowed);
+        let (_, raises) = config.global.ops_limits.resolve(over, allowed);
         let outcome = if allowed {
             "It is permitted by --allow-component-limit-overrides."
         } else {

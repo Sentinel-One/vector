@@ -147,7 +147,7 @@ impl SourceConfig for FluentConfig {
         let source = FluentSource::new(
             log_namespace,
             self.max_frame_bytes,
-            cx.globals.limits.compression,
+            cx.globals.ops_limits.compression,
             self.max_entries_per_frame,
             self.max_msgpack_depth,
         );

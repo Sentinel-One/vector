@@ -196,7 +196,7 @@ impl SourceConfig for DatadogAgentConfig {
             logs_schema_definition,
             log_namespace,
             self.parse_ddtags,
-            cx.globals.limits.compression,
+            cx.globals.ops_limits.compression,
         );
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let filters = source.build_warp_filters(cx.out, acknowledgements, self)?;

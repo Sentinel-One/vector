@@ -370,7 +370,7 @@ impl HecLogsSinkConfig {
             self.rejection_report.clone(),
             self.compression,
             rej_ctx,
-            cx.globals.limits.compression,
+            cx.globals.ops_limits.compression,
         );
 
         let batch_settings = self.batch.into_batcher_settings()?;

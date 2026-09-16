@@ -80,7 +80,7 @@ pub struct GlobalOptions {
     /// Operational limits applied across components.
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
-    pub limits: OperationalLimits,
+    pub ops_limits: OperationalLimits,
 
     /// Controls how acknowledgements are handled for all sinks by default.
     ///
@@ -249,10 +249,10 @@ impl GlobalOptions {
                 proxy: self.proxy.merge(&with.proxy),
                 // Whichever file set a non-default wins; if both did, this file's value is kept.
                 // Same precedence as the `Option` fields above, which use `or`.
-                limits: if self.limits == OperationalLimits::default() {
-                    with.limits
+                ops_limits: if self.ops_limits == OperationalLimits::default() {
+                    with.ops_limits
                 } else {
-                    self.limits
+                    self.ops_limits
                 },
                 expire_metrics: self.expire_metrics.or(with.expire_metrics),
                 expire_metrics_secs: self.expire_metrics_secs.or(with.expire_metrics_secs),

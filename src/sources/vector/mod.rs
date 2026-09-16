@@ -349,7 +349,7 @@ impl GenerateConfig for VectorConfig {
 impl SourceConfig for VectorConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
         // From this component's context, so the deployment controls the cap.
-        let compression_limits: CompressionLimits = cx.globals.limits.compression;
+        let compression_limits: CompressionLimits = cx.globals.ops_limits.compression;
         let tls_settings = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let log_namespace = cx.log_namespace(self.log_namespace);

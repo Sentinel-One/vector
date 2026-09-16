@@ -23,7 +23,7 @@ impl SourceConfig for Config {
         let chkptr = cx.checkpoint_accessor().await;
         let src = self
             .clone()
-            .build_source(cx.out, cx.shutdown, chkptr, lns, cx.globals.limits.compression)
+            .build_source(cx.out, cx.shutdown, chkptr, lns, cx.globals.ops_limits.compression)
             .map(|r| match r {
                 Ok(_) => Ok(()),
                 Err(e) => {
@@ -128,5 +128,56 @@ mod tests {
     #[tokio::test]
     async fn test_basic_event_gen() {
         s::test_basic_event_gen(run).await;
+    }
+
+    #[test]
+    fn source_outer_limits_does_not_shadow_scol_limits() {
+        use crate::config::{load_from_str, Format};
+        use vector_lib::config::ComponentKey;
+
+        let toml_str = r#"
+            [sources.demo_scol_source]
+            type = "scol"
+
+            [sources.demo_scol_source.trigger]
+            interval_secs = 60
+
+            [sources.demo_scol_source.limits]
+            max_entries = 500
+            max_bytes = 11111111
+
+            [sources.demo_scol_source.limits.completion]
+            max_entries = 250
+
+            [sinks.out]
+            type = "console"
+            inputs = ["demo_scol_source"]
+            encoding.codec = "json"
+        "#;
+
+        let config =
+            load_from_str(toml_str, Format::Toml).expect("config should load without error");
+        let outer = config
+            .source(&ComponentKey::from("demo_scol_source"))
+            .expect("source should be present");
+
+        // The wrapper's own override ends up empty: `max_entries`/`max_bytes` aren't fields of
+        // `OperationalLimitsOverride`, so they were never recognised as a raise/lower request.
+        assert!(
+            outer.ops_limits.is_empty(),
+            "expected the outer `ops_limits` override to be empty (it only understands \
+             compression/framing/connection), got {:?}",
+            outer.ops_limits
+        );
+
+        // The flattened SCOL config must actually receive the `limits` key: `max_bytes` should
+        // reflect the configured (11111111), not SCOL's own 200 MiB default.
+        let inner_debug = format!("{:?}", outer.inner);
+        assert!(
+            inner_debug.contains("max_bytes: 11111111"),
+            // inner_debug.contains("max_bytes: 209715200"),
+            "expected SCOL's `limits.max_bytes` to be the configured 11111111, not \
+             silently defaulted to SCOL's own 209715200 (200 MiB); got: {inner_debug}"
+        );
     }
 }
