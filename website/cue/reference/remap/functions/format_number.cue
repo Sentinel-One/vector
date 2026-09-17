@@ -34,14 +34,18 @@ remap: functions: format_number: {
 			default: ","
 		},
 	]
-	internal_failure_reasons: []
+	internal_failure_reasons: [
+		"`value` is a float that is infinite or otherwise not representable as a decimal.",
+		"`scale` is negative.",
+		"`scale` exceeds 1024.",
+	]
 	return: types: ["string"]
 
 	examples: [
 		{
 			title: "Format a number (3 decimals)"
 			source: #"""
-				format_number(1234567.89, 3, decimal_separator: ".", grouping_separator: ",")
+				format_number!(1234567.89, 3, decimal_separator: ".", grouping_separator: ",")
 				"""#
 			return: "1,234,567.890"
 		},
