@@ -1428,6 +1428,7 @@ mod tests {
             endpoint_target: Default::default(),
             timestamp_configuration: None,
             rejection_report: Default::default(),
+            effective_bytes_algorithm: Default::default(),
         }
         .build(SinkContext::default())
         .await

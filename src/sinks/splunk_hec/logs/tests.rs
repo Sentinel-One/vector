@@ -177,6 +177,7 @@ fn hec_encoder(encoding: EncodingConfig) -> HecLogsEncoder {
         transformer,
         encoder,
         auto_extract_timestamp: false,
+        effective_bytes_algorithm: Default::default(),
     }
 }
 
@@ -253,6 +254,7 @@ async fn splunk_passthrough_token() {
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -767,6 +769,7 @@ async fn raw_endpoint_with_metadata_and_batch_headers() {
         endpoint_target: EndpointTarget::Raw,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -849,6 +852,7 @@ async fn raw_endpoint_with_only_batch_headers() {
         endpoint_target: EndpointTarget::Raw,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -912,6 +916,7 @@ async fn raw_endpoint_without_metadata_or_headers() {
         endpoint_target: EndpointTarget::Raw,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -967,6 +972,7 @@ async fn event_endpoint_with_two_batch_headers() {
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1043,6 +1049,7 @@ async fn event_endpoint_with_one_batch_header() {
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1104,6 +1111,7 @@ async fn event_endpoint_no_batching_on_metadata_fields() {
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1165,6 +1173,7 @@ async fn batch_headers_missing_value_separate_batch() {
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1231,6 +1240,7 @@ async fn batch_headers_static_headers_override() {
         endpoint_target: EndpointTarget::Event,
         timestamp_configuration: None,
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     };
     let cx = SinkContext::default();
 
@@ -1387,4 +1397,96 @@ async fn splunk_enforce_token_without_passthrough() {
     .await;
 
     assert_eq!(tokens[0], "Splunk enforced-token");
+}
+
+#[cfg(test)]
+mod effective_bytes_emission {
+    use vector_lib::codecs::{JsonSerializerConfig, TextSerializerConfig};
+
+    use crate::codecs::{Encoder, EncodingConfig};
+    use crate::sinks::splunk_hec::common::{EffectiveBytesAlgorithm, EndpointTarget, SentEvent};
+    use crate::sinks::splunk_hec::logs::{encoder::HecLogsEncoder, sink::HecProcessedEvent};
+
+    fn effective_bytes(
+        encoding: EncodingConfig,
+        algorithm: EffectiveBytesAlgorithm,
+        input: Vec<HecProcessedEvent>,
+    ) -> Option<u64> {
+        let encoder = HecLogsEncoder {
+            transformer: encoding.transformer(),
+            encoder: Encoder::<()>::new(encoding.build().unwrap()),
+            auto_extract_timestamp: false,
+            effective_bytes_algorithm: algorithm,
+        };
+        let (_, _, effective_bytes) = encoder.encode_batch(input, &mut Vec::new()).unwrap();
+        effective_bytes
+    }
+
+    fn json_value_bytes(processed: &HecProcessedEvent) -> u64 {
+        EffectiveBytesAlgorithm::ValueBytes
+            .measure(SentEvent::Json(processed.event.value()))
+            .unwrap()
+    }
+
+    #[test]
+    fn value_bytes_algorithm_sums_batch() {
+        let input = vec![super::get_processed_event(), super::get_processed_event()];
+        let expected = input.iter().map(json_value_bytes).sum::<u64>();
+        assert!(expected > 0, "test fixture should carry value bytes");
+
+        let actual = effective_bytes(
+            JsonSerializerConfig::default().into(),
+            EffectiveBytesAlgorithm::ValueBytes,
+            input,
+        );
+        assert_eq!(actual, Some(expected));
+    }
+
+    #[test]
+    fn value_bytes_algorithm_counts_raw_endpoint_json_events() {
+        let mut processed = super::get_processed_event();
+        processed.metadata.endpoint_target = EndpointTarget::Raw;
+        let expected = json_value_bytes(&processed);
+
+        let actual = effective_bytes(
+            JsonSerializerConfig::default().into(),
+            EffectiveBytesAlgorithm::ValueBytes,
+            vec![processed],
+        );
+        assert_eq!(actual, Some(expected));
+    }
+
+    #[test]
+    fn value_bytes_algorithm_counts_only_sent_text_on_event_endpoint() {
+        // The text codec sends only the message as the HEC `event` string, so the event's other
+        // fields must not be counted.
+        let actual = effective_bytes(
+            TextSerializerConfig::default().into(),
+            EffectiveBytesAlgorithm::ValueBytes,
+            vec![super::get_processed_event()],
+        );
+        assert_eq!(actual, Some("hello world".len() as u64));
+    }
+
+    #[test]
+    fn value_bytes_algorithm_counts_only_sent_text_on_raw_endpoint() {
+        let mut processed = super::get_processed_event();
+        processed.metadata.endpoint_target = EndpointTarget::Raw;
+        let actual = effective_bytes(
+            TextSerializerConfig::default().into(),
+            EffectiveBytesAlgorithm::ValueBytes,
+            vec![processed],
+        );
+        assert_eq!(actual, Some("hello world".len() as u64));
+    }
+
+    #[test]
+    fn none_algorithm_computes_no_effective_bytes() {
+        let actual = effective_bytes(
+            JsonSerializerConfig::default().into(),
+            EffectiveBytesAlgorithm::None,
+            vec![super::get_processed_event()],
+        );
+        assert_eq!(actual, None);
+    }
 }

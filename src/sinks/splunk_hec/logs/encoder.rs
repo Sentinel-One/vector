@@ -11,7 +11,10 @@ use crate::{
     codecs::Transformer,
     event::{Event, LogEvent},
     internal_events::SplunkEventEncodeError,
-    sinks::{splunk_hec::common::EndpointTarget, util::encoding::Encoder},
+    sinks::{
+        splunk_hec::common::{EffectiveBytesAlgorithm, EndpointTarget, SentEvent},
+        util::encoding::Encoder,
+    },
 };
 
 #[derive(Serialize, Debug)]
@@ -58,16 +61,22 @@ pub struct HecLogsEncoder {
     pub transformer: Transformer,
     pub encoder: crate::codecs::Encoder<()>,
     pub auto_extract_timestamp: bool,
+    pub effective_bytes_algorithm: EffectiveBytesAlgorithm,
 }
 
-impl Encoder<Vec<HecProcessedEvent>> for HecLogsEncoder {
-    fn encode_input(
+impl HecLogsEncoder {
+    /// Encodes the batch like [`Encoder::encode_input`], also returning the batch's effective bytes
+    /// (`None` when the algorithm is `none`).
+    pub fn encode_batch(
         &self,
         input: Vec<HecProcessedEvent>,
         writer: &mut dyn std::io::Write,
-    ) -> std::io::Result<(usize, GroupedCountByteSize)> {
+    ) -> std::io::Result<(usize, GroupedCountByteSize, Option<u64>)> {
         let mut encoder = self.encoder.clone();
         let mut byte_size = telemetry().create_request_count_byte_size();
+        let algorithm = self.effective_bytes_algorithm;
+        let sends_json = encoder.serializer().supports_json();
+        let mut effective_bytes: Option<u64> = None;
         let encoded_input: Vec<u8> = input
             .into_iter()
             .filter_map(|processed_event| {
@@ -78,10 +87,23 @@ impl Encoder<Vec<HecProcessedEvent>> for HecLogsEncoder {
                 byte_size.add_event(&event, event.estimated_json_encoded_size_of());
 
                 let mut bytes = BytesMut::new();
+                // A JSON codec is measured before encoding consumes the event, any other codec from
+                // its encoded text. Counted only once the event is encoded.
+                let mut measured = if sends_json {
+                    algorithm.measure(SentEvent::Json(event.as_log().value()))
+                } else {
+                    None
+                };
 
                 match metadata.endpoint_target {
                     EndpointTarget::Raw => {
                         encoder.encode(event, &mut bytes).ok()?;
+                        if !sends_json {
+                            measured = algorithm.measure(SentEvent::Text(&bytes));
+                        }
+                        if let Some(measured) = measured {
+                            *effective_bytes.get_or_insert(0) += measured;
+                        }
                         Some(bytes.to_vec())
                     }
                     EndpointTarget::Event => {
@@ -95,6 +117,7 @@ impl Encoder<Vec<HecProcessedEvent>> for HecLogsEncoder {
                             )
                         } else {
                             encoder.encode(event, &mut bytes).ok()?;
+                            measured = algorithm.measure(SentEvent::Text(&bytes));
                             HecEvent::Text(String::from_utf8_lossy(&bytes))
                         };
 
@@ -117,7 +140,12 @@ impl Encoder<Vec<HecProcessedEvent>> for HecLogsEncoder {
                         hec_data.sourcetype = metadata.sourcetype;
 
                         match serde_json::to_vec(&hec_data) {
-                            Ok(value) => Some(value),
+                            Ok(value) => {
+                                if let Some(measured) = measured {
+                                    *effective_bytes.get_or_insert(0) += measured;
+                                }
+                                Some(value)
+                            }
                             Err(error) => {
                                 emit!(SplunkEventEncodeError {
                                     error: error.into()
@@ -133,6 +161,17 @@ impl Encoder<Vec<HecProcessedEvent>> for HecLogsEncoder {
 
         let encoded_size = encoded_input.len();
         writer.write_all(encoded_input.as_slice())?;
+        Ok((encoded_size, byte_size, effective_bytes))
+    }
+}
+
+impl Encoder<Vec<HecProcessedEvent>> for HecLogsEncoder {
+    fn encode_input(
+        &self,
+        input: Vec<HecProcessedEvent>,
+        writer: &mut dyn std::io::Write,
+    ) -> std::io::Result<(usize, GroupedCountByteSize)> {
+        let (encoded_size, byte_size, _) = self.encode_batch(input, writer)?;
         Ok((encoded_size, byte_size))
     }
 }
