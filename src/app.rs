@@ -210,7 +210,11 @@ impl Application {
             debug!(message = "Disabled probing and configuration of root certificate locations on the system for OpenSSL.");
         }
 
-        let runtime = build_runtime(opts.root.threads, "vector-worker")?;
+        let runtime = build_runtime(
+            opts.root.threads,
+            opts.root.worker_stack_size,
+            "vector-worker",
+        )?;
 
         // Signal handler for OS and provider messages.
         let mut signals = SignalPair::new(&runtime);
@@ -469,10 +473,18 @@ fn get_log_levels(default: &str) -> String {
         .unwrap_or_else(|_| default.into())
 }
 
-pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtime, ExitCode> {
+pub fn build_runtime(
+    threads: Option<usize>,
+    worker_stack_size: Option<usize>,
+    thread_name: &str,
+) -> Result<Runtime, ExitCode> {
     let mut rt_builder = runtime::Builder::new_multi_thread();
     rt_builder.max_blocking_threads(20_000);
     rt_builder.enable_all().thread_name(thread_name);
+
+    if let Some(worker_stack_size) = worker_stack_size {
+        rt_builder.thread_stack_size(worker_stack_size);
+    }
 
     let threads = threads.unwrap_or_else(crate::num_threads);
     if threads == 0 {
@@ -484,7 +496,11 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
         .unwrap_or_else(|_| panic!("double thread initialization"));
     rt_builder.worker_threads(threads);
 
-    debug!(messaged = "Building runtime.", worker_threads = threads);
+    debug!(
+        messaged = "Building runtime.",
+        worker_threads = threads,
+        worker_stack_size = worker_stack_size
+    );
     Ok(rt_builder.build().expect("Unable to create async runtime"))
 }
 
@@ -570,5 +586,45 @@ pub fn watcher_config(
     match method {
         WatchConfigMethod::Recommended => config::watcher::WatcherConfig::RecommendedWatcher,
         WatchConfigMethod::Poll => config::watcher::WatcherConfig::PollWatcher(interval.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A deeply recursive Lua transform (e.g. flattening an attacker/vendor-controlled nested
+    // JSON payload with no depth guard) can overflow a worker thread's default stack and abort
+    // the whole process. This recurses deep enough with a multi-KiB frame to blow past the
+    // platform default worker stack size, to confirm `worker_stack_size` is actually applied to
+    // the runtime's worker threads (not just accepted and ignored).
+    const DEPTH: usize = 50_000;
+    const REQUESTED_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+    #[inline(never)]
+    fn deep_recurse(remaining: usize, acc: usize) -> usize {
+        let _padding = std::hint::black_box([0u8; 2048]);
+        if remaining == 0 {
+            acc
+        } else {
+            deep_recurse(remaining - 1, acc + 1)
+        }
+    }
+
+    #[test]
+    fn build_runtime_applies_custom_worker_stack_size() {
+        let runtime = build_runtime(Some(1), Some(REQUESTED_STACK_SIZE), "test-worker")
+            .expect("failed to build runtime");
+
+        // The recursion runs inside a spawned task so it actually executes on one of the
+        // runtime's worker threads (the ones `worker_stack_size` configures), not on the test's
+        // own thread.
+        let result = runtime.block_on(async {
+            tokio::spawn(async { tokio::task::block_in_place(|| deep_recurse(DEPTH, 0)) })
+                .await
+                .expect("worker thread crashed or task panicked")
+        });
+
+        assert_eq!(result, DEPTH);
     }
 }
