@@ -130,8 +130,8 @@ pub struct RootOpts {
     /// Defaults to tokio's built-in default (2 MiB) if unset. Raise this if you see
     /// "stack overflow" panics in `vector-worker` threads (e.g. from deeply recursive VRL
     /// or Lua transforms).
-    #[arg(long, env = "VECTOR_THREAD_STACK_SIZE")]
-    pub thread_stack_size: Option<usize>,
+    #[arg(long, env = "WORKER_STACK_SIZE")]
+    pub worker_stack_size: Option<usize>,
 
     /// Enable more detailed internal logging. Repeat to increase level. Overridden by `--quiet`.
     #[arg(short, long, action = ArgAction::Count)]
