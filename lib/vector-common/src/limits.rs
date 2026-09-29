@@ -12,7 +12,7 @@ use vector_config::configurable_component;
 /// Default cap on the size of any decompressed payload.
 ///
 /// Prevents a compressed "bomb" from causing unbounded memory growth.
-pub const DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES: usize = 100 * 1024 * 1024;
+pub const DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES: usize = 1000 * 1024 * 1024;
 
 /// RFC 9659 window ceiling for zstd under HTTP `Content-Encoding: zstd`: conformant senders use a
 /// `Window_Size` of at most 8 MB (2^23) and decoders need only support up to that. Governs HTTP
@@ -138,7 +138,7 @@ impl CompressionLimits {
 /// sends a delimiter. Deployments with routinely larger single-line records (e.g.
 /// CloudTrail-via-`aws_s3`, which can exceed 10 MB) still need to raise this via
 /// `ops_limits.framing.max_frame_length_bytes` or a component's own `max_length`.
-pub const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 100 * 1024 * 1024;
 
 /// Limits applied by delimited framers (`character_delimited`, `newline_delimited`,
 /// `octet_counting`) while a frame is still incomplete.
@@ -184,7 +184,7 @@ impl FramingLimits {
 /// `write_all` progresses only as the peer's TCP receive window opens, so a peer that simply
 /// stops calling `recv()` would otherwise park the write - and with it the task, socket and fd -
 /// indefinitely. Generous enough that a merely slow client is never dropped.
-pub const DEFAULT_ACK_WRITE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_ACK_WRITE_TIMEOUT_SECS: u64 = 300;
 
 /// Limits applied to per-connection network operations, such as writing an acknowledgement back
 /// to a peer.
