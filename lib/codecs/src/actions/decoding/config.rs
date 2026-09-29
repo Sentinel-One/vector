@@ -69,3 +69,43 @@ impl DecodingConfig {
         Ok(Decoder::new(framer, deserializer).with_log_namespace(self.log_namespace))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use tokio_util::codec::Decoder as _;
+    use vector_common::limits::{FramingLimits, OperationalLimits};
+    use vector_core::config::LogNamespace;
+
+    use super::DecodingConfig;
+    use crate::decoding::{DeserializerConfig, FramingConfig, NewlineDelimitedDecoderConfig};
+
+    fn newline_config() -> DecodingConfig {
+        DecodingConfig::new(
+            FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig::new()),
+            DeserializerConfig::Bytes,
+            LogNamespace::Legacy,
+        )
+    }
+
+    #[test]
+    fn framer_rejects_frame_over_the_operational_limit() {
+        let limits = OperationalLimits {
+            framing: FramingLimits::with_max_frame_length_bytes(4096),
+            ..Default::default()
+        };
+        let mut decoder = newline_config()
+            .with_operational_limits(limits)
+            .build()
+            .unwrap();
+        let mut buf = BytesMut::from(&[b'a'; 5000][..]);
+        assert!(decoder.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn framer_buffers_same_frame_under_default_limits() {
+        let mut decoder = newline_config().build().unwrap();
+        let mut buf = BytesMut::from(&[b'a'; 5000][..]);
+        assert!(matches!(decoder.decode(&mut buf), Ok(None)));
+    }
+}

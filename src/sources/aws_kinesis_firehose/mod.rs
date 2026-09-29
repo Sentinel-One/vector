@@ -159,6 +159,7 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let decoder =
             DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+                .with_operational_limits(cx.globals.ops_limits)
                 .build()?;
 
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);

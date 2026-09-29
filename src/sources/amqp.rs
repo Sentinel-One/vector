@@ -22,6 +22,7 @@ use lapin::{acker::Acker, message::Delivery, Channel};
 use snafu::Snafu;
 use std::{io::Cursor, pin::Pin};
 use tokio_util::codec::FramedRead;
+use vector_common::limits::OperationalLimits;
 use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
 use vector_lib::configurable::configurable_component;
 use vector_lib::lookup::{lookup_v2::OptionalValuePath, metadata_path, owned_value_path, path};
@@ -125,8 +126,14 @@ fn default_offset_key() -> OptionalValuePath {
 impl_generate_config_from_default!(AmqpSourceConfig);
 
 impl AmqpSourceConfig {
-    fn decoder(&self, log_namespace: LogNamespace) -> vector_lib::Result<Decoder> {
-        DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace).build()
+    fn decoder(
+        &self,
+        log_namespace: LogNamespace,
+        ops_limits: OperationalLimits,
+    ) -> vector_lib::Result<Decoder> {
+        DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+            .with_operational_limits(ops_limits)
+            .build()
     }
 }
 
@@ -137,7 +144,15 @@ impl SourceConfig for AmqpSourceConfig {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
 
-        amqp_source(self, cx.shutdown, cx.out, log_namespace, acknowledgements).await
+        amqp_source(
+            self,
+            cx.shutdown,
+            cx.out,
+            log_namespace,
+            cx.globals.ops_limits,
+            acknowledgements,
+        )
+        .await
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -207,6 +222,7 @@ pub(crate) async fn amqp_source(
     shutdown: ShutdownSignal,
     out: SourceSender,
     log_namespace: LogNamespace,
+    ops_limits: OperationalLimits,
     acknowledgements: bool,
 ) -> crate::Result<super::Source> {
     let config = config.clone();
@@ -222,6 +238,7 @@ pub(crate) async fn amqp_source(
         out,
         channel,
         log_namespace,
+        ops_limits,
         acknowledgements,
     )))
 }
@@ -306,11 +323,12 @@ async fn receive_event(
     config: &AmqpSourceConfig,
     out: &mut SourceSender,
     log_namespace: LogNamespace,
+    ops_limits: OperationalLimits,
     finalizer: Option<&UnorderedFinalizer<FinalizerEntry>>,
     msg: Delivery,
 ) -> Result<(), ()> {
     let payload = Cursor::new(Bytes::copy_from_slice(&msg.data));
-    let decoder = config.decoder(log_namespace).map_err(|_e| ())?;
+    let decoder = config.decoder(log_namespace, ops_limits).map_err(|_e| ())?;
     let mut stream = FramedRead::new(payload, decoder);
 
     // Extract timestamp from AMQP message
@@ -417,6 +435,7 @@ async fn run_amqp_source(
     mut out: SourceSender,
     channel: Channel,
     log_namespace: LogNamespace,
+    ops_limits: OperationalLimits,
     acknowledgements: bool,
 ) -> Result<(), ()> {
     let (finalizer, mut ack_stream) =
@@ -452,7 +471,7 @@ async fn run_amqp_source(
                             return Err(());
                         }
                         Ok(msg) => {
-                            receive_event(&config, &mut out, log_namespace, finalizer.as_ref(), msg).await?
+                            receive_event(&config, &mut out, log_namespace, ops_limits, finalizer.as_ref(), msg).await?
                         }
                     }
                 } else {
@@ -633,6 +652,7 @@ mod integration_test {
             ShutdownSignal::noop(),
             SourceSender::new_test().0,
             LogNamespace::Legacy,
+            OperationalLimits::default(),
             false,
         )
         .await
@@ -649,6 +669,7 @@ mod integration_test {
             ShutdownSignal::noop(),
             SourceSender::new_test().0,
             LogNamespace::Legacy,
+            OperationalLimits::default(),
             false,
         )
         .await

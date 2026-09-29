@@ -5,6 +5,7 @@ use aws_smithy_types::byte_stream::ByteStream;
 use futures::{stream, stream::StreamExt, TryStreamExt};
 use snafu::Snafu;
 use tokio_util::io::StreamReader;
+use vector_common::limits::OperationalLimits;
 use vector_lib::codecs::decoding::{
     DeserializerConfig, FramingConfig, NewlineDelimitedDecoderOptions,
 };
@@ -132,9 +133,14 @@ impl SourceConfig for AwsS3Config {
 
         match self.strategy {
             Strategy::Sqs => Ok(Box::pin(
-                self.create_sqs_ingestor(multiline_config, &cx.proxy, log_namespace)
-                    .await?
-                    .run(cx, self.acknowledgements, log_namespace),
+                self.create_sqs_ingestor(
+                    multiline_config,
+                    &cx.proxy,
+                    log_namespace,
+                    cx.globals.ops_limits,
+                )
+                .await?
+                .run(cx, self.acknowledgements, log_namespace),
             )),
         }
     }
@@ -204,12 +210,14 @@ impl AwsS3Config {
         multiline: Option<line_agg::Config>,
         proxy: &ProxyConfig,
         log_namespace: LogNamespace,
+        ops_limits: OperationalLimits,
     ) -> crate::Result<sqs::Ingestor> {
         let region = self.region.region();
         let endpoint = self.region.endpoint();
 
         let decoder =
             DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+                .with_operational_limits(ops_limits)
                 .build()?;
 
         match self.sqs {

@@ -138,7 +138,7 @@ impl CompressionLimits {
 /// sends a delimiter. Deployments with routinely larger single-line records (e.g.
 /// CloudTrail-via-`aws_s3`, which can exceed 10 MB) still need to raise this via
 /// `ops_limits.framing.max_frame_length_bytes` or a component's own `max_length`.
-pub const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 10 * 1024 * 1024;
 
 /// Limits applied by delimited framers (`character_delimited`, `newline_delimited`,
 /// `octet_counting`) while a frame is still incomplete.
@@ -430,6 +430,19 @@ mod tests {
         assert_eq!(
             ConnectionLimits::default().ack_write_timeout_secs,
             DEFAULT_ACK_WRITE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn default_frame_length_cap_is_10_mib() {
+        assert_eq!(DEFAULT_MAX_FRAME_LENGTH_BYTES, 10_485_760);
+        assert_eq!(FramingLimits::default().max_frame_length_bytes, 10_485_760);
+        assert_eq!(
+            serde_json::from_str::<OperationalLimits>("{}")
+                .unwrap()
+                .framing
+                .max_frame_length_bytes,
+            10_485_760
         );
     }
 

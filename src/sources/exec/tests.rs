@@ -458,3 +458,38 @@ fn standard_streaming_test_config() -> ExecConfig {
         log_namespace: None,
     }
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn scheduled_exec_drops_line_over_ops_limits_frame_cap() {
+    let config = ExecConfig {
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "yes a | head -c 200 | tr -d '\\n'; echo; yes b | head -c 10000 | tr -d '\\n'; echo"
+                .to_owned(),
+        ],
+        ..standard_scheduled_test_config()
+    };
+    let (tx, rx) = SourceSender::new_test();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.globals.ops_limits.framing =
+        vector_common::limits::FramingLimits::with_max_frame_length_bytes(4096);
+
+    let source = config.build(cx).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(3), source).await;
+
+    let messages: Vec<String> = crate::test_util::collect_ready(rx)
+        .await
+        .into_iter()
+        .map(|event| {
+            event
+                .as_log()
+                .get_message()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(messages, vec!["a".repeat(100)]);
+}

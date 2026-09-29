@@ -8,6 +8,7 @@ use tokio_util::codec::Decoder as _;
 use vrl::value::{kind::Collection, Kind};
 use warp::http::HeaderMap;
 
+use vector_common::limits::OperationalLimits;
 use vector_lib::codecs::{
     decoding::{DeserializerConfig, FramingConfig},
     BytesDecoderConfig, BytesDeserializerConfig, JsonDeserializerConfig,
@@ -228,7 +229,7 @@ impl SimpleHttpConfig {
         schema_definition
     }
 
-    fn get_decoding_config(&self) -> crate::Result<DecodingConfig> {
+    fn get_decoding_config(&self, ops_limits: OperationalLimits) -> crate::Result<DecodingConfig> {
         if self.encoding.is_some() && (self.framing.is_some() || self.decoding.is_some()) {
             return Err("Using `encoding` is deprecated and does not have any effect when `decoding` or `framing` is provided. Configure `framing` and `decoding` instead.".into());
         }
@@ -265,7 +266,8 @@ impl SimpleHttpConfig {
             framing,
             decoding,
             self.log_namespace.unwrap_or(false).into(),
-        ))
+        )
+        .with_operational_limits(ops_limits))
     }
 }
 
@@ -363,7 +365,7 @@ impl SourceConfig for SimpleHttpConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let decoder = self
-            .get_decoding_config()?
+            .get_decoding_config(cx.globals.ops_limits)?
             .build()?
             .with_log_namespace(log_namespace);
 
@@ -1714,7 +1716,7 @@ mod tests {
                 ResourceDirection::Push,
                 HttpResourceConfig::from_parts(uri, Some(config.method.into())),
                 config
-                    .get_decoding_config()
+                    .get_decoding_config(vector_common::limits::OperationalLimits::default())
                     .expect("should not fail to get decoding config"),
             );
 
@@ -1940,6 +1942,33 @@ mod tests {
             log.get(event_path!("message")).and_then(|v| v.as_str()).as_deref(),
             Some("allowed"),
         );
+    }
+
+    async fn spawn_newline_http_source_with_frame_cap(
+        cap: usize,
+    ) -> (SocketAddr, impl Stream<Item = Event>) {
+        let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let address = next_addr();
+        let mut context = SourceContext::new_test(sender, None);
+        context.globals.ops_limits.framing =
+            vector_common::limits::FramingLimits::with_max_frame_length_bytes(cap);
+        let config = SimpleHttpConfig {
+            address,
+            framing: Some(vector_lib::codecs::NewlineDelimitedDecoderConfig::new().into()),
+            decoding: Some(vector_lib::codecs::BytesDeserializerConfig::new().into()),
+            ..SimpleHttpConfig::default()
+        };
+        let source = config.build(context).await.unwrap();
+        tokio::spawn(source);
+        wait_for_tcp(address).await;
+        (address, recv)
+    }
+
+    #[tokio::test]
+    async fn rejects_body_frame_over_ops_limits_frame_cap() {
+        let (address, _recv) = spawn_newline_http_source_with_frame_cap(4096).await;
+        assert_eq!(400, send(address, &"b".repeat(5000)).await);
+        assert_eq!(200, send(address, &"a".repeat(100)).await);
     }
 
     register_validatable_component!(SimpleHttpConfig);

@@ -415,6 +415,7 @@ impl SourceConfig for DemoLogsConfig {
         self.format.validate()?;
         let decoder =
             DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+                .with_operational_limits(cx.globals.ops_limits)
                 .build()?;
 
         let gen_ctx = self.format.build_gen_ctx()?;

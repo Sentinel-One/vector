@@ -87,6 +87,7 @@ impl SourceConfig for StdinConfig {
             cx.shutdown,
             cx.out,
             log_namespace,
+            cx.globals.ops_limits,
         )
     }
 
@@ -116,6 +117,7 @@ mod tests {
         SourceSender,
     };
     use futures::StreamExt;
+    use vector_common::limits::{FramingLimits, OperationalLimits};
     use vector_lib::lookup::path;
     use vrl::value;
 
@@ -132,7 +134,13 @@ mod tests {
             let buf = Cursor::new("hello world\nhello world again");
 
             config
-                .source(buf, ShutdownSignal::noop(), tx, LogNamespace::Legacy)
+                .source(
+                    buf,
+                    ShutdownSignal::noop(),
+                    tx,
+                    LogNamespace::Legacy,
+                    OperationalLimits::default(),
+                )
                 .unwrap()
                 .await
                 .unwrap();
@@ -173,7 +181,13 @@ mod tests {
             let buf = Cursor::new("hello world\nhello world again");
 
             config
-                .source(buf, ShutdownSignal::noop(), tx, LogNamespace::Vector)
+                .source(
+                    buf,
+                    ShutdownSignal::noop(),
+                    tx,
+                    LogNamespace::Vector,
+                    OperationalLimits::default(),
+                )
                 .unwrap()
                 .await
                 .unwrap();
@@ -205,5 +219,38 @@ mod tests {
             assert!(event.is_none());
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn stdin_drops_line_over_ops_limits_frame_cap() {
+        let (tx, rx) = SourceSender::new_test();
+        let config = StdinConfig::default();
+        let input = format!("{}\n{}\n", "a".repeat(100), "b".repeat(5000));
+        let limits = OperationalLimits {
+            framing: FramingLimits::with_max_frame_length_bytes(4096),
+            ..Default::default()
+        };
+
+        config
+            .source(
+                Cursor::new(input),
+                ShutdownSignal::noop(),
+                tx,
+                LogNamespace::Legacy,
+                limits,
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        let messages: Vec<String> = rx
+            .map(|event| {
+                event.as_log()[log_schema().message_key().unwrap().to_string()]
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+            .await;
+        assert_eq!(messages, vec!["a".repeat(100)]);
     }
 }

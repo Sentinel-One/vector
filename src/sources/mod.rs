@@ -112,3 +112,75 @@ enum BuildError {
     #[snafu(display("URI parse error: {}", source))]
     UriParseError { source: ::http::uri::InvalidUri },
 }
+
+#[cfg(test)]
+mod framing_limits_guard {
+    use std::path::Path;
+
+    /// Drops everything from the first top-level `#[cfg(..test..)]` inline module onward.
+    fn production_code(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = lines
+            .windows(2)
+            .position(|pair| {
+                pair[0].starts_with("#[cfg(")
+                    && pair[0].contains("test")
+                    && (pair[1].starts_with("mod ") || pair[1].starts_with("pub mod "))
+                    && pair[1].trim_end().ends_with('{')
+            })
+            .unwrap_or(lines.len());
+        lines[..end].join("\n")
+    }
+
+    fn is_test_file(path: &Path) -> bool {
+        let name = path.file_name().unwrap().to_string_lossy();
+        name == "tests.rs" || name.ends_with("integration_tests.rs") || name.starts_with("test")
+    }
+
+    fn collect_offenders(dir: &Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_offenders(&path, offenders);
+            } else if path.extension().is_some_and(|ext| ext == "rs") && !is_test_file(&path) {
+                let code = production_code(&std::fs::read_to_string(&path).unwrap());
+                for pattern in [
+                    "NewlineDelimitedDecoder::new()",
+                    "CharacterDelimitedDecoder::new(",
+                ] {
+                    for (offset, _) in code.match_indices(pattern) {
+                        let line = code[..offset].lines().count() + 1;
+                        offenders.push(format!("{}:{line} (hand-built framer)", path.display()));
+                    }
+                }
+                for (offset, _) in code.match_indices("DecodingConfig::new(") {
+                    let rest = &code[offset..];
+                    let end = [rest.find(".build()"), rest.find(';')]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        .unwrap_or(rest.len());
+                    if !rest[..end].contains("with_operational_limits") {
+                        let line = code[..offset].lines().count() + 1;
+                        offenders.push(format!("{}:{line}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Without `with_operational_limits`, a source's framer ignores `ops_limits.framing` and
+    /// silently falls back to the compiled-in default.
+    #[test]
+    fn every_source_decoder_honours_ops_limits() {
+        let mut offenders = Vec::new();
+        collect_offenders(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sources"),
+            &mut offenders,
+        );
+        assert!(
+            offenders.is_empty(),
+            "`DecodingConfig::new(..)` without `.with_operational_limits(cx.globals.ops_limits)`: {offenders:#?}"
+        );
+    }
+}

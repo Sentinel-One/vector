@@ -101,7 +101,7 @@ pub struct CharacterDelimitedDecoderOptions {
     /// This length does *not* include the trailing delimiter.
     ///
     /// Defaults to the deployment's configured frame length cap
-    /// (`ops_limits.framing.max_frame_length_bytes`, 1 MiB unless overridden). Set this field to
+    /// (`ops_limits.framing.max_frame_length_bytes`, 10 MiB unless overridden). Set this field to
     /// override the cap for this component alone; unlike `sources.<name>.ops_limits.framing`, it is
     /// applied exactly as given, not clamped by `--allow-component-limit-overrides`.
     ///

@@ -260,7 +260,9 @@ impl SourceConfig for ExecConfig {
             .framing
             .clone()
             .unwrap_or_else(|| self.decoding.default_stream_framing());
-        let decoder = DecodingConfig::new(framing, self.decoding.clone(), log_namespace).build()?;
+        let decoder = DecodingConfig::new(framing, self.decoding.clone(), log_namespace)
+            .with_operational_limits(cx.globals.ops_limits)
+            .build()?;
 
         match &self.mode {
             Mode::Scheduled => {
