@@ -137,6 +137,7 @@ async fn config(
         path: None,
         batch_headers: Default::default(),
         rejection_report: Default::default(),
+        effective_bytes_algorithm: Default::default(),
     }
 }
 
