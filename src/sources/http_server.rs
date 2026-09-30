@@ -514,13 +514,8 @@ impl HttpSource for SimpleHttpSource {
                 Err(error) => {
                     // Error is logged / emitted by `crate::codecs::Decoder`, no further
                     // handling is needed here
-                    let status = if error.is_frame_too_long() {
-                        StatusCode::PAYLOAD_TOO_LARGE
-                    } else {
-                        StatusCode::BAD_REQUEST
-                    };
                     return Err(ErrorMessage::new(
-                        status,
+                        StatusCode::BAD_REQUEST,
                         format!("Failed decoding body: {}", error),
                     ));
                 }
@@ -1973,7 +1968,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_body_frame_over_ops_limits_frame_cap() {
         let (address, recv) = spawn_newline_http_source_with_frame_cap(4096).await;
-        assert_eq!(413, send(address, &"b".repeat(5000)).await);
+        assert_eq!(400, send(address, &"b".repeat(5000)).await);
         assert_eq!(200, send(address, &"a".repeat(100)).await);
 
         let events = crate::test_util::collect_ready(recv).await;
