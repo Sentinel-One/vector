@@ -5,6 +5,7 @@ use vector_common::limits::{
     ACK_WRITE_TIMEOUT_SECS_ENV, MAX_DECOMPRESSED_SIZE_BYTES_ENV, MAX_FRAME_LENGTH_BYTES_ENV,
 };
 
+#[tracing_test::traced_test]
 #[test]
 fn invalid_env_overrides_fail_bootstrap_and_store_nothing() {
     let built_in = OperationalLimits::default();
@@ -24,12 +25,15 @@ fn invalid_env_overrides_fail_bootstrap_and_store_nothing() {
     assert_eq!(errors[0].value, "abc");
     assert_eq!(errors[1].value, "0");
 
-    // Nothing was stored, not even the valid decompression override.
+    // Nothing was stored, not even the valid decompression override, and nothing was logged as
+    // resolved.
     assert_eq!(OperationalLimits::default(), built_in);
+    assert!(!logs_contain("Resolved ops_limits defaults."));
 
     // Once the env is fixed, bootstrap succeeds and applies it.
     std::env::set_var(MAX_FRAME_LENGTH_BYTES_ENV, "8192");
     std::env::set_var(ACK_WRITE_TIMEOUT_SECS_ENV, "7");
     init_env_defaults().expect("corrected overrides must bootstrap");
+    assert!(logs_contain("Resolved ops_limits defaults."));
     assert_eq!(FramingLimits::default().max_frame_length_bytes, 8192);
 }
