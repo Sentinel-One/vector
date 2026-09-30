@@ -96,6 +96,8 @@ impl ApplicationConfig {
         config: Config,
         extra_context: ExtraContext,
     ) -> Result<Self, ExitCode> {
+        config.global.ops_limits.log_effective();
+
         #[cfg(feature = "api")]
         let api = config.api;
 
@@ -204,6 +206,21 @@ impl Application {
             opts.log_level(),
             opts.root.internal_log_rate_limit,
         );
+
+        // After logging (so invalid overrides are reported) and before any config is loaded.
+        match vector_common::limits::init_env_defaults() {
+            Ok(()) => {}
+            Err(vector_common::limits::InitEnvDefaultsError::InvalidOverrides(errors)) => {
+                for error in errors {
+                    error!(message = "Invalid ops_limits environment override.", %error);
+                }
+                return Err(exitcode::CONFIG);
+            }
+            Err(error) => {
+                error!(message = "Failed to initialize ops_limits defaults.", %error);
+                return Err(exitcode::SOFTWARE);
+            }
+        }
 
         // Can only log this after initializing the logging subsystem
         if opts.root.openssl_no_probe {

@@ -333,7 +333,7 @@ impl SourceConfig for KafkaSourceConfig {
         let log_namespace = cx.log_namespace(self.log_namespace);
 
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
 
@@ -1836,6 +1836,7 @@ mod integration_test {
             config.framing.clone(),
             config.decoding.clone(),
             log_namespace,
+            Default::default(),
         )
         .build()
         .unwrap();

@@ -15,37 +15,27 @@ pub struct DecodingConfig {
     /// The namespace used when decoding.
     log_namespace: LogNamespace,
     /// Limits applied by framers that decompress or buffer an incomplete frame.
-    ///
-    /// Defaults to the documented caps; a component with access to its context should override
-    /// this with `GlobalOptions`' value via [`Self::with_operational_limits`].
     #[serde(default, skip)]
     operational_limits: OperationalLimits,
 }
 
 impl DecodingConfig {
-    /// Creates a new `DecodingConfig` with the provided `FramingConfig` and
-    /// `DeserializerConfig`.
+    /// Creates a new `DecodingConfig`.
+    ///
+    /// `operational_limits` are the limits framers run under. Take them from the component's
+    /// context (`cx.globals.ops_limits`) so the deployment controls the caps.
     pub fn new(
         framing: FramingConfig,
         decoding: DeserializerConfig,
         log_namespace: LogNamespace,
+        operational_limits: OperationalLimits,
     ) -> Self {
         Self {
             framing,
             decoding,
             log_namespace,
-            operational_limits: OperationalLimits::default(),
+            operational_limits,
         }
-    }
-
-    /// Sets the operational limits framers should run under.
-    ///
-    /// Take these from the component's context (`cx.globals.ops_limits`) so the deployment controls
-    /// the caps rather than a process-wide default.
-    #[must_use]
-    pub const fn with_operational_limits(mut self, limits: OperationalLimits) -> Self {
-        self.operational_limits = limits;
-        self
     }
 
     /// Get the decoding configuration.
@@ -67,5 +57,51 @@ impl DecodingConfig {
         let deserializer = self.decoding.build()?;
 
         Ok(Decoder::new(framer, deserializer).with_log_namespace(self.log_namespace))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use tokio_util::codec::Decoder as _;
+    use vector_common::limits::{FramingLimits, OperationalLimits};
+    use vector_core::config::LogNamespace;
+
+    use super::DecodingConfig;
+    use crate::decoding::{DeserializerConfig, FramingConfig, NewlineDelimitedDecoderConfig};
+
+    fn newline_decoder_capped_at(max_frame_length_bytes: usize) -> super::Decoder {
+        let limits = OperationalLimits {
+            framing: FramingLimits::new(max_frame_length_bytes),
+            ..Default::default()
+        };
+        DecodingConfig::new(
+            FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig::new()),
+            DeserializerConfig::Bytes,
+            LogNamespace::Legacy,
+            limits,
+        )
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn framer_rejects_frame_over_the_operational_limit() {
+        let mut buf = BytesMut::from(&[b'a'; 5000][..]);
+        assert!(newline_decoder_capped_at(4096).decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn framer_decodes_frame_under_the_operational_limit() {
+        let mut buf = BytesMut::from(format!("{}\n", "a".repeat(5000)).as_str());
+        let (events, _) = newline_decoder_capped_at(8192)
+            .decode(&mut buf)
+            .unwrap()
+            .expect("a complete frame under the cap must decode");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].as_log().get_message().unwrap(),
+            &vrl::value::Value::from("a".repeat(5000))
+        );
     }
 }

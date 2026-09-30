@@ -16,7 +16,7 @@ impl SourceConfig for GcsConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<crate::sources::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let ack = cx.do_acknowledgements(self.acknowledgements);
-        self.build_source(log_namespace, ack, cx.shutdown, cx.out, &APP_INFO)
+        self.build_source(log_namespace, ack, cx.shutdown, cx.out, &APP_INFO, cx.globals.ops_limits)
             .await
     }
 

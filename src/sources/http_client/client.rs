@@ -27,6 +27,7 @@ use crate::{
     tls::{TlsConfig, TlsSettings},
     Result,
 };
+use vector_common::limits::OperationalLimits;
 use vector_lib::codecs::{
     decoding::{DeserializerConfig, FramingConfig},
     StreamDecodingError,
@@ -187,7 +188,9 @@ impl SourceConfig for HttpClientConfig {
         let log_namespace = cx.log_namespace(self.log_namespace);
 
         // build the decoder
-        let decoder = self.get_decoding_config(Some(log_namespace)).build()?;
+        let decoder = self
+            .get_decoding_config(Some(log_namespace), cx.globals.ops_limits)
+            .build()?;
 
         let content_type = self.decoding.content_type(&self.framing).to_string();
 
@@ -236,13 +239,17 @@ impl SourceConfig for HttpClientConfig {
 }
 
 impl HttpClientConfig {
-    pub fn get_decoding_config(&self, log_namespace: Option<LogNamespace>) -> DecodingConfig {
+    pub fn get_decoding_config(
+        &self,
+        log_namespace: Option<LogNamespace>,
+        ops_limits: OperationalLimits,
+    ) -> DecodingConfig {
         let decoding = self.decoding.clone();
         let framing = self.framing.clone();
         let log_namespace =
             log_namespace.unwrap_or_else(|| self.log_namespace.unwrap_or(false).into());
 
-        DecodingConfig::new(framing, decoding, log_namespace)
+        DecodingConfig::new(framing, decoding, log_namespace, ops_limits)
     }
 }
 

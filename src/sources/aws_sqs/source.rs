@@ -278,6 +278,7 @@ mod tests {
                 config.framing.clone(),
                 config.decoding,
                 LogNamespace::Vector,
+                Default::default(),
             )
             .build()
             .unwrap(),
@@ -331,6 +332,7 @@ mod tests {
                 config.framing.clone(),
                 config.decoding,
                 LogNamespace::Legacy,
+                Default::default(),
             )
             .build()
             .unwrap(),

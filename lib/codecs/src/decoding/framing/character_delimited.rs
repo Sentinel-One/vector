@@ -6,7 +6,7 @@ use vector_config::configurable_component;
 
 use super::{BoxedFramingError, FramingError};
 use crate::decoding::StreamDecodingError;
-use vector_common::limits::{FramingLimits, DEFAULT_MAX_FRAME_LENGTH_BYTES};
+use vector_common::limits::FramingLimits;
 
 /// A frame exceeded `max_length`.
 ///
@@ -80,7 +80,7 @@ impl CharacterDelimitedDecoderConfig {
             .character_delimited
             .max_length
             .unwrap_or(limits.max_frame_length_bytes);
-        CharacterDelimitedDecoder::new_with_max_length(
+        CharacterDelimitedDecoder::new(
             self.character_delimited.delimiter,
             max_length,
         )
@@ -101,7 +101,7 @@ pub struct CharacterDelimitedDecoderOptions {
     /// This length does *not* include the trailing delimiter.
     ///
     /// Defaults to the deployment's configured frame length cap
-    /// (`ops_limits.framing.max_frame_length_bytes`, 1 MiB unless overridden). Set this field to
+    /// (`ops_limits.framing.max_frame_length_bytes`, 100 MiB unless overridden). Set this field to
     /// override the cap for this component alone; unlike `sources.<name>.ops_limits.framing`, it is
     /// applied exactly as given, not clamped by `--allow-component-limit-overrides`.
     ///
@@ -131,21 +131,11 @@ pub struct CharacterDelimitedDecoder {
 }
 
 impl CharacterDelimitedDecoder {
-    /// Creates a `CharacterDelimitedDecoder` with the specified delimiter, using the documented
-    /// default frame length cap.
-    ///
-    /// Callers that have access to a component's context (i.e. everything reached through
-    /// [`CharacterDelimitedDecoderConfig::build`]) should prefer that instead, so the deployment's
-    /// configured limit applies rather than this hardcoded default.
-    pub const fn new(delimiter: u8) -> Self {
-        Self::new_with_max_length(delimiter, DEFAULT_MAX_FRAME_LENGTH_BYTES)
-    }
-
     /// Creates a `CharacterDelimitedDecoder` with a maximum frame length limit.
     ///
     /// A frame longer than `max_length` is a fatal decode error and the connection is reset — see
     /// [`FrameTooLong`].
-    pub const fn new_with_max_length(delimiter: u8, max_length: usize) -> Self {
+    pub const fn new(delimiter: u8, max_length: usize) -> Self {
         CharacterDelimitedDecoder {
             delimiter,
             max_length,
@@ -239,7 +229,7 @@ mod tests {
 
     #[test]
     fn decode() {
-        let mut codec = CharacterDelimitedDecoder::new(b'\n');
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', FramingLimits::default().max_frame_length_bytes);
         let buf = &mut BytesMut::new();
         buf.put_slice(b"abc\n");
         assert_eq!(Some("abc".into()), codec.decode(buf).unwrap());
@@ -252,7 +242,7 @@ mod tests {
     fn incomplete_frame_over_max_length_is_a_fatal_error() {
         const MAX_LENGTH: usize = 10;
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
         buf.put_slice(&[b'x'; 100]);
 
@@ -274,7 +264,7 @@ mod tests {
     fn incomplete_frame_within_max_length_waits_for_more_bytes() {
         const MAX_LENGTH: usize = 100;
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
 
         buf.put_slice(b"partial");
@@ -294,7 +284,7 @@ mod tests {
     fn max_length_boundary_is_exact() {
         const MAX_LENGTH: usize = 10;
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
         buf.put_slice(&[b'x'; MAX_LENGTH]);
         buf.put_slice(b"\n");
@@ -304,7 +294,7 @@ mod tests {
             "a frame of exactly max_length must be accepted",
         );
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
         buf.put_slice(&[b'x'; MAX_LENGTH + 1]);
         assert!(
@@ -320,7 +310,7 @@ mod tests {
     fn read_much_larger_than_max_length_is_fine_when_it_contains_frames() {
         const MAX_LENGTH: usize = 10;
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
 
         // 8 KiB in one read, made of 1000 short valid frames — 800x the limit in total.
@@ -350,7 +340,7 @@ mod tests {
     fn large_read_with_trailing_partial_frame_waits_instead_of_erroring() {
         const MAX_LENGTH: usize = 10;
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
         for _ in 0..500 {
             buf.put_slice(b"abcdefg\n");
@@ -374,7 +364,7 @@ mod tests {
     fn exactly_max_length_without_delimiter_still_waits() {
         const MAX_LENGTH: usize = 10;
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
         buf.put_slice(&[b'x'; MAX_LENGTH]);
         assert_eq!(
@@ -390,20 +380,12 @@ mod tests {
         );
     }
 
-    /// `new()` must pick up the documented default cap rather than the old unbounded default.
-    #[test]
-    fn new_uses_the_default_frame_length_cap() {
-        let codec = CharacterDelimitedDecoder::new(b'\n');
-        assert_eq!(codec.max_length(), DEFAULT_MAX_FRAME_LENGTH_BYTES);
-        assert_ne!(codec.max_length(), usize::MAX);
-    }
-
     /// `build()` must fall back to the deployment's configured cap, not the hardcoded default,
     /// when the component has not set its own `max_length`.
     #[test]
     fn build_falls_back_to_the_deployment_configured_cap() {
         let config = CharacterDelimitedDecoderConfig::new(b'\n');
-        let codec = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        let codec = config.build(FramingLimits::new(4096));
         assert_eq!(codec.max_length(), 4096);
     }
 
@@ -413,7 +395,7 @@ mod tests {
         let config = CharacterDelimitedDecoderConfig {
             character_delimited: CharacterDelimitedDecoderOptions::new(b'\n', Some(64)),
         };
-        let codec = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        let codec = config.build(FramingLimits::new(4096));
         assert_eq!(codec.max_length(), 64);
     }
 
@@ -424,7 +406,7 @@ mod tests {
         // A terminated frame longer than the limit is fatal, exactly as an over-long incomplete
         // frame is. It used to be skipped so that following frames still decoded; that split
         // behaviour is gone, so nothing after the offending frame is read.
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
         buf.put_slice(b"1234567\n123456\n");
         let error = codec.decode(buf).unwrap_err();
@@ -435,7 +417,7 @@ mod tests {
         );
 
         // Frames within the limit are untouched, including one of exactly `max_length`.
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
         buf.put_slice(b"123456\n12345\n123");
         assert_eq!(codec.decode(buf).unwrap(), Some(Bytes::from("123456")));
@@ -457,7 +439,7 @@ mod tests {
     fn decode_discard_repeat() {
         const MAX_LENGTH: usize = 1;
 
-        let mut codec = CharacterDelimitedDecoder::new_with_max_length(b'\n', MAX_LENGTH);
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', MAX_LENGTH);
         let buf = &mut BytesMut::new();
 
         buf.reserve(200);
@@ -479,7 +461,7 @@ mod tests {
         let mut bytes = serde_json::to_vec(&input).unwrap();
         bytes.push(b'\n');
 
-        let mut codec = CharacterDelimitedDecoder::new(b'\n');
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', FramingLimits::default().max_frame_length_bytes);
         let buf = &mut BytesMut::new();
 
         buf.reserve(bytes.len());
@@ -547,7 +529,7 @@ mod tests {
             {"log":"2019-01-18 07:53:06.419 [               ]  INFO 1 --- [vent-bus.prod-1] c.t.listener.CommonListener              : warehousing Dailywarehousing.daily\n","stream":"stdout","time":"2019-01-18T07:53:06.420527437Z"}
         "#};
 
-        let mut codec = CharacterDelimitedDecoder::new(b'\n');
+        let mut codec = CharacterDelimitedDecoder::new(b'\n', FramingLimits::default().max_frame_length_bytes);
         let buf = &mut BytesMut::new();
 
         buf.extend(events.to_string().as_bytes());

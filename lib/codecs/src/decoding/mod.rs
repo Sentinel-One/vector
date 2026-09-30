@@ -196,7 +196,9 @@ impl FramingConfig {
             FramingConfig::NewlineDelimited(config) => {
                 Framer::NewlineDelimited(config.build(limits.framing))
             }
-            FramingConfig::OctetCounting(config) => Framer::OctetCounting(config.build()),
+            FramingConfig::OctetCounting(config) => {
+                Framer::OctetCounting(config.build(limits.framing))
+            }
             FramingConfig::ChunkedGelf(config) => {
                 Framer::ChunkedGelf(config.build(limits.compression))
             }

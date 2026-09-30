@@ -3,6 +3,8 @@ use crate::{event::LogEvent, test_util::trace_init};
 use bytes::Bytes;
 use std::ffi::OsStr;
 use std::io::Cursor;
+use vector_common::limits::FramingLimits;
+use vector_lib::codecs::{BytesDeserializerConfig, NewlineDelimitedDecoderConfig};
 use vector_lib::event::EventMetadata;
 use vrl::value;
 
@@ -264,7 +266,7 @@ async fn test_spawn_reader_thread() {
 
     let buf = Cursor::new("hello world\nhello rocket 🚀");
     let reader = BufReader::new(buf);
-    let decoder = crate::codecs::Decoder::default();
+    let decoder = test_decoder();
     let (sender, mut receiver) = channel(1024);
 
     spawn_reader_thread(reader, decoder, STDOUT, sender);
@@ -301,7 +303,7 @@ async fn test_spawn_reader_thread() {
 async fn test_drop_receiver() {
     let config = standard_scheduled_test_config();
     let hostname = Some("Some.Machine".to_string());
-    let decoder = Default::default();
+    let decoder = test_decoder();
     let shutdown = ShutdownSignal::noop();
     let (tx, rx) = SourceSender::new_test();
 
@@ -336,7 +338,7 @@ async fn test_run_command_linux() {
         &crate::test_util::components::SOURCE_TAGS,
         async {
             let hostname = Some("Some.Machine".to_string());
-            let decoder = Default::default();
+            let decoder = test_decoder();
             let shutdown = ShutdownSignal::noop();
             let (tx, rx) = SourceSender::new_test();
 
@@ -392,7 +394,7 @@ async fn test_graceful_shutdown() {
         ),
     ];
     let hostname = Some("Some.Machine".to_string());
-    let decoder = Default::default();
+    let decoder = test_decoder();
     let (trigger, shutdown, _) = ShutdownSignal::new_wired();
     let (tx, mut rx) = SourceSender::new_test();
 
@@ -435,6 +437,17 @@ async fn test_graceful_shutdown() {
     }
 }
 
+fn test_decoder() -> Decoder {
+    DecodingConfig::new(
+        NewlineDelimitedDecoderConfig::new().into(),
+        BytesDeserializerConfig::new().into(),
+        LogNamespace::Legacy,
+        Default::default(),
+    )
+    .build()
+    .unwrap()
+}
+
 fn standard_scheduled_test_config() -> ExecConfig {
     Default::default()
 }
@@ -457,4 +470,38 @@ fn standard_streaming_test_config() -> ExecConfig {
         decoding: default_decoding(),
         log_namespace: None,
     }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn scheduled_exec_stops_decoding_at_line_over_ops_limits_frame_cap() {
+    let config = ExecConfig {
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "for c in a b c; do n=100; [ $c = b ] && n=5000; yes $c | head -n $n | tr -d '\\n'; echo; done"
+                .to_owned(),
+        ],
+        ..standard_scheduled_test_config()
+    };
+    let (tx, rx) = SourceSender::new_test();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.globals.ops_limits.framing = FramingLimits::new(4096);
+
+    let source = config.build(cx).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(3), source).await;
+
+    let messages: Vec<String> = crate::test_util::collect_ready(rx)
+        .await
+        .into_iter()
+        .map(|event| {
+            event
+                .as_log()
+                .get_message()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(messages, vec!["a".repeat(100)]);
 }

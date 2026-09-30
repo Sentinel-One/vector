@@ -235,7 +235,7 @@ fn emit_decompress_error(
 mod tests {
     /// Limits are a parameter now, so a test simply states the cap it wants.
     fn limits(max_decompressed_size_bytes: usize) -> CompressionLimits {
-        CompressionLimits::with_max_decompressed_size_bytes(max_decompressed_size_bytes)
+        CompressionLimits::new(max_decompressed_size_bytes)
     }
 
     use std::io::Write;

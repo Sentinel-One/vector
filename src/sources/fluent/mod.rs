@@ -870,6 +870,9 @@ impl From<FluentEvent<'_>> for LogEvent {
 
 #[cfg(test)]
 mod tests {
+    /// Keeps decompression-bomb fixtures small on the wire regardless of the production default.
+    const TEST_MAX_DECOMPRESSED_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
     use bytes::BytesMut;
     use chrono::{DateTime, Utc};
     use rmp_serde::Serializer;
@@ -1383,14 +1386,12 @@ mod tests {
         use std::collections::BTreeMap;
         use std::io::Write as _;
 
-        use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
-
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
         let member = encoder.finish().unwrap();
 
         let mut bomb = Vec::new();
-        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+        for _ in 0..(TEST_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
             bomb.extend_from_slice(&member);
         }
         assert!(
@@ -1403,8 +1404,11 @@ mod tests {
         let message = rmp_serde::to_vec(&("tag.name", serde_bytes::ByteBuf::from(bomb), options))
             .expect("failed to build the fluent frame");
 
-        let error =
-            decode_all(message).expect_err("a payload inflating past the cap must be rejected");
+        let error = decode_all_with(
+            message,
+            CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES),
+        )
+        .expect_err("a payload inflating past the cap must be rejected");
 
         assert!(matches!(error, DecodeError::IO(_)), "got {error:?}");
         assert!(
@@ -1414,12 +1418,19 @@ mod tests {
     }
 
     fn decode_all(message: Vec<u8>) -> Result<(SmallVec<[Event; 1]>, usize), DecodeError> {
+        decode_all_with(message, CompressionLimits::default())
+    }
+
+    fn decode_all_with(
+        message: Vec<u8>,
+        compression_limits: CompressionLimits,
+    ) -> Result<(SmallVec<[Event; 1]>, usize), DecodeError> {
         let mut buf = BytesMut::from(&message[..]);
 
         let mut decoder = FluentDecoder::new(
             LogNamespace::default(),
             None,
-            CompressionLimits::default(),
+            compression_limits,
             default_max_entries_per_frame(),
             default_max_msgpack_depth(),
         );

@@ -184,7 +184,7 @@ impl SourceConfig for LogplexConfig {
         let log_namespace = cx.log_namespace(self.log_namespace);
 
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
 
         let source = LogplexSource {
@@ -230,7 +230,7 @@ impl SourceConfig for LogplexConfig {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct LogplexSource {
     query_parameters: Vec<HttpConfigParamKind>,
     decoder: Decoder,
@@ -445,6 +445,17 @@ mod tests {
     use vrl::value::{kind::Collection, Kind};
 
     use super::{HttpSourceAuthConfig, LogplexConfig};
+
+    fn test_decoder() -> crate::codecs::Decoder {
+        crate::codecs::DecodingConfig::new(
+            vector_lib::codecs::NewlineDelimitedDecoderConfig::new().into(),
+            vector_lib::codecs::BytesDeserializerConfig::new().into(),
+            vector_lib::config::LogNamespace::Legacy,
+            Default::default(),
+        )
+        .build()
+        .unwrap()
+    }
     use crate::{
         config::{log_schema, SourceConfig, SourceContext},
         serde::{default_decoding, default_framing_message_based},
@@ -686,7 +697,7 @@ mod tests {
     fn logplex_handles_normal_lines() {
         let log_namespace = LogNamespace::Legacy;
         let body = "267 <158>1 2020-01-08T22:33:57.353034+00:00 host heroku router - foo bar baz";
-        let events = super::line_to_events(Default::default(), log_namespace, body.into());
+        let events = super::line_to_events(test_decoder(), log_namespace, body.into());
         let log = events[0].as_log();
 
         assert_eq!(*log.get_message().unwrap(), "foo bar baz".into());
@@ -705,7 +716,7 @@ mod tests {
     fn logplex_handles_malformed_lines() {
         let log_namespace = LogNamespace::Legacy;
         let body = "what am i doing here";
-        let events = super::line_to_events(Default::default(), log_namespace, body.into());
+        let events = super::line_to_events(test_decoder(), log_namespace, body.into());
         let log = events[0].as_log();
 
         assert_eq!(*log.get_message().unwrap(), "what am i doing here".into());
@@ -717,7 +728,7 @@ mod tests {
     fn logplex_doesnt_blow_up_on_bad_framing() {
         let log_namespace = LogNamespace::Legacy;
         let body = "1000000 <158>1 2020-01-08T22:33:57.353034+00:00 host heroku router - i'm not that long";
-        let events = super::line_to_events(Default::default(), log_namespace, body.into());
+        let events = super::line_to_events(test_decoder(), log_namespace, body.into());
         let log = events[0].as_log();
 
         assert_eq!(*log.get_message().unwrap(), "i'm not that long".into());

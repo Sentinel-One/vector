@@ -178,6 +178,7 @@ async fn amqp_round_trip() {
         ShutdownSignal::noop(),
         tx,
         LogNamespace::Legacy,
+        Default::default(),
         true,
     )
     .await

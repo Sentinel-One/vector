@@ -55,7 +55,7 @@ impl ValidatableComponent for HttpClientConfig {
         let external_resource = ExternalResource::new(
             ResourceDirection::Pull,
             HttpResourceConfig::from_parts(uri, Some(config.method.into())),
-            config.get_decoding_config(None),
+            config.get_decoding_config(None, Default::default()),
         );
 
         ValidationConfiguration::from_source(

@@ -170,9 +170,12 @@ impl GenerateConfig for StatsdConfig {
 impl SourceConfig for StatsdConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         match self {
-            StatsdConfig::Udp(config) => {
-                Ok(Box::pin(statsd_udp(config.clone(), cx.shutdown, cx.out)))
-            }
+            StatsdConfig::Udp(config) => Ok(Box::pin(statsd_udp(
+                config.clone(),
+                cx.shutdown,
+                cx.out,
+                cx.globals.ops_limits.framing.max_frame_length_bytes,
+            ))),
             StatsdConfig::Tcp(config) => {
                 let tls_config = config.tls.as_ref().map(|tls| tls.tls_config.clone());
                 let tls_client_metadata_key = config
@@ -183,6 +186,7 @@ impl SourceConfig for StatsdConfig {
                 let tls = MaybeTlsSettings::from_config(tls_config.as_ref(), true)?;
                 let statsd_tcp_source = StatsdTcpSource {
                     sanitize: config.sanitize,
+                    max_frame_length_bytes: cx.globals.ops_limits.framing.max_frame_length_bytes,
                 };
 
                 statsd_tcp_source.run(
@@ -202,7 +206,12 @@ impl SourceConfig for StatsdConfig {
                 )
             }
             #[cfg(unix)]
-            StatsdConfig::Unix(config) => statsd_unix(config.clone(), cx.shutdown, cx.out),
+            StatsdConfig::Unix(config) => statsd_unix(
+                config.clone(),
+                cx.shutdown,
+                cx.out,
+                cx.globals.ops_limits.framing.max_frame_length_bytes,
+            ),
         }
     }
 
@@ -296,6 +305,7 @@ async fn statsd_udp(
     config: UdpConfig,
     shutdown: ShutdownSignal,
     mut out: SourceSender,
+    max_frame_length_bytes: usize,
 ) -> Result<(), ()> {
     let listenfd = ListenFd::from_env();
     let socket = try_bind_udp_socket(config.address, listenfd)
@@ -320,7 +330,9 @@ async fn statsd_udp(
     );
 
     let codec = Decoder::new(
-        Framer::NewlineDelimited(NewlineDelimitedDecoder::new()),
+        Framer::NewlineDelimited(NewlineDelimitedDecoder::new(
+            max_frame_length_bytes,
+        )),
         Deserializer::Boxed(Box::new(StatsdDeserializer::udp(config.sanitize))),
     );
     let mut stream = UdpFramed::new(socket, codec).take_until(shutdown);
@@ -347,6 +359,7 @@ async fn statsd_udp(
 #[derive(Clone)]
 struct StatsdTcpSource {
     sanitize: bool,
+    max_frame_length_bytes: usize,
 }
 
 impl TcpSource for StatsdTcpSource {
@@ -357,7 +370,9 @@ impl TcpSource for StatsdTcpSource {
 
     fn decoder(&self) -> Self::Decoder {
         Decoder::new(
-            Framer::NewlineDelimited(NewlineDelimitedDecoder::new()),
+            Framer::NewlineDelimited(NewlineDelimitedDecoder::new(
+                self.max_frame_length_bytes,
+            )),
             Deserializer::Boxed(Box::new(StatsdDeserializer::tcp(self.sanitize))),
         )
     }
@@ -396,6 +411,19 @@ mod test {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<StatsdConfig>();
+    }
+
+    #[test]
+    fn tcp_decoder_rejects_frame_over_ops_limits_frame_cap() {
+        use tokio_util::codec::Decoder as _;
+
+        let mut decoder = StatsdTcpSource {
+            sanitize: true,
+            max_frame_length_bytes: 4096,
+        }
+        .decoder();
+        let mut buf = bytes::BytesMut::from(&[b'a'; 5000][..]);
+        assert!(decoder.decode(&mut buf).is_err());
     }
 
     #[tokio::test]

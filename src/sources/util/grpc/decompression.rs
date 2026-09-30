@@ -492,7 +492,6 @@ impl<S> Layer<S> for DecompressionAndMetricsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::util::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
     fn gzip(payload: &[u8]) -> Vec<u8> {
         use flate2::write::GzEncoder;
@@ -625,10 +624,11 @@ mod tests {
     /// The new decompressor must carry the global cap, not an unbounded sink.
     #[test]
     fn new_decompressor_is_capped_at_the_global_limit() {
-        let decoder = new_decompressor(&CompressionLimits::default());
+        let limits = CompressionLimits::default();
+        let decoder = new_decompressor(&limits);
         assert_eq!(
             decoder.get_ref().max_len,
-            GRPC_MESSAGE_HEADER_LEN + DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
+            GRPC_MESSAGE_HEADER_LEN + limits.max_decompressed_size_bytes
         );
     }
 }

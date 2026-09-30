@@ -5,6 +5,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::{channel::mpsc, executor, SinkExt, StreamExt};
 use tokio_util::{codec::FramedRead, io::StreamReader};
+use vector_common::limits::OperationalLimits;
 use vector_lib::codecs::{
     decoding::{DeserializerConfig, FramingConfig},
     StreamDecodingError,
@@ -46,6 +47,7 @@ pub trait FileDescriptorConfig: NamedComponent {
         shutdown: ShutdownSignal,
         out: SourceSender,
         log_namespace: LogNamespace,
+        ops_limits: OperationalLimits,
     ) -> crate::Result<crate::sources::Source>
     where
         R: Send + io::BufRead + 'static,
@@ -62,7 +64,8 @@ pub trait FileDescriptorConfig: NamedComponent {
         let framing = self
             .framing()
             .unwrap_or_else(|| decoding.default_stream_framing());
-        let decoder = DecodingConfig::new(framing, decoding, log_namespace).build()?;
+        let decoder = DecodingConfig::new(framing, decoding, log_namespace, ops_limits)
+            .build()?;
 
         let (sender, receiver) = mpsc::channel(1024);
 

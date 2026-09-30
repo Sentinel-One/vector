@@ -967,11 +967,10 @@ mod test {
     fn decompressed_bomb_is_rejected() {
         use std::io::Write as _;
 
-        use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
-
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         let chunk = vec![0u8; 1024 * 1024];
-        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+        let cap = CompressionLimits::default().max_decompressed_size_bytes;
+        for _ in 0..(cap / (1024 * 1024) + 1) {
             encoder.write_all(&chunk).unwrap();
         }
         let compressed = encoder.finish().unwrap();

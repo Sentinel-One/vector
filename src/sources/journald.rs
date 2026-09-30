@@ -369,6 +369,7 @@ impl SourceConfig for JournaldConfig {
             self.current_boot_only,
             self.since_now,
             self.extra_args.clone(),
+            cx.globals.ops_limits.framing.max_frame_length_bytes,
         );
 
         let batch_size = self.batch_size;
@@ -649,6 +650,7 @@ struct StartJournalctl {
     current_boot_only: bool,
     since_now: bool,
     extra_args: Vec<String>,
+    max_frame_length_bytes: usize,
 }
 
 impl StartJournalctl {
@@ -659,6 +661,7 @@ impl StartJournalctl {
         current_boot_only: bool,
         since_now: bool,
         extra_args: Vec<String>,
+        max_frame_length_bytes: usize,
     ) -> Self {
         Self {
             path,
@@ -667,6 +670,7 @@ impl StartJournalctl {
             current_boot_only,
             since_now,
             extra_args,
+            max_frame_length_bytes,
         }
     }
 
@@ -716,7 +720,7 @@ impl StartJournalctl {
 
         let stream = FramedRead::new(
             child.stdout.take().unwrap(),
-            CharacterDelimitedDecoder::new(b'\n'),
+            CharacterDelimitedDecoder::new(b'\n', self.max_frame_length_bytes),
         )
         .boxed();
 
@@ -1554,6 +1558,7 @@ mod tests {
             current_boot_only,
             since_now,
             extra_args,
+            vector_common::limits::FramingLimits::default().max_frame_length_bytes,
         )
         .make_command(cursor)
     }

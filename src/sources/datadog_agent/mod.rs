@@ -185,7 +185,7 @@ impl SourceConfig for DatadogAgentConfig {
             .cloned();
 
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
 
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;

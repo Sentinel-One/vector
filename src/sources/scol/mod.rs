@@ -23,7 +23,7 @@ impl SourceConfig for Config {
         let chkptr = cx.checkpoint_accessor().await;
         let src = self
             .clone()
-            .build_source(cx.out, cx.shutdown, chkptr, lns, cx.globals.ops_limits.compression)
+            .build_source(cx.out, cx.shutdown, chkptr, lns, cx.globals.ops_limits)
             .map(|r| match r {
                 Ok(_) => Ok(()),
                 Err(e) => {
@@ -74,7 +74,7 @@ mod tests {
     use crate::test_util::components::{assert_source_compliance, SOURCE_TAGS};
     use scol::test_scenarios as s;
     use vector_common::await_result;
-    use vector_common::limits::CompressionLimits;
+    use vector_common::limits::OperationalLimits;
     use vector_lib::config::LogNamespace;
     use vector_lib::event::Event;
     use vector_lib::shutdown::ShutdownSignal;
@@ -103,7 +103,7 @@ mod tests {
                 signal,
                 chkptr,
                 LogNamespace::Legacy,
-                CompressionLimits::default(),
+                OperationalLimits::default(),
             ));
             let evts = Box::pin(rx.take(n_evts as usize).collect::<Vec<_>>());
 

@@ -246,7 +246,7 @@ mod tests {
         let payload = gzip_bomb(1024);
         let out = CappedDecoder::gzip(
             payload.as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(1024),
+            &CompressionLimits::new(1024),
         )
         .decompress()
         .expect("payload exactly at the limit must decompress");
@@ -258,7 +258,7 @@ mod tests {
         let payload = gzip_bomb(64 * 1024);
         let error = CappedDecoder::gzip(
             payload.as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(1024),
+            &CompressionLimits::new(1024),
         )
         .decompress()
         .expect_err("payload over the limit must be rejected");
@@ -282,7 +282,7 @@ mod tests {
         // Each member on its own is within the limit; together they are not.
         let error = CappedDecoder::gzip(
             payload.as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(4096),
+            &CompressionLimits::new(4096),
         )
         .decompress()
         .expect_err("concatenated members must be capped in aggregate");
@@ -297,7 +297,7 @@ mod tests {
         let payload = zlib_bomb(64 * 1024);
         let error = CappedDecoder::zlib(
             payload.as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(1024),
+            &CompressionLimits::new(1024),
         )
         .decompress()
         .expect_err("payload over the limit must be rejected");
@@ -311,7 +311,7 @@ mod tests {
         let payload = zstd::encode_all(vec![0u8; 64 * 1024].as_slice(), 19).unwrap();
         let result = CappedDecoder::zstd(
             payload.as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(1024),
+            &CompressionLimits::new(1024),
         )
         .expect("decoder init")
         .decompress();
@@ -335,7 +335,7 @@ mod tests {
 
         let error = CappedDecoder::zstd(
             payload.as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(1024 * 1024),
+            &CompressionLimits::new(1024 * 1024),
         )
         .expect("decoder init")
         .decompress()
@@ -352,7 +352,7 @@ mod tests {
         let payload = gzip_bomb(64 * 1024);
         let mut reader = CappedDecoder::gzip(
             payload.as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(1024),
+            &CompressionLimits::new(1024),
         )
         .into_reader();
 
@@ -372,7 +372,7 @@ mod tests {
     fn unrelated_io_error_is_not_a_limit_error() {
         let error = CappedDecoder::gzip(
             b"not gzip at all".as_slice(),
-            &CompressionLimits::with_max_decompressed_size_bytes(1024),
+            &CompressionLimits::new(1024),
         )
         .decompress()
         .expect_err("invalid gzip must fail");

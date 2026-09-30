@@ -94,7 +94,13 @@ impl SourceConfig for FileDescriptorSourceConfig {
         let pipe = io::BufReader::new(unsafe { File::from_raw_fd(self.fd as i32) });
         let log_namespace = cx.log_namespace(self.log_namespace);
 
-        self.source(pipe, cx.shutdown, cx.out, log_namespace)
+        self.source(
+            pipe,
+            cx.shutdown,
+            cx.out,
+            log_namespace,
+            cx.globals.ops_limits,
+        )
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {

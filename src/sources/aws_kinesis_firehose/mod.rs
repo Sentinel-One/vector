@@ -158,7 +158,7 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
 
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
@@ -305,6 +305,10 @@ mod tests {
     use vrl::value;
 
     use super::*;
+    use vector_common::limits::CompressionLimits;
+
+    /// Keeps decompression-bomb fixtures small on the wire regardless of the production default.
+    const TEST_MAX_DECOMPRESSED_SIZE_BYTES: usize = 64 * 1024 * 1024;
     use crate::{
         event::{Event, EventStatus},
         log_event,
@@ -392,7 +396,8 @@ mod tests {
         let status = if delivered { Delivered } else { Rejected };
         let (sender, recv) = SourceSender::new_test_finalize(status);
         let address = next_addr();
-        let cx = SourceContext::new_test(sender, None);
+        let mut cx = SourceContext::new_test(sender, None);
+        cx.globals.ops_limits.compression = CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES);
         tokio::spawn(async move {
             AwsKinesisFirehoseConfig {
                 address,
@@ -506,8 +511,6 @@ mod tests {
         /// repeated past the cap suffices.
         #[tokio::test]
         async fn gzip_encoded_request_body_over_the_cap_is_rejected() {
-            use crate::sources::util::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
-
             let (rx, address) = source(None, None, false, Compression::None, true, false).await;
             let draining = drain(rx);
 
@@ -517,7 +520,7 @@ mod tests {
             encoder.read_to_end(&mut member).unwrap();
 
             let mut bomb = Vec::new();
-            for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            for _ in 0..(TEST_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
                 bomb.extend_from_slice(&member);
             }
             assert!(bomb.len() < 1024 * 1024, "bomb must stay small on the wire");
@@ -530,7 +533,7 @@ mod tests {
                 .unwrap();
 
             // Asserting only `!= 200` would pass for the wrong reason: with the cap removed the
-            // bomb inflates to ~101 MiB, `serde_json` then fails to parse it and the handler
+            // bomb inflates past the cap, `serde_json` then fails to parse it and the handler
             // answers 401 (`RequestError::Parse`), which is also non-200. Pin the decode failure
             // specifically, which only the cap can produce.
             assert_eq!(400, response.status().as_u16());
@@ -1134,7 +1137,8 @@ mod tests {
         ));
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let address = next_addr();
-        let cx = SourceContext::new_test(sender, None);
+        let mut cx = SourceContext::new_test(sender, None);
+        cx.globals.ops_limits.compression = CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES);
         tokio::spawn(async move {
             AwsKinesisFirehoseConfig {
                 address,

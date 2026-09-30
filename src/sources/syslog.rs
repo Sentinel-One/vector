@@ -230,7 +230,7 @@ impl SourceConfig for SyslogConfig {
                 socket_file_mode,
             } => {
                 let decoder = Decoder::new(
-                    Framer::OctetCounting(OctetCountingDecoder::new_with_max_length(
+                    Framer::OctetCounting(OctetCountingDecoder::new(
                         self.max_length,
                     )),
                     Deserializer::Syslog(
@@ -291,7 +291,7 @@ impl TcpSource for SyslogTcpSource {
 
     fn decoder(&self) -> Self::Decoder {
         Decoder::new(
-            Framer::OctetCounting(OctetCountingDecoder::new_with_max_length(self.max_length)),
+            Framer::OctetCounting(OctetCountingDecoder::new(self.max_length)),
             Deserializer::Syslog(SyslogDeserializerConfig::from_source(SyslogConfig::NAME).build()),
         )
     }
