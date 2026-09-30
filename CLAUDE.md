@@ -149,6 +149,8 @@ Observo introduces one deliberate global singleton in `src/topology/builder.rs` 
 
 ## Testing Notes (Observo-specific)
 
+For test placement, commands, and coverage caveats, see [TESTING.md](TESTING.md).
+
 - Default `cargo test` and `make test` skip Observo crates (excluded via `EXCLUDE_WORKSPACES`). Run `FEATURES=observo make test` to include them.
 - `cargo-nextest` retries 3× before reporting failure (config in `.config/nextest.toml`, 30s slow-test threshold, no fail-fast) — flaky tests slip through. Watch the test summary for "flaky retries."
 - `#[tokio::test]` defaults to single-threaded; use `#[tokio::test(flavor = "multi_thread")]` when concurrency is required for the test logic.
