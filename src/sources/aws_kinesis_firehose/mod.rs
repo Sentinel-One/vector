@@ -305,6 +305,7 @@ mod tests {
     use vrl::value;
 
     use super::*;
+    use vector_common::limits::CompressionLimits;
 
     /// Keeps decompression-bomb fixtures small on the wire regardless of the production default.
     const TEST_MAX_DECOMPRESSED_SIZE_BYTES: usize = 64 * 1024 * 1024;
@@ -396,10 +397,7 @@ mod tests {
         let (sender, recv) = SourceSender::new_test_finalize(status);
         let address = next_addr();
         let mut cx = SourceContext::new_test(sender, None);
-        cx.globals.ops_limits.compression =
-            vector_common::limits::CompressionLimits::with_max_decompressed_size_bytes(
-                TEST_MAX_DECOMPRESSED_SIZE_BYTES,
-            );
+        cx.globals.ops_limits.compression = CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES);
         tokio::spawn(async move {
             AwsKinesisFirehoseConfig {
                 address,
@@ -1140,10 +1138,7 @@ mod tests {
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let address = next_addr();
         let mut cx = SourceContext::new_test(sender, None);
-        cx.globals.ops_limits.compression =
-            vector_common::limits::CompressionLimits::with_max_decompressed_size_bytes(
-                TEST_MAX_DECOMPRESSED_SIZE_BYTES,
-            );
+        cx.globals.ops_limits.compression = CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES);
         tokio::spawn(async move {
             AwsKinesisFirehoseConfig {
                 address,

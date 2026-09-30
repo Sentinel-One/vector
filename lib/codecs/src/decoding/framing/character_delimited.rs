@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn build_falls_back_to_the_deployment_configured_cap() {
         let config = CharacterDelimitedDecoderConfig::new(b'\n');
-        let codec = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        let codec = config.build(FramingLimits::new(4096));
         assert_eq!(codec.max_length(), 4096);
     }
 
@@ -395,7 +395,7 @@ mod tests {
         let config = CharacterDelimitedDecoderConfig {
             character_delimited: CharacterDelimitedDecoderOptions::new(b'\n', Some(64)),
         };
-        let codec = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        let codec = config.build(FramingLimits::new(4096));
         assert_eq!(codec.max_length(), 64);
     }
 

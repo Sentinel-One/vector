@@ -72,7 +72,7 @@ mod tests {
 
     fn newline_decoder_capped_at(max_frame_length_bytes: usize) -> super::Decoder {
         let limits = OperationalLimits {
-            framing: FramingLimits::with_max_frame_length_bytes(max_frame_length_bytes),
+            framing: FramingLimits::new(max_frame_length_bytes),
             ..Default::default()
         };
         DecodingConfig::new(
@@ -92,11 +92,16 @@ mod tests {
     }
 
     #[test]
-    fn framer_buffers_frame_under_the_operational_limit() {
-        let mut buf = BytesMut::from(&[b'a'; 5000][..]);
-        assert!(matches!(
-            newline_decoder_capped_at(8192).decode(&mut buf),
-            Ok(None)
-        ));
+    fn framer_decodes_frame_under_the_operational_limit() {
+        let mut buf = BytesMut::from(format!("{}\n", "a".repeat(5000)).as_str());
+        let (events, _) = newline_decoder_capped_at(8192)
+            .decode(&mut buf)
+            .unwrap()
+            .expect("a complete frame under the cap must decode");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].as_log().get_message().unwrap(),
+            &vrl::value::Value::from("a".repeat(5000))
+        );
     }
 }

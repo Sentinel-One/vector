@@ -237,9 +237,9 @@ impl Default for CompressionLimits {
 }
 
 impl CompressionLimits {
-    /// Builds limits with an explicit decompressed-size cap. Mostly useful in tests.
+    /// Builds limits with the given decompressed-size cap.
     #[must_use]
-    pub const fn with_max_decompressed_size_bytes(max_decompressed_size_bytes: usize) -> Self {
+    pub const fn new(max_decompressed_size_bytes: usize) -> Self {
         Self {
             max_decompressed_size_bytes,
         }
@@ -359,9 +359,9 @@ impl Default for FramingLimits {
 }
 
 impl FramingLimits {
-    /// Builds limits with an explicit frame-length cap. Mostly useful in tests.
+    /// Builds limits with the given frame-length cap.
     #[must_use]
-    pub const fn with_max_frame_length_bytes(max_frame_length_bytes: usize) -> Self {
+    pub const fn new(max_frame_length_bytes: usize) -> Self {
         Self {
             max_frame_length_bytes,
         }
@@ -850,27 +850,22 @@ mod tests {
     fn zstd_window_log_tracks_the_cap() {
         // 100 MiB needs a 2^27 window; the HTTP variant is clamped to RFC 9659's 2^23.
         assert_eq!(
-            CompressionLimits::with_max_decompressed_size_bytes(100 * 1024 * 1024)
-                .zstd_window_log(),
+            CompressionLimits::new(100 * 1024 * 1024).zstd_window_log(),
             Some(27)
         );
         assert_eq!(
-            CompressionLimits::with_max_decompressed_size_bytes(100 * 1024 * 1024)
-                .http_zstd_window_log(),
+            CompressionLimits::new(100 * 1024 * 1024).http_zstd_window_log(),
             Some(HTTP_ZSTD_WINDOW_LOG_MAX)
         );
         // A zero cap clamps to the tightest window rather than disabling the guard.
-        assert_eq!(
-            CompressionLimits::with_max_decompressed_size_bytes(0).zstd_window_log(),
-            Some(10)
-        );
+        assert_eq!(CompressionLimits::new(0).zstd_window_log(), Some(10));
     }
 
     // ---- component limit overrides ------------------------------------------------------------
 
     fn global(max: usize) -> OperationalLimits {
         OperationalLimits {
-            compression: CompressionLimits::with_max_decompressed_size_bytes(max),
+            compression: CompressionLimits::new(max),
             framing: FramingLimits::default(),
             connection: ConnectionLimits::default(),
         }
@@ -889,7 +884,7 @@ mod tests {
     fn global_framing(max: usize) -> OperationalLimits {
         OperationalLimits {
             compression: CompressionLimits::default(),
-            framing: FramingLimits::with_max_frame_length_bytes(max),
+            framing: FramingLimits::new(max),
             connection: ConnectionLimits::default(),
         }
     }

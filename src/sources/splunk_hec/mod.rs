@@ -1383,10 +1383,7 @@ mod tests {
         let valid_tokens =
             valid_tokens.map(|tokens| tokens.iter().map(|v| v.to_string().into()).collect());
         let mut cx = SourceContext::new_test(sender, None);
-        cx.globals.ops_limits.compression =
-            vector_common::limits::CompressionLimits::with_max_decompressed_size_bytes(
-                TEST_MAX_DECOMPRESSED_SIZE_BYTES,
-            );
+        cx.globals.ops_limits.compression = CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES);
         tokio::spawn(async move {
             SplunkConfig {
                 address,

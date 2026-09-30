@@ -514,8 +514,13 @@ impl HttpSource for SimpleHttpSource {
                 Err(error) => {
                     // Error is logged / emitted by `crate::codecs::Decoder`, no further
                     // handling is needed here
+                    let status = if error.is_frame_too_long() {
+                        StatusCode::PAYLOAD_TOO_LARGE
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
                     return Err(ErrorMessage::new(
-                        StatusCode::BAD_REQUEST,
+                        status,
                         format!("Failed decoding body: {}", error),
                     ));
                 }
@@ -1952,7 +1957,7 @@ mod tests {
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let address = next_addr();
         let mut context = SourceContext::new_test(sender, None);
-        context.globals.ops_limits.framing = FramingLimits::with_max_frame_length_bytes(cap);
+        context.globals.ops_limits.framing = FramingLimits::new(cap);
         let config = SimpleHttpConfig {
             address,
             framing: Some(NewlineDelimitedDecoderConfig::new().into()),
@@ -1967,9 +1972,20 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_body_frame_over_ops_limits_frame_cap() {
-        let (address, _recv) = spawn_newline_http_source_with_frame_cap(4096).await;
-        assert_eq!(400, send(address, &"b".repeat(5000)).await);
+        let (address, recv) = spawn_newline_http_source_with_frame_cap(4096).await;
+        assert_eq!(413, send(address, &"b".repeat(5000)).await);
         assert_eq!(200, send(address, &"a".repeat(100)).await);
+
+        let events = crate::test_util::collect_ready(recv).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "only the in-limit body must produce an event"
+        );
+        assert_eq!(
+            events[0].as_log().get_message().unwrap(),
+            &Value::from("a".repeat(100))
+        );
     }
 
     register_validatable_component!(SimpleHttpConfig);

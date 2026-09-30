@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn build_falls_back_to_the_deployment_configured_cap() {
         let config = NewlineDelimitedDecoderConfig::new();
-        let decoder = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        let decoder = config.build(FramingLimits::new(4096));
         assert_eq!(decoder.0.max_length(), 4096);
     }
 
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn build_prefers_an_explicit_max_length_over_the_deployment_cap() {
         let config = NewlineDelimitedDecoderConfig::new_with_max_length(64);
-        let decoder = config.build(FramingLimits::with_max_frame_length_bytes(4096));
+        let decoder = config.build(FramingLimits::new(4096));
         assert_eq!(decoder.0.max_length(), 64);
     }
 }

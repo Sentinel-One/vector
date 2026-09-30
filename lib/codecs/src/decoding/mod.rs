@@ -53,6 +53,13 @@ pub enum Error {
     ParsingError(vector_common::Error),
 }
 
+impl Error {
+    /// Whether this is a frame that exceeded its framer's maximum length.
+    pub fn is_frame_too_long(&self) -> bool {
+        matches!(self, Self::FramingError(error) if error.as_any().is::<framing::FrameTooLong>())
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -631,6 +638,25 @@ impl format::Deserializer for Deserializer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_frame_too_long_identifies_only_oversized_frames() {
+        use tokio_util::codec::Decoder as _;
+
+        let mut decoder = crate::actions::Decoder::new(
+            Framer::NewlineDelimited(NewlineDelimitedDecoder::new(4)),
+            Deserializer::Bytes(BytesDeserializer),
+        );
+        let mut buf = bytes::BytesMut::from("aaaaaaaa");
+        assert!(decoder.decode(&mut buf).unwrap_err().is_frame_too_long());
+
+        let mut decoder = crate::actions::Decoder::new(
+            Framer::NewlineDelimited(NewlineDelimitedDecoder::new(1024)),
+            Deserializer::Json(JsonDeserializer::default()),
+        );
+        let mut buf = bytes::BytesMut::from("not json\n");
+        assert!(!decoder.decode(&mut buf).unwrap_err().is_frame_too_long());
+    }
 
     #[test]
     fn gelf_stream_default_framing_is_null_delimited() {

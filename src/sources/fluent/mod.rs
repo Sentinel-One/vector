@@ -1406,7 +1406,7 @@ mod tests {
 
         let error = decode_all_with(
             message,
-            CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES),
+            CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES),
         )
         .expect_err("a payload inflating past the cap must be rejected");
 

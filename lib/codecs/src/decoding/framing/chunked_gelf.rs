@@ -1289,7 +1289,7 @@ mod tests {
     /// is enough to exceed it — no single oversized member required.
     #[test]
     fn gzip_decompression_is_capped() {
-        let limits = CompressionLimits::with_max_decompressed_size_bytes(TEST_CAP_BYTES);
+        let limits = CompressionLimits::new(TEST_CAP_BYTES);
         let member = Compression::Gzip.compress(&vec![0u8; 1024 * 1024]);
         let members = TEST_CAP_BYTES / (1024 * 1024) + 1;
         let mut bomb = BytesMut::new();
@@ -1321,7 +1321,7 @@ mod tests {
     fn zlib_decompression_is_capped() {
         use std::io::Write as IoWrite;
 
-        let limits = CompressionLimits::with_max_decompressed_size_bytes(TEST_CAP_BYTES);
+        let limits = CompressionLimits::new(TEST_CAP_BYTES);
         let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         let chunk = vec![0u8; 1024 * 1024];
         for _ in 0..(TEST_CAP_BYTES / (1024 * 1024) + 1) {

@@ -2694,7 +2694,7 @@ mod decompression_caps {
             None,
             LogNamespace::Legacy,
             false,
-            CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES),
+            CompressionLimits::new(TEST_MAX_DECOMPRESSED_SIZE_BYTES),
         )
     }
 

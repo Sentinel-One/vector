@@ -232,7 +232,7 @@ mod tests {
             "c".repeat(100)
         );
         let limits = OperationalLimits {
-            framing: FramingLimits::with_max_frame_length_bytes(4096),
+            framing: FramingLimits::new(4096),
             ..Default::default()
         };
 

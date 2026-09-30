@@ -1149,7 +1149,7 @@ mod limit_override_tests {
     fn global_with(max: usize) -> GlobalOptions {
         GlobalOptions {
             ops_limits: OperationalLimits {
-                compression: CompressionLimits::with_max_decompressed_size_bytes(max),
+                compression: CompressionLimits::new(max),
                 ..Default::default()
             },
             ..Default::default()

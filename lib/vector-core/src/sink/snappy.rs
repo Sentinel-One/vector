@@ -141,7 +141,7 @@ mod tests {
     use super::*;
 
     fn limits(max: usize) -> CompressionLimits {
-        CompressionLimits::with_max_decompressed_size_bytes(max)
+        CompressionLimits::new(max)
     }
 
     fn snappy(payload: &[u8]) -> Vec<u8> {

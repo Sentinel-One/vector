@@ -15,6 +15,7 @@ mod strata_snappy;
 use std::{any::Any, fmt::Debug};
 
 use ::bytes::Bytes;
+pub(crate) use character_delimited::FrameTooLong;
 pub use character_delimited::{
     CharacterDelimitedDecoder, CharacterDelimitedDecoderConfig, CharacterDelimitedDecoderOptions,
 };

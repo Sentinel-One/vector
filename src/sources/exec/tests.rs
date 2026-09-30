@@ -486,7 +486,7 @@ async fn scheduled_exec_stops_decoding_at_line_over_ops_limits_frame_cap() {
     };
     let (tx, rx) = SourceSender::new_test();
     let mut cx = SourceContext::new_test(tx, None);
-    cx.globals.ops_limits.framing = FramingLimits::with_max_frame_length_bytes(4096);
+    cx.globals.ops_limits.framing = FramingLimits::new(4096);
 
     let source = config.build(cx).await.unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(3), source).await;
