@@ -188,8 +188,7 @@ impl SourceConfig for PulsarSourceConfig {
 
         let consumer = self.create_consumer().await?;
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
-                .with_operational_limits(cx.globals.ops_limits)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
 
@@ -578,6 +577,7 @@ mod integration_tests {
             cnf.framing.clone(),
             cnf.decoding.clone(),
             LogNamespace::Legacy,
+            Default::default(),
         )
         .build()
         .unwrap();

@@ -264,6 +264,9 @@ fn decode_gzip(data: &[u8], limits: &CompressionLimits) -> std::io::Result<Bytes
 
 #[cfg(test)]
 mod tests {
+    /// Keeps decompression-bomb fixtures small on the wire regardless of the production default.
+    const TEST_MAX_DECOMPRESSED_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write as _;
 
@@ -283,14 +286,12 @@ mod tests {
     /// One cheap gzip member repeated past the cap. `MultiGzDecoder` walks every concatenated
     /// member, so no single oversized member is required.
     fn gzip_bomb() -> Vec<u8> {
-        use crate::sources::util::decompression::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
-
         let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
         encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
         let member = encoder.finish().unwrap();
 
         let mut bomb = Vec::new();
-        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+        for _ in 0..(TEST_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
             bomb.extend_from_slice(&member);
         }
         assert!(
@@ -310,7 +311,7 @@ mod tests {
     /// A gzip-bomb record must be refused rather than inflated.
     #[test]
     fn explicit_gzip_record_over_the_cap_is_rejected() {
-        let error = decode_record(&record(&gzip_bomb()), super::Compression::Gzip, &CompressionLimits::default())
+        let error = decode_record(&record(&gzip_bomb()), super::Compression::Gzip, &CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES))
             .expect_err("a record inflating past the cap must be rejected");
 
         assert!(matches!(
@@ -323,7 +324,7 @@ mod tests {
     /// silently forwarded as raw bytes. The raw-bytes fallback exists only for a mis-detection.
     #[test]
     fn auto_detected_gzip_record_over_the_cap_is_rejected_not_forwarded() {
-        let error = decode_record(&record(&gzip_bomb()), super::Compression::Auto, &CompressionLimits::default())
+        let error = decode_record(&record(&gzip_bomb()), super::Compression::Auto, &CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES))
             .expect_err("an oversized auto-detected gzip record must not fall back to raw bytes");
 
         assert!(matches!(
@@ -340,13 +341,17 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         for compression in [super::Compression::Gzip, super::Compression::Auto] {
-            let decoded = decode_record(&record(&compressed), compression, &CompressionLimits::default())
+            let decoded = decode_record(&record(&compressed), compression, &CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES))
                 .expect("a record within the cap must decode");
             assert_eq!(decoded, Bytes::from_static(CONTENT));
         }
 
-        let plain = decode_record(&record(CONTENT), super::Compression::None, &CompressionLimits::default())
-            .expect("an uncompressed record must decode");
+        let plain = decode_record(
+            &record(CONTENT),
+            super::Compression::None,
+            &CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES),
+        )
+        .expect("an uncompressed record must decode");
         assert_eq!(plain, Bytes::from_static(CONTENT));
     }
 
@@ -357,7 +362,7 @@ mod tests {
         let mut not_gzip = vector_common::constants::GZIP_MAGIC.to_vec();
         not_gzip.extend_from_slice(b"definitely not a gzip stream");
 
-        let decoded = decode_record(&record(&not_gzip), super::Compression::Auto, &CompressionLimits::default())
+        let decoded = decode_record(&record(&not_gzip), super::Compression::Auto, &CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES))
             .expect("a mis-detected record must fall back to raw bytes");
 
         assert_eq!(decoded, Bytes::from(not_gzip));

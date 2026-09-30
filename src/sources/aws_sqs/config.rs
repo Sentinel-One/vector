@@ -111,8 +111,7 @@ impl SourceConfig for AwsSqsConfig {
 
         let client = self.build_client(&cx).await?;
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
-                .with_operational_limits(cx.globals.ops_limits)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
 

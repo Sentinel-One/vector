@@ -169,8 +169,7 @@ impl SourceConfig for RedisSourceConfig {
         let client = redis::Client::open(self.url.as_str()).context(ClientSnafu {})?;
         let connection_info = ConnectionInfo::from(client.get_connection_info());
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
-                .with_operational_limits(cx.globals.ops_limits)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
 
         let bytes_received = register!(BytesReceived::from(Protocol::from(

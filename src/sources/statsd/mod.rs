@@ -330,7 +330,7 @@ async fn statsd_udp(
     );
 
     let codec = Decoder::new(
-        Framer::NewlineDelimited(NewlineDelimitedDecoder::new_with_max_length(
+        Framer::NewlineDelimited(NewlineDelimitedDecoder::new(
             max_frame_length_bytes,
         )),
         Deserializer::Boxed(Box::new(StatsdDeserializer::udp(config.sanitize))),
@@ -370,7 +370,7 @@ impl TcpSource for StatsdTcpSource {
 
     fn decoder(&self) -> Self::Decoder {
         Decoder::new(
-            Framer::NewlineDelimited(NewlineDelimitedDecoder::new_with_max_length(
+            Framer::NewlineDelimited(NewlineDelimitedDecoder::new(
                 self.max_frame_length_bytes,
             )),
             Deserializer::Boxed(Box::new(StatsdDeserializer::tcp(self.sanitize))),

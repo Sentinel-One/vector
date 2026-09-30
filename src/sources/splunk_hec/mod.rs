@@ -1330,6 +1330,9 @@ mod tests {
     };
     use crate::sinks::util::http::RequestConfig;
 
+    /// Keeps decompression-bomb fixtures small on the wire regardless of the production default.
+    const TEST_MAX_DECOMPRESSED_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<SplunkConfig>();
@@ -1379,7 +1382,11 @@ mod tests {
         let address = next_addr();
         let valid_tokens =
             valid_tokens.map(|tokens| tokens.iter().map(|v| v.to_string().into()).collect());
-        let cx = SourceContext::new_test(sender, None);
+        let mut cx = SourceContext::new_test(sender, None);
+        cx.globals.ops_limits.compression =
+            vector_common::limits::CompressionLimits::with_max_decompressed_size_bytes(
+                TEST_MAX_DECOMPRESSED_SIZE_BYTES,
+            );
         tokio::spawn(async move {
             SplunkConfig {
                 address,
@@ -2854,7 +2861,7 @@ mod tests {
                     X_SPLUNK_REQUEST_CHANNEL.to_string(),
                     "channel".to_string(),
                 )])),
-                DecodingConfig::new(framing, decoding, false.into()),
+                DecodingConfig::new(framing, decoding, false.into(), Default::default()),
             );
 
             ValidationConfiguration::from_source(
@@ -2971,15 +2978,13 @@ mod tests {
         fn gzip_bomb() -> Vec<u8> {
             use std::io::Write as _;
 
-            use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
-
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
             encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
             let member = encoder.finish().unwrap();
 
             let mut bomb = Vec::new();
-            for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+            for _ in 0..(TEST_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
                 bomb.extend_from_slice(&member);
             }
             assert!(

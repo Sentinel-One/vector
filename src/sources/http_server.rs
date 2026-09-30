@@ -266,8 +266,8 @@ impl SimpleHttpConfig {
             framing,
             decoding,
             self.log_namespace.unwrap_or(false).into(),
-        )
-        .with_operational_limits(ops_limits))
+            ops_limits,
+        ))
     }
 }
 
@@ -542,9 +542,11 @@ mod tests {
     use futures::Stream;
     use http::{HeaderMap, Method, StatusCode, Uri};
     use similar_asserts::assert_eq;
+    use vector_common::limits::{FramingLimits, OperationalLimits};
     use vector_lib::codecs::{
         decoding::{DeserializerConfig, FramingConfig},
-        BytesDecoderConfig, JsonDeserializerConfig,
+        BytesDecoderConfig, BytesDeserializerConfig, JsonDeserializerConfig,
+        NewlineDelimitedDecoderConfig,
     };
     use vector_lib::config::LogNamespace;
     use vector_lib::event::LogEvent;
@@ -1716,7 +1718,7 @@ mod tests {
                 ResourceDirection::Push,
                 HttpResourceConfig::from_parts(uri, Some(config.method.into())),
                 config
-                    .get_decoding_config(vector_common::limits::OperationalLimits::default())
+                    .get_decoding_config(OperationalLimits::default())
                     .expect("should not fail to get decoding config"),
             );
 
@@ -1950,12 +1952,11 @@ mod tests {
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let address = next_addr();
         let mut context = SourceContext::new_test(sender, None);
-        context.globals.ops_limits.framing =
-            vector_common::limits::FramingLimits::with_max_frame_length_bytes(cap);
+        context.globals.ops_limits.framing = FramingLimits::with_max_frame_length_bytes(cap);
         let config = SimpleHttpConfig {
             address,
-            framing: Some(vector_lib::codecs::NewlineDelimitedDecoderConfig::new().into()),
-            decoding: Some(vector_lib::codecs::BytesDeserializerConfig::new().into()),
+            framing: Some(NewlineDelimitedDecoderConfig::new().into()),
+            decoding: Some(BytesDeserializerConfig::new().into()),
             ..SimpleHttpConfig::default()
         };
         let source = config.build(context).await.unwrap();

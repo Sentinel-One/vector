@@ -6,6 +6,7 @@ use criterion::{
     SamplingMode, Throughput,
 };
 use tokio_util::codec::Decoder;
+use vector_common::limits::FramingLimits;
 use vector_lib::codecs::{
     decoding::{Deserializer, Framer},
     BytesDeserializer, CharacterDelimitedDecoder,
@@ -49,10 +50,10 @@ fn decoding(c: &mut Criterion) {
                 b.iter_batched(
                     || {
                         let framer = Framer::CharacterDelimited(
-                            param
-                                .max_length
-                                .map(|ml| CharacterDelimitedDecoder::new_with_max_length(b'a', ml))
-                                .unwrap_or(CharacterDelimitedDecoder::new(b'a')),
+                            CharacterDelimitedDecoder::new(
+                                b'a',
+                                param.max_length.unwrap_or(FramingLimits::default().max_frame_length_bytes),
+                            ),
                         );
                         let deserializer = Deserializer::Bytes(BytesDeserializer);
                         let decoder = vector::codecs::Decoder::new(framer, deserializer);

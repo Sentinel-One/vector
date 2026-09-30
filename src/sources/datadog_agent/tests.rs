@@ -2574,6 +2574,7 @@ impl ValidatableComponent for DatadogAgentConfig {
             config.framing.clone(),
             DeserializerConfig::Json(Default::default()),
             false.into(),
+            Default::default(),
         );
 
         let external_resource = ExternalResource::new(
@@ -2673,11 +2674,13 @@ mod decompression_caps {
     use std::io::Write as _;
 
     use similar_asserts::assert_eq;
-    use vector_common::limits::DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES;
 
     use super::*;
     use vector_common::limits::CompressionLimits;
     use crate::sources::datadog_agent::DatadogAgentSource;
+
+    /// Keeps decompression-bomb fixtures small on the wire regardless of the production default.
+    const TEST_MAX_DECOMPRESSED_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
     fn test_source() -> DatadogAgentSource {
         let decoder = crate::codecs::Decoder::new(
@@ -2691,7 +2694,7 @@ mod decompression_caps {
             None,
             LogNamespace::Legacy,
             false,
-            CompressionLimits::default(),
+            CompressionLimits::with_max_decompressed_size_bytes(TEST_MAX_DECOMPRESSED_SIZE_BYTES),
         )
     }
 
@@ -2703,7 +2706,7 @@ mod decompression_caps {
         let member = encoder.finish().unwrap();
 
         let mut bomb = Vec::new();
-        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+        for _ in 0..(TEST_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
             bomb.extend_from_slice(&member);
         }
         assert!(
@@ -2717,7 +2720,7 @@ mod decompression_caps {
     fn zlib_bomb() -> Bytes {
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         encoder
-            .write_all(&vec![0u8; DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES + 1])
+            .write_all(&vec![0u8; TEST_MAX_DECOMPRESSED_SIZE_BYTES + 1])
             .unwrap();
         Bytes::from(encoder.finish().unwrap())
     }
@@ -2771,7 +2774,7 @@ mod decompression_caps {
     fn zstd_body_over_the_cap_is_rejected() {
         let frame = zstd::encode_all(vec![0u8; 1024 * 1024].as_slice(), 1).unwrap();
         let mut bomb = Vec::new();
-        for _ in 0..(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
+        for _ in 0..(TEST_MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024) + 1) {
             bomb.extend_from_slice(&frame);
         }
 

@@ -1,7 +1,4 @@
-use crate::decoding::{
-    format::Deserializer as _, BoxedFramingError, BytesDeserializer, Deserializer, Error, Framer,
-    NewlineDelimitedDecoder,
-};
+use crate::decoding::{format::Deserializer as _, BoxedFramingError, Deserializer, Error, Framer};
 use crate::internal_events::codecs::{DecoderDeserializeError, DecoderFramingError};
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
@@ -20,16 +17,6 @@ pub struct Decoder {
     pub deserializer: Deserializer,
     /// The `log_namespace` being used.
     pub log_namespace: LogNamespace,
-}
-
-impl Default for Decoder {
-    fn default() -> Self {
-        Self {
-            framer: Framer::NewlineDelimited(NewlineDelimitedDecoder::new()),
-            deserializer: Deserializer::Bytes(BytesDeserializer),
-            log_namespace: LogNamespace::Legacy,
-        }
-    }
 }
 
 impl Decoder {
@@ -138,6 +125,7 @@ mod tests {
         decoding::{Deserializer, Framer},
         JsonDeserializer, NewlineDelimitedDecoder, StreamDecodingError,
     };
+    use vector_common::limits::FramingLimits;
     use bytes::Bytes;
     use futures::{stream, StreamExt};
     use tokio_util::{codec::FramedRead, io::StreamReader};
@@ -153,7 +141,7 @@ mod tests {
         let stream = iter.map(Ok::<_, std::io::Error>);
         let reader = StreamReader::new(stream);
         let decoder = Decoder::new(
-            Framer::NewlineDelimited(NewlineDelimitedDecoder::new()),
+            Framer::NewlineDelimited(NewlineDelimitedDecoder::new(FramingLimits::default().max_frame_length_bytes)),
             Deserializer::Json(JsonDeserializer::default()),
         );
         let mut stream = FramedRead::new(reader, decoder);

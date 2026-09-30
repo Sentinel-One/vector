@@ -131,8 +131,7 @@ impl AmqpSourceConfig {
         log_namespace: LogNamespace,
         ops_limits: OperationalLimits,
     ) -> vector_lib::Result<Decoder> {
-        DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
-            .with_operational_limits(ops_limits)
+        DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, ops_limits)
             .build()
     }
 }

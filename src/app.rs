@@ -205,6 +205,14 @@ impl Application {
             opts.root.internal_log_rate_limit,
         );
 
+        // After logging (so invalid overrides are reported) and before any config is loaded.
+        if let Err(errors) = vector_common::limits::init_env_defaults() {
+            for error in errors {
+                error!(message = "Invalid ops_limits environment override.", %error);
+            }
+            return Err(exitcode::CONFIG);
+        }
+
         // Can only log this after initializing the logging subsystem
         if opts.root.openssl_no_probe {
             debug!(message = "Disabled probing and configuration of root certificate locations on the system for OpenSSL.");

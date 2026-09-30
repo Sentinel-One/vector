@@ -720,7 +720,7 @@ impl StartJournalctl {
 
         let stream = FramedRead::new(
             child.stdout.take().unwrap(),
-            CharacterDelimitedDecoder::new_with_max_length(b'\n', self.max_frame_length_bytes),
+            CharacterDelimitedDecoder::new(b'\n', self.max_frame_length_bytes),
         )
         .boxed();
 
@@ -1558,7 +1558,7 @@ mod tests {
             current_boot_only,
             since_now,
             extra_args,
-            vector_common::limits::DEFAULT_MAX_FRAME_LENGTH_BYTES,
+            vector_common::limits::FramingLimits::default().max_frame_length_bytes,
         )
         .make_command(cursor)
     }

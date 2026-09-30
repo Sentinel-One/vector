@@ -64,8 +64,7 @@ pub trait FileDescriptorConfig: NamedComponent {
         let framing = self
             .framing()
             .unwrap_or_else(|| decoding.default_stream_framing());
-        let decoder = DecodingConfig::new(framing, decoding, log_namespace)
-            .with_operational_limits(ops_limits)
+        let decoder = DecodingConfig::new(framing, decoding, log_namespace, ops_limits)
             .build()?;
 
         let (sender, receiver) = mpsc::channel(1024);

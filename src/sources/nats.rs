@@ -141,8 +141,7 @@ impl SourceConfig for NatsSourceConfig {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let (connection, subscription) = create_subscription(self).await?;
         let decoder =
-            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
-                .with_operational_limits(cx.globals.ops_limits)
+            DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, cx.globals.ops_limits)
                 .build()?;
 
         Ok(Box::pin(nats_source(
@@ -404,6 +403,7 @@ mod integration_tests {
                 conf.framing.clone(),
                 conf.decoding.clone(),
                 LogNamespace::Legacy,
+                Default::default(),
             )
             .build()
             .unwrap();

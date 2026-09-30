@@ -222,10 +222,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdin_drops_line_over_ops_limits_frame_cap() {
+    async fn stdin_stops_decoding_at_line_over_ops_limits_frame_cap() {
         let (tx, rx) = SourceSender::new_test();
         let config = StdinConfig::default();
-        let input = format!("{}\n{}\n", "a".repeat(100), "b".repeat(5000));
+        let input = format!(
+            "{}\n{}\n{}\n",
+            "a".repeat(100),
+            "b".repeat(5000),
+            "c".repeat(100)
+        );
         let limits = OperationalLimits {
             framing: FramingLimits::with_max_frame_length_bytes(4096),
             ..Default::default()

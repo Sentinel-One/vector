@@ -305,8 +305,8 @@ impl SourceConfig for PubsubConfig {
                 self.framing.clone(),
                 self.decoding.clone(),
                 log_namespace,
+                cx.globals.ops_limits,
             )
-            .with_operational_limits(cx.globals.ops_limits)
             .build()?,
             acknowledgements: cx.do_acknowledgements(self.acknowledgements),
             shutdown: cx.shutdown,

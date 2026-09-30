@@ -249,7 +249,7 @@ impl HttpClientConfig {
         let log_namespace =
             log_namespace.unwrap_or_else(|| self.log_namespace.unwrap_or(false).into());
 
-        DecodingConfig::new(framing, decoding, log_namespace).with_operational_limits(ops_limits)
+        DecodingConfig::new(framing, decoding, log_namespace, ops_limits)
     }
 }
 

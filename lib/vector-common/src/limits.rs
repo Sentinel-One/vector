@@ -5,14 +5,154 @@
 //! individual pipelines may only tighten it, never loosen it, unless explicitly permitted. See
 //! [`OperationalLimits::resolve`].
 
-use std::fmt;
+use std::{fmt, str::FromStr, sync::OnceLock};
 
 use vector_config::configurable_component;
+
+/// An `ops_limits` environment override that is set but is not a positive integer within range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidEnvOverride {
+    /// The environment variable holding the value.
+    pub variable: &'static str,
+    /// The raw value it was set to.
+    pub value: String,
+}
+
+impl fmt::Display for InvalidEnvOverride {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid value {:?} for {}: expected a positive integer within range",
+            self.value, self.variable
+        )
+    }
+}
+
+impl std::error::Error for InvalidEnvOverride {}
+
+/// Resolves a default from the raw value of environment variable `name`.
+///
+/// Unset uses `default`. A positive integer (surrounding whitespace allowed) uses that value.
+/// Anything else is an error, so a mistyped override can never be silently replaced by `default`.
+fn resolve_env_default<T>(
+    name: &'static str,
+    raw: Option<&str>,
+    default: T,
+) -> Result<T, InvalidEnvOverride>
+where
+    T: FromStr + Default + PartialEq,
+{
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.trim().parse::<T>() {
+        Ok(value) if value != T::default() => Ok(value),
+        _ => Err(InvalidEnvOverride {
+            variable: name,
+            value: raw.to_owned(),
+        }),
+    }
+}
+
+/// Overrides the built-in default for `compression.max_decompressed_size_bytes` when set to a
+/// positive integer.
+pub const MAX_DECOMPRESSED_SIZE_BYTES_ENV: &str = "VECTOR_OPS_LIMITS_MAX_DECOMPRESSED_SIZE_BYTES";
+
+/// Overrides the built-in default for `framing.max_frame_length_bytes` when set to a positive
+/// integer.
+pub const MAX_FRAME_LENGTH_BYTES_ENV: &str = "VECTOR_OPS_LIMITS_MAX_FRAME_LENGTH_BYTES";
+
+/// Overrides the built-in default for `connection.ack_write_timeout_secs` when set to a positive
+/// integer.
+pub const ACK_WRITE_TIMEOUT_SECS_ENV: &str = "VECTOR_OPS_LIMITS_ACK_WRITE_TIMEOUT_SECS";
+
+/// The `ops_limits` defaults in effect for this process: each compiled constant, unless its
+/// environment variable overrides it.
+struct EnvDefaults {
+    max_decompressed_size_bytes: usize,
+    max_frame_length_bytes: usize,
+    ack_write_timeout_secs: u64,
+}
+
+impl EnvDefaults {
+    /// Resolves every override, reporting all invalid ones rather than stopping at the first.
+    fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, Vec<InvalidEnvOverride>> {
+        match (
+            resolve_env_default(
+                MAX_DECOMPRESSED_SIZE_BYTES_ENV,
+                lookup(MAX_DECOMPRESSED_SIZE_BYTES_ENV).as_deref(),
+                DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES,
+            ),
+            resolve_env_default(
+                MAX_FRAME_LENGTH_BYTES_ENV,
+                lookup(MAX_FRAME_LENGTH_BYTES_ENV).as_deref(),
+                DEFAULT_MAX_FRAME_LENGTH_BYTES,
+            ),
+            resolve_env_default(
+                ACK_WRITE_TIMEOUT_SECS_ENV,
+                lookup(ACK_WRITE_TIMEOUT_SECS_ENV).as_deref(),
+                DEFAULT_ACK_WRITE_TIMEOUT_SECS,
+            ),
+        ) {
+            (
+                Ok(max_decompressed_size_bytes),
+                Ok(max_frame_length_bytes),
+                Ok(ack_write_timeout_secs),
+            ) => Ok(Self {
+                max_decompressed_size_bytes,
+                max_frame_length_bytes,
+                ack_write_timeout_secs,
+            }),
+            (decompressed, frame, ack) => Err([decompressed.err(), frame.err(), ack.err()]
+                .into_iter()
+                .flatten()
+                .collect()),
+        }
+    }
+}
+
+/// Set once at process bootstrap by [`init_env_defaults`].
+static ENV_DEFAULTS: OnceLock<EnvDefaults> = OnceLock::new();
+
+/// Used until [`init_env_defaults`] runs, and in processes that never call it (tests, benches,
+/// library use).
+static BUILT_IN_DEFAULTS: EnvDefaults = EnvDefaults {
+    max_decompressed_size_bytes: DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES,
+    max_frame_length_bytes: DEFAULT_MAX_FRAME_LENGTH_BYTES,
+    ack_write_timeout_secs: DEFAULT_ACK_WRITE_TIMEOUT_SECS,
+};
+
+/// Reads the `VECTOR_OPS_LIMITS_*` environment overrides and fixes the `ops_limits` defaults for
+/// the rest of the process.
+///
+/// Call once at bootstrap, before any config is loaded. Once a call has succeeded, later calls do
+/// nothing.
+///
+/// # Errors
+///
+/// Returns every override that is set but is not a positive integer within range. Nothing is stored
+/// in that case, and the caller should refuse to start.
+pub fn init_env_defaults() -> Result<(), Vec<InvalidEnvOverride>> {
+    if ENV_DEFAULTS.get().is_some() {
+        return Ok(());
+    }
+    let defaults = EnvDefaults::from_lookup(|name| {
+        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+    })?;
+    let _ = ENV_DEFAULTS.set(defaults);
+    Ok(())
+}
+
+fn env_defaults() -> &'static EnvDefaults {
+    ENV_DEFAULTS.get().unwrap_or(&BUILT_IN_DEFAULTS)
+}
 
 /// Default cap on the size of any decompressed payload.
 ///
 /// Prevents a compressed "bomb" from causing unbounded memory growth.
-pub const DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES: usize = 1000 * 1024 * 1024;
+const DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES: usize = 1000 * 1024 * 1024;
 
 /// RFC 9659 window ceiling for zstd under HTTP `Content-Encoding: zstd`: conformant senders use a
 /// `Window_Size` of at most 8 MB (2^23) and decoders need only support up to that. Governs HTTP
@@ -34,18 +174,21 @@ pub struct CompressionLimits {
     ///
     /// Sources that decompress incoming payloads (gzip, zlib, zstd) enforce this so a compressed
     /// "bomb" cannot exhaust memory. A payload exceeding it is rejected.
+    ///
+    /// When unset, defaults to the `VECTOR_OPS_LIMITS_MAX_DECOMPRESSED_SIZE_BYTES` environment variable if it is set, otherwise
+    /// to the built-in default. Vector refuses to start if that variable is not a positive integer.
     #[serde(default = "default_max_decompressed_size_bytes")]
     pub max_decompressed_size_bytes: usize,
 }
 
-const fn default_max_decompressed_size_bytes() -> usize {
-    DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
+fn default_max_decompressed_size_bytes() -> usize {
+    env_defaults().max_decompressed_size_bytes
 }
 
 impl Default for CompressionLimits {
     fn default() -> Self {
         Self {
-            max_decompressed_size_bytes: DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES,
+            max_decompressed_size_bytes: default_max_decompressed_size_bytes(),
         }
     }
 }
@@ -135,10 +278,10 @@ impl CompressionLimits {
 ///
 /// Sized well above ordinary line-oriented traffic so that unusually wide but legitimate records
 /// decode without a pipeline author needing to raise it, while still bounding a peer that never
-/// sends a delimiter. Deployments with routinely larger single-line records (e.g.
-/// CloudTrail-via-`aws_s3`, which can exceed 10 MB) still need to raise this via
-/// `ops_limits.framing.max_frame_length_bytes` or a component's own `max_length`.
-pub const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 100 * 1024 * 1024;
+/// sends a delimiter. Deployments with larger single-line records can raise it via
+/// `ops_limits.framing.max_frame_length_bytes`, `VECTOR_OPS_LIMITS_MAX_FRAME_LENGTH_BYTES`, or a
+/// component's own `max_length`.
+const DEFAULT_MAX_FRAME_LENGTH_BYTES: usize = 100 * 1024 * 1024;
 
 /// Limits applied by delimited framers (`character_delimited`, `newline_delimited`,
 /// `octet_counting`) while a frame is still incomplete.
@@ -153,18 +296,21 @@ pub struct FramingLimits {
     /// Delimited framers buffer bytes until they see their delimiter, so a peer that never sends
     /// one would otherwise grow the per-connection buffer without bound. A frame that reaches this
     /// limit while still incomplete is a fatal decode error and the connection is reset.
+    ///
+    /// When unset, defaults to the `VECTOR_OPS_LIMITS_MAX_FRAME_LENGTH_BYTES` environment variable if it is set, otherwise
+    /// to the built-in default. Vector refuses to start if that variable is not a positive integer.
     #[serde(default = "default_max_frame_length_bytes")]
     pub max_frame_length_bytes: usize,
 }
 
-const fn default_max_frame_length_bytes() -> usize {
-    DEFAULT_MAX_FRAME_LENGTH_BYTES
+fn default_max_frame_length_bytes() -> usize {
+    env_defaults().max_frame_length_bytes
 }
 
 impl Default for FramingLimits {
     fn default() -> Self {
         Self {
-            max_frame_length_bytes: DEFAULT_MAX_FRAME_LENGTH_BYTES,
+            max_frame_length_bytes: default_max_frame_length_bytes(),
         }
     }
 }
@@ -184,7 +330,7 @@ impl FramingLimits {
 /// `write_all` progresses only as the peer's TCP receive window opens, so a peer that simply
 /// stops calling `recv()` would otherwise park the write - and with it the task, socket and fd -
 /// indefinitely. Generous enough that a merely slow client is never dropped.
-pub const DEFAULT_ACK_WRITE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_ACK_WRITE_TIMEOUT_SECS: u64 = 300;
 
 /// Limits applied to per-connection network operations, such as writing an acknowledgement back
 /// to a peer.
@@ -196,18 +342,21 @@ pub const DEFAULT_ACK_WRITE_TIMEOUT_SECS: u64 = 300;
 pub struct ConnectionLimits {
     /// How long, in seconds, to wait for a peer to accept an acknowledgement before treating the
     /// connection as stalled and dropping it.
+    ///
+    /// When unset, defaults to the `VECTOR_OPS_LIMITS_ACK_WRITE_TIMEOUT_SECS` environment variable if it is set, otherwise
+    /// to the built-in default. Vector refuses to start if that variable is not a positive integer.
     #[serde(default = "default_ack_write_timeout_secs")]
     pub ack_write_timeout_secs: u64,
 }
 
-const fn default_ack_write_timeout_secs() -> u64 {
-    DEFAULT_ACK_WRITE_TIMEOUT_SECS
+fn default_ack_write_timeout_secs() -> u64 {
+    env_defaults().ack_write_timeout_secs
 }
 
 impl Default for ConnectionLimits {
     fn default() -> Self {
         Self {
-            ack_write_timeout_secs: DEFAULT_ACK_WRITE_TIMEOUT_SECS,
+            ack_write_timeout_secs: default_ack_write_timeout_secs(),
         }
     }
 }
@@ -417,15 +566,169 @@ impl OperationalLimits {
 mod tests {
     use super::*;
 
+    const VAR: &str = "VECTOR_OPS_LIMITS_TEST_ONLY";
+
+    fn lookup_from(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
     #[test]
-    fn default_cap_is_used_when_unset() {
+    fn env_default_uses_compiled_value_when_unset() {
+        assert_eq!(resolve_env_default(VAR, None, 42_usize), Ok(42));
+    }
+
+    #[test]
+    fn env_default_uses_positive_integer_from_env() {
         assert_eq!(
-            CompressionLimits::default().max_decompressed_size_bytes,
+            resolve_env_default(VAR, Some("1048576"), 42_usize),
+            Ok(1_048_576)
+        );
+        assert_eq!(resolve_env_default(VAR, Some(" 300 "), 30_u64), Ok(300));
+        assert_eq!(resolve_env_default(VAR, Some("1"), 30_u64), Ok(1));
+    }
+
+    #[test]
+    fn env_default_rejects_values_that_are_not_positive_integers_in_range() {
+        for raw in [
+            "",
+            "   ",
+            "abc",
+            "-5",
+            "0",
+            "1.5",
+            "10MiB",
+            "0x10",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                resolve_env_default(VAR, Some(raw), 42_usize),
+                Err(InvalidEnvOverride {
+                    variable: VAR,
+                    value: raw.to_owned(),
+                }),
+                "input {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_default_rejects_u64_overflow_for_timeouts() {
+        assert!(resolve_env_default(VAR, Some("18446744073709551616"), 30_u64).is_err());
+        assert_eq!(
+            resolve_env_default(VAR, Some("18446744073709551615"), 30_u64),
+            Ok(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn invalid_env_override_message_names_variable_and_value() {
+        let error = InvalidEnvOverride {
+            variable: MAX_FRAME_LENGTH_BYTES_ENV,
+            value: "abc".to_owned(),
+        };
+        let message = error.to_string();
+        assert!(message.contains(MAX_FRAME_LENGTH_BYTES_ENV), "{message}");
+        assert!(message.contains("\"abc\""), "{message}");
+    }
+
+    #[test]
+    fn env_defaults_read_each_field_from_its_own_variable() {
+        let defaults = EnvDefaults::from_lookup(lookup_from(&[
+            (MAX_DECOMPRESSED_SIZE_BYTES_ENV, "1000"),
+            (MAX_FRAME_LENGTH_BYTES_ENV, "2000"),
+            (ACK_WRITE_TIMEOUT_SECS_ENV, "3"),
+        ]))
+        .unwrap();
+        assert_eq!(defaults.max_decompressed_size_bytes, 1000);
+        assert_eq!(defaults.max_frame_length_bytes, 2000);
+        assert_eq!(defaults.ack_write_timeout_secs, 3);
+    }
+
+    #[test]
+    fn env_defaults_override_only_the_variables_that_are_set() {
+        let defaults =
+            EnvDefaults::from_lookup(lookup_from(&[(MAX_FRAME_LENGTH_BYTES_ENV, "2000")])).unwrap();
+        assert_eq!(
+            defaults.max_decompressed_size_bytes,
+            DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
+        );
+        assert_eq!(defaults.max_frame_length_bytes, 2000);
+        assert_eq!(
+            defaults.ack_write_timeout_secs,
+            DEFAULT_ACK_WRITE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn env_defaults_fall_back_to_compiled_constants_when_unset() {
+        let defaults = EnvDefaults::from_lookup(|_| None).unwrap();
+        assert_eq!(
+            defaults.max_decompressed_size_bytes,
             DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
         );
         assert_eq!(
+            defaults.max_frame_length_bytes,
+            DEFAULT_MAX_FRAME_LENGTH_BYTES
+        );
+        assert_eq!(
+            defaults.ack_write_timeout_secs,
+            DEFAULT_ACK_WRITE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn env_defaults_report_the_invalid_variable() {
+        let errors = EnvDefaults::from_lookup(lookup_from(&[
+            (MAX_DECOMPRESSED_SIZE_BYTES_ENV, "1000"),
+            (MAX_FRAME_LENGTH_BYTES_ENV, "abc"),
+        ]))
+        .err()
+        .unwrap();
+        assert_eq!(
+            errors,
+            vec![InvalidEnvOverride {
+                variable: MAX_FRAME_LENGTH_BYTES_ENV,
+                value: "abc".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn env_defaults_report_every_invalid_variable() {
+        let errors = EnvDefaults::from_lookup(lookup_from(&[
+            (MAX_DECOMPRESSED_SIZE_BYTES_ENV, "0"),
+            (MAX_FRAME_LENGTH_BYTES_ENV, "abc"),
+            (ACK_WRITE_TIMEOUT_SECS_ENV, "-1"),
+        ]))
+        .err()
+        .unwrap();
+        let variables: Vec<_> = errors.iter().map(|error| error.variable).collect();
+        assert_eq!(
+            variables,
+            vec![
+                MAX_DECOMPRESSED_SIZE_BYTES_ENV,
+                MAX_FRAME_LENGTH_BYTES_ENV,
+                ACK_WRITE_TIMEOUT_SECS_ENV
+            ]
+        );
+    }
+
+    #[test]
+    fn defaults_are_built_in_until_bootstrap_reads_the_env() {
+        assert_eq!(
             FramingLimits::default().max_frame_length_bytes,
             DEFAULT_MAX_FRAME_LENGTH_BYTES
+        );
+        assert_eq!(
+            CompressionLimits::default().max_decompressed_size_bytes,
+            DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES
         );
         assert_eq!(
             ConnectionLimits::default().ack_write_timeout_secs,
@@ -434,16 +737,23 @@ mod tests {
     }
 
     #[test]
-    fn default_frame_length_cap_is_10_mib() {
-        assert_eq!(DEFAULT_MAX_FRAME_LENGTH_BYTES, 10_485_760);
-        assert_eq!(FramingLimits::default().max_frame_length_bytes, 10_485_760);
-        assert_eq!(
-            serde_json::from_str::<OperationalLimits>("{}")
-                .unwrap()
-                .framing
-                .max_frame_length_bytes,
-            10_485_760
-        );
+    fn built_in_defaults() {
+        assert_eq!(DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES, 1000 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_FRAME_LENGTH_BYTES, 100 * 1024 * 1024);
+        assert_eq!(DEFAULT_ACK_WRITE_TIMEOUT_SECS, 300);
+    }
+
+    #[test]
+    fn default_impls_match_serde_defaults_for_missing_fields() {
+        let parsed: OperationalLimits = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, OperationalLimits::default());
+    }
+
+    #[test]
+    fn config_value_wins_over_env_default() {
+        let parsed: OperationalLimits =
+            serde_json::from_str(r#"{"framing":{"max_frame_length_bytes":4096}}"#).unwrap();
+        assert_eq!(parsed.framing.max_frame_length_bytes, 4096);
     }
 
     #[test]

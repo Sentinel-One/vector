@@ -5,7 +5,4 @@
 //! [`CompressionLimits`] from their own context (`cx.globals.ops_limits.compression`) rather than
 //! reading process state.
 pub use vector_common::decompression::{CappedDecoder, CappedReader, DecompressedSizeLimitExceeded};
-pub use vector_common::limits::{
-    CompressionLimits, OperationalLimits, DEFAULT_MAX_DECOMPRESSED_SIZE_BYTES,
-    HTTP_ZSTD_WINDOW_LOG_MAX,
-};
+pub use vector_common::limits::{CompressionLimits, OperationalLimits, HTTP_ZSTD_WINDOW_LOG_MAX};
