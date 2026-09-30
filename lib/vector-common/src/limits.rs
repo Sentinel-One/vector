@@ -30,6 +30,29 @@ impl fmt::Display for InvalidEnvOverride {
 
 impl std::error::Error for InvalidEnvOverride {}
 
+/// Why [`init_env_defaults`] refused to fix the `ops_limits` defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitEnvDefaultsError {
+    /// One or more `VECTOR_OPS_LIMITS_*` variables are set but are not positive integers in range.
+    InvalidOverrides(Vec<InvalidEnvOverride>),
+    /// The defaults were already fixed by an earlier call.
+    AlreadyInitialized,
+}
+
+impl fmt::Display for InitEnvDefaultsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidOverrides(errors) => {
+                let details: Vec<String> = errors.iter().map(ToString::to_string).collect();
+                write!(f, "{}", details.join("; "))
+            }
+            Self::AlreadyInitialized => write!(f, "ops_limits defaults were already initialized"),
+        }
+    }
+}
+
+impl std::error::Error for InitEnvDefaultsError {}
+
 /// Resolves a default from the raw value of environment variable `name`.
 ///
 /// Unset uses `default`. A positive integer (surrounding whitespace allowed) uses that value.
@@ -127,21 +150,41 @@ static BUILT_IN_DEFAULTS: EnvDefaults = EnvDefaults {
 /// Reads the `VECTOR_OPS_LIMITS_*` environment overrides and fixes the `ops_limits` defaults for
 /// the rest of the process.
 ///
-/// Call once at bootstrap, before any config is loaded. Once a call has succeeded, later calls do
-/// nothing.
+/// Call exactly once at bootstrap, before any config is loaded.
 ///
 /// # Errors
 ///
-/// Returns every override that is set but is not a positive integer within range. Nothing is stored
-/// in that case, and the caller should refuse to start.
-pub fn init_env_defaults() -> Result<(), Vec<InvalidEnvOverride>> {
-    if ENV_DEFAULTS.get().is_some() {
-        return Ok(());
-    }
-    let defaults = EnvDefaults::from_lookup(|name| {
-        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
-    })?;
-    let _ = ENV_DEFAULTS.set(defaults);
+/// - [`InitEnvDefaultsError::InvalidOverrides`] lists every override that is set but is not a
+///   positive integer within range. Nothing is stored, and the caller should refuse to start.
+/// - [`InitEnvDefaultsError::AlreadyInitialized`] if the defaults were already fixed; they are left
+///   unchanged.
+pub fn init_env_defaults() -> Result<(), InitEnvDefaultsError> {
+    let lookup =
+        |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+    let defaults =
+        EnvDefaults::from_lookup(lookup).map_err(InitEnvDefaultsError::InvalidOverrides)?;
+    ENV_DEFAULTS
+        .set(defaults)
+        .map_err(|_| InitEnvDefaultsError::AlreadyInitialized)?;
+
+    let defaults = env_defaults();
+    let source = |name: &str| {
+        if lookup(name).is_some() {
+            "env"
+        } else {
+            "built-in"
+        }
+    };
+    tracing::info!(
+        message =
+            "Resolved ops_limits defaults. They apply to any ops_limits field not set in config.",
+        max_decompressed_size_bytes = defaults.max_decompressed_size_bytes,
+        max_decompressed_size_bytes_source = source(MAX_DECOMPRESSED_SIZE_BYTES_ENV),
+        max_frame_length_bytes = defaults.max_frame_length_bytes,
+        max_frame_length_bytes_source = source(MAX_FRAME_LENGTH_BYTES_ENV),
+        ack_write_timeout_secs = defaults.ack_write_timeout_secs,
+        ack_write_timeout_secs_source = source(ACK_WRITE_TIMEOUT_SECS_ENV),
+    );
     Ok(())
 }
 
@@ -492,6 +535,18 @@ impl fmt::Display for LimitRaise {
 }
 
 impl OperationalLimits {
+    /// Logs these limits as the global values the process enforces: the config file's
+    /// `ops_limits`, with unset fields filled from the defaults. Components may still lower them,
+    /// or raise them with `--allow-component-limit-overrides`.
+    pub fn log_effective(&self) {
+        tracing::info!(
+            message = "Effective global ops_limits.",
+            max_decompressed_size_bytes = self.compression.max_decompressed_size_bytes,
+            max_frame_length_bytes = self.framing.max_frame_length_bytes,
+            ack_write_timeout_secs = self.connection.ack_write_timeout_secs,
+        );
+    }
+
     /// Applies a component's override to these global limits.
     ///
     /// Returns the limits the component should actually run under, together with every raise it
@@ -639,6 +694,25 @@ mod tests {
     }
 
     #[test]
+    fn init_error_messages_describe_the_failure() {
+        let invalid = InitEnvDefaultsError::InvalidOverrides(vec![
+            InvalidEnvOverride {
+                variable: MAX_FRAME_LENGTH_BYTES_ENV,
+                value: "abc".to_owned(),
+            },
+            InvalidEnvOverride {
+                variable: ACK_WRITE_TIMEOUT_SECS_ENV,
+                value: "0".to_owned(),
+            },
+        ])
+        .to_string();
+        assert!(invalid.contains(MAX_FRAME_LENGTH_BYTES_ENV), "{invalid}");
+        assert!(invalid.contains(ACK_WRITE_TIMEOUT_SECS_ENV), "{invalid}");
+        let twice = InitEnvDefaultsError::AlreadyInitialized.to_string();
+        assert!(twice.contains("already"), "{twice}");
+    }
+
+    #[test]
     fn env_defaults_read_each_field_from_its_own_variable() {
         let defaults = EnvDefaults::from_lookup(lookup_from(&[
             (MAX_DECOMPRESSED_SIZE_BYTES_ENV, "1000"),
@@ -754,6 +828,22 @@ mod tests {
         let parsed: OperationalLimits =
             serde_json::from_str(r#"{"framing":{"max_frame_length_bytes":4096}}"#).unwrap();
         assert_eq!(parsed.framing.max_frame_length_bytes, 4096);
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn log_effective_reports_the_values_in_use() {
+        let limits: OperationalLimits = serde_json::from_str(
+            r#"{"compression":{"max_decompressed_size_bytes":536870912},
+                "framing":{"max_frame_length_bytes":10485760},
+                "connection":{"ack_write_timeout_secs":30}}"#,
+        )
+        .unwrap();
+        limits.log_effective();
+        assert!(logs_contain("Effective global ops_limits."));
+        assert!(logs_contain("max_decompressed_size_bytes=536870912"));
+        assert!(logs_contain("max_frame_length_bytes=10485760"));
+        assert!(logs_contain("ack_write_timeout_secs=30"));
     }
 
     #[test]

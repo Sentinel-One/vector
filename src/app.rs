@@ -96,6 +96,8 @@ impl ApplicationConfig {
         config: Config,
         extra_context: ExtraContext,
     ) -> Result<Self, ExitCode> {
+        config.global.ops_limits.log_effective();
+
         #[cfg(feature = "api")]
         let api = config.api;
 
@@ -206,11 +208,18 @@ impl Application {
         );
 
         // After logging (so invalid overrides are reported) and before any config is loaded.
-        if let Err(errors) = vector_common::limits::init_env_defaults() {
-            for error in errors {
-                error!(message = "Invalid ops_limits environment override.", %error);
+        match vector_common::limits::init_env_defaults() {
+            Ok(()) => {}
+            Err(vector_common::limits::InitEnvDefaultsError::InvalidOverrides(errors)) => {
+                for error in errors {
+                    error!(message = "Invalid ops_limits environment override.", %error);
+                }
+                return Err(exitcode::CONFIG);
             }
-            return Err(exitcode::CONFIG);
+            Err(error) => {
+                error!(message = "Failed to initialize ops_limits defaults.", %error);
+                return Err(exitcode::SOFTWARE);
+            }
         }
 
         // Can only log this after initializing the logging subsystem
