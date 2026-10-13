@@ -189,7 +189,7 @@ tonic-build = { version = "0.11", default-features = false, features = ["transpo
 tower = { version = "0.4.13", default-features = false, features = ["buffer", "limit", "retry", "timeout", "util", "balance", "discover"] }
 tower-http = { version = "0.4.4", default-features = false, features = ["compression-full", "decompression-gzip", "trace"] }
 url = { version = "2.5.4", default-features = false, features = ["serde"] }
-uuid = { version = "1.11.0", features = ["v4", "v7", "serde"] }
+uuid = { version = "1.11.0", features = ["v4", "v5", "v7", "serde"] }
 vector-lib = { path = "lib/vector-lib", default-features = false, features = ["vrl"] }
 vector-config = { path = "lib/vector-config" }
 vector-config-common = { path = "lib/vector-config-common" }
