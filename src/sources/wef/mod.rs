@@ -53,11 +53,13 @@ impl_generate_config_from_default!(Config);
 impl SourceConfig for Config {
     async fn build(&self, cx: SourceContext) -> Result<Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
+        let chkptr = cx.checkpoint_accessor().await;
 
         let src = wef::run_wef_source(
             self.wef_config.clone(),
             cx.out,
             cx.shutdown.map(|_token| ()),
+            chkptr,
             log_namespace,
         )
         .map(|r| match r {
