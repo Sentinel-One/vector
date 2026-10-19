@@ -1,0 +1,21 @@
+#This file is NOT part of the open-source components licensed under the Mozilla Public License, v. 2.0 (MPL-2.0).
+#Proprietary and Confidential – © 2025 Observo Inc.
+#Unauthorized copying, modification, distribution, or disclosure of this file, via any medium, is strictly prohibited.
+#This file is distributed separately and is not subject to the terms of the MPL-2.0.
+[package]
+name = "jaqwasm"
+version = "0.1.0"
+authors = ["Observo <observo-all@observo.ai>"]
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime"] }
+tracing = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+ciborium = "0.2"
+serde_json = "1"

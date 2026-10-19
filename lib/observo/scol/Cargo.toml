@@ -16,6 +16,8 @@ path = "src/lib.rs"
 arc-swap = { version = "1.7", default-features = false }
 dashmap = { version = "5.5" }
 lext = { path = "../lext" }
+jaqwasm = { path = "../jaqwasm" }
+ciborium = "0.2"
 mlua = { version = "0.10.2", default-features = false, features = ["lua54", "send", "vendored", "macros", "async"]}
 serde.workspace = true
 serde_json.workspace = true
@@ -68,6 +70,10 @@ reqwest = { version = "0.12", default-features = false }
 hyper1 = { package = "hyper", version = "1", default-features = false }
 async-compression = { workspace = true }
 snap.workspace = true
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = { version = "2", features = ["serde"] }
+ordered-float = { version = "4.5.0", default-features = false }
 
 # Optional dependencies for testing (below)
 testcontainers = { version = "0.19", optional = true }
