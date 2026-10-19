@@ -1830,7 +1830,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease 0.2.37",
  "proc-macro2 1.0.107",
@@ -1850,7 +1850,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2 1.0.107",
  "quote 1.0.47",
  "regex",
@@ -6523,7 +6523,7 @@ dependencies = [
 [[package]]
 name = "libgssapi"
 version = "0.9.1"
-source = "git+https://github.com/jsbali/libgssapi?rev=86dd34d32d8fd9c32bccde92b535ebcd8d99d37e#86dd34d32d8fd9c32bccde92b535ebcd8d99d37e"
+source = "git+https://github.com/jsbali/libgssapi?rev=3ce4b085a3470eca838d555e4b29682fbe1fc3cb#3ce4b085a3470eca838d555e4b29682fbe1fc3cb"
 dependencies = [
  "bitflags 2.11.1",
  "bytes 1.9.0",
@@ -6534,7 +6534,7 @@ dependencies = [
 [[package]]
 name = "libgssapi-sys"
 version = "0.3.3"
-source = "git+https://github.com/jsbali/libgssapi?rev=86dd34d32d8fd9c32bccde92b535ebcd8d99d37e#86dd34d32d8fd9c32bccde92b535ebcd8d99d37e"
+source = "git+https://github.com/jsbali/libgssapi?rev=3ce4b085a3470eca838d555e4b29682fbe1fc3cb#3ce4b085a3470eca838d555e4b29682fbe1fc3cb"
 dependencies = [
  "bindgen 0.71.1",
  "krb5-src",
@@ -9053,7 +9053,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9552f850d5f0964a4e4d0bf306459ac29323ddfbae05e35a7c0d35cb0803cc5"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2 1.0.107",
  "quote 1.0.47",
  "syn 2.0.117",

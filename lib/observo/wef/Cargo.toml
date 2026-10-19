@@ -17,7 +17,7 @@ http = { package = "http", version = "1.0" }
 http-body = "1.0"
 http-body-util = "0.1"
 
-libgssapi = { git = "https://github.com/jsbali/libgssapi", rev = "86dd34d32d8fd9c32bccde92b535ebcd8d99d37e", features = ["iov", "vendored"] }
+libgssapi = { git = "https://github.com/jsbali/libgssapi", rev = "3ce4b085a3470eca838d555e4b29682fbe1fc3cb", features = ["iov", "vendored"] }
 
 # XML parsing
 roxmltree = "0.19"
