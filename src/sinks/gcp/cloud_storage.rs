@@ -247,7 +247,7 @@ impl SinkConfig for GcsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         // Validate before building auth so a bad bucket/endpoint fails fast, without needing credentials.
         let base_url = format!("{}/{}/", self.endpoint, self.bucket);
-        base_url
+        let base_uri = base_url
             .parse::<Uri>()
             .context(InvalidBaseUrlSnafu { url: &base_url })?;
         let auth = self
@@ -256,14 +256,10 @@ impl SinkConfig for GcsSinkConfig {
             .await?;
         let tls = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls, cx.proxy(), &APP_INFO)?;
-        let healthcheck = build_healthcheck(
-            self.bucket.clone(),
-            client.clone(),
-            base_url.clone(),
-            auth.clone(),
-        )?;
+        let healthcheck =
+            build_healthcheck(self.bucket.clone(), client.clone(), base_url, auth.clone())?;
         auth.spawn_regenerate_token(&APP_INFO);
-        let sink = self.build_sink(client, base_url, auth, cx)?;
+        let sink = self.build_sink(client, base_uri, auth, cx)?;
 
         Ok((sink, healthcheck))
     }
@@ -281,7 +277,7 @@ impl GcsSinkConfig {
     fn build_sink(
         &self,
         client: HttpClient,
-        base_url: String,
+        base_uri: Uri,
         auth: GcpAuthenticator,
         cx: SinkContext,
     ) -> crate::Result<VectorSink> {
@@ -291,14 +287,11 @@ impl GcsSinkConfig {
 
         let partitioner = self.key_partitioner()?;
 
-        let base_uri = base_url
-            .parse::<Uri>()
-            .context(InvalidBaseUrlSnafu { url: &base_url })?;
         let protocol = get_http_scheme_from_uri(&base_uri);
 
         let svc = ServiceBuilder::new()
             .settings(request, GcsRetryLogic)
-            .service(GcsService::new(client, base_url, auth));
+            .service(GcsService::new(client, base_uri.to_string(), auth));
 
         let request_settings = RequestSettings::new(self, cx)?;
 
@@ -548,12 +541,7 @@ mod tests {
         let config =
             default_config(stack_encoding_config(JsonSerializerConfig::default().into()));
         let sink = config
-            .build_sink(
-                client,
-                mock_endpoint.to_string(),
-                GcpAuthenticator::None,
-                context,
-            )
+            .build_sink(client, mock_endpoint, GcpAuthenticator::None, context)
             .expect("failed to build sink");
 
         let event = Event::Log(LogEvent::from("simple message"));
