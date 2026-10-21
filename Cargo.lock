@@ -10753,6 +10753,7 @@ dependencies = [
  "chkpts",
  "chrono",
  "ciborium",
+ "criterion",
  "cron",
  "dashmap 5.5.3",
  "flate2",
