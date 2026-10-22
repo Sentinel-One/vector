@@ -21,6 +21,9 @@ pub struct HecRequest {
     pub sourcetype: Option<String>,
     pub host: Option<String>,
     pub headers: Vec<(HeaderName, HeaderValue)>,
+    /// Effective bytes of the batch, counted by `HecService` once the batch is delivered. `0` when
+    /// the sink computes no effective bytes.
+    pub effective_bytes: u64,
 }
 
 impl ByteSizeOf for HecRequest {

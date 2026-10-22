@@ -417,6 +417,28 @@ mod tests {
         assert_eq!(res1, res2);
     }
 
+    #[test]
+    #[cfg(feature = "observo")]
+    fn parse_grpc_checkpoint_config() {
+        use chkpts::BackendConfig;
+        use std::time::Duration;
+
+        let cfg: GlobalOptions = serde_yaml::from_str(r#"
+            checkpoint:
+              backend:
+                type: grpc
+                endpoint: http://control-agent:9090
+                timeout_secs: 2.5
+        "#).unwrap();
+        let CheckpointConfig::Observo(ref cfg) = cfg.checkpoint else {
+            panic!("expected observo checkpoint config");
+        };
+        assert_eq!(cfg.backend, BackendConfig::Grpc {
+            endpoint: "http://control-agent:9090".into(),
+            timeout: Duration::from_millis(2500),
+        });
+    }
+
     fn merge<P: Debug, T>(
         name: &str,
         dd1: Option<P>,

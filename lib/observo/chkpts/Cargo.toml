@@ -18,6 +18,9 @@ vector-common = { path = "../../vector-common", default-features = false }
 serde.workspace = true
 serde_with.workspace = true
 anyhow.workspace = true
+tonic.workspace = true
+prost = { workspace = true, features = ["derive"] }
+rand.workspace = true
 chrono.workspace = true
 metrics.workspace = true
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-chrono-0_4"] }
@@ -29,13 +32,22 @@ tokio.workspace = true
 tracing.workspace = true
 testcontainers-modules = { version = "0.7", features = ["postgres"], optional = true }
 
+[build-dependencies]
+tonic-build.workspace = true
+
 [features]
 default = []
+# Generates the CheckpointService server stubs used by the in-process fake server in tests.
+# Turned on automatically for tests by the self dev-dependency below.
+test-server = []
 integration-tests = ["dep:testcontainers-modules"]
 
 [dev-dependencies]
 assert_matches = { version = "1.5" }
 tempfile = "3.15.0"
-rand.workspace = true
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
 vector-common = { path = "../../vector-common", default-features = false, features = ["test"] }
+tokio-stream.workspace = true
+chkpts = { path = ".", features = ["test-server"] }
+serde_yaml.workspace = true
+metrics-util = { workspace = true, features = ["debugging"] }

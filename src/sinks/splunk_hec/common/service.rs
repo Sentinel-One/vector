@@ -67,6 +67,8 @@ pub struct HecService<S> {
     rej_rpt: RejectionReport,
     compression: Compression,
     rej_ctx: Arc<HecRejectionContext>,
+    /// `vector_effective_bytes_total` counter, incremented only for delivered batches.
+    effective_bytes: Option<Counter>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -116,7 +118,14 @@ where
             compression,
             rej_ctx,
             compression_limits,
+            effective_bytes: None,
         }
+    }
+
+    /// Counts the effective bytes of every delivered batch on `counter`.
+    pub fn with_effective_bytes(mut self, counter: Counter) -> Self {
+        self.effective_bytes = Some(counter);
+        self
     }
 }
 
@@ -165,6 +174,10 @@ where
         let metadata = std::mem::take(req.metadata_mut());
         let events_count = metadata.event_count();
         let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
+        let effective_bytes = self
+            .effective_bytes
+            .clone()
+            .map(|counter| (counter, req.effective_bytes));
         let response = self.inner.call(req);
 
         Box::pin(async move {
@@ -228,6 +241,14 @@ where
                 );
                 EventStatus::Rejected
             };
+
+            // Counted only once delivered, so rejected batches never count and retries (which
+            // happen below this service) never count twice.
+            if event_status == EventStatus::Delivered {
+                if let Some((counter, bytes)) = effective_bytes {
+                    counter.increment(bytes);
+                }
+            }
 
             Ok(HecResponse {
                 event_status,
@@ -531,6 +552,7 @@ mod tests {
             sourcetype: None,
             host: None,
             headers: vec![],
+            effective_bytes: 0,
         }
     }
 
@@ -1025,6 +1047,41 @@ mod tests {
         );
         let response = service.ready().await.unwrap().call(get_hec_request()).await.unwrap();
         assert_eq!(EventStatus::Rejected, response.event_status);
+    }
+
+    #[tokio::test]
+    async fn effective_bytes_counted_only_for_delivered_batches() {
+        for (status, expected_event_status, expected_count) in [
+            (200, EventStatus::Delivered, 42),
+            (400, EventStatus::Rejected, 0),
+            (503, EventStatus::Errored, 0),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock_server)
+                .await;
+
+            let count = Arc::new(AtomicU64::new(0));
+            let mut service = get_hec_service_with_rejection_report(
+                mock_server.uri(),
+                RejectionReport::Stats,
+                no_ack_config(),
+            )
+            .with_effective_bytes(metrics::Counter::from_arc(Arc::clone(&count)));
+            let request = HecRequest {
+                effective_bytes: 42,
+                ..get_hec_request()
+            };
+
+            let response = service.ready().await.unwrap().call(request).await.unwrap();
+            assert_eq!(expected_event_status, response.event_status);
+            assert_eq!(
+                expected_count,
+                count.load(Ordering::Relaxed),
+                "status {status}"
+            );
+        }
     }
 }
 

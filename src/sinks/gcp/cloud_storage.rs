@@ -49,6 +49,15 @@ use crate::{
 pub enum GcsHealthcheckError {
     #[snafu(display("key_prefix template parse error: {}", source))]
     KeyPrefixTemplate { source: TemplateParseError },
+    #[snafu(display(
+        "invalid endpoint/bucket: {:?} does not form a valid URL ({}); check for whitespace or invalid characters in `bucket`",
+        url,
+        source
+    ))]
+    InvalidBaseUrl {
+        url: String,
+        source: http::uri::InvalidUri,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -236,21 +245,21 @@ impl GenerateConfig for GcsSinkConfig {
 #[typetag::serde(name = "gcp_cloud_storage")]
 impl SinkConfig for GcsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Validate before building auth so a bad bucket/endpoint fails fast, without needing credentials.
+        let base_url = format!("{}/{}/", self.endpoint, self.bucket);
+        let base_uri = base_url
+            .parse::<Uri>()
+            .context(InvalidBaseUrlSnafu { url: &base_url })?;
         let auth = self
             .auth
             .build(Scope::DevStorageReadWrite, &APP_INFO)
             .await?;
-        let base_url = format!("{}/{}/", self.endpoint, self.bucket);
         let tls = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls, cx.proxy(), &APP_INFO)?;
-        let healthcheck = build_healthcheck(
-            self.bucket.clone(),
-            client.clone(),
-            base_url.clone(),
-            auth.clone(),
-        )?;
+        let healthcheck =
+            build_healthcheck(self.bucket.clone(), client.clone(), base_url, auth.clone())?;
         auth.spawn_regenerate_token(&APP_INFO);
-        let sink = self.build_sink(client, base_url, auth, cx)?;
+        let sink = self.build_sink(client, base_uri, auth, cx)?;
 
         Ok((sink, healthcheck))
     }
@@ -268,7 +277,7 @@ impl GcsSinkConfig {
     fn build_sink(
         &self,
         client: HttpClient,
-        base_url: String,
+        base_uri: Uri,
         auth: GcpAuthenticator,
         cx: SinkContext,
     ) -> crate::Result<VectorSink> {
@@ -278,11 +287,11 @@ impl GcsSinkConfig {
 
         let partitioner = self.key_partitioner()?;
 
-        let protocol = get_http_scheme_from_uri(&base_url.parse::<Uri>().unwrap());
+        let protocol = get_http_scheme_from_uri(&base_uri);
 
         let svc = ServiceBuilder::new()
             .settings(request, GcsRetryLogic)
-            .service(GcsService::new(client, base_url, auth));
+            .service(GcsService::new(client, base_uri.to_string(), auth));
 
         let request_settings = RequestSettings::new(self, cx)?;
 
@@ -502,6 +511,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_rejects_bucket_with_whitespace() {
+        let mut config =
+            default_config(stack_encoding_config(JsonSerializerConfig::default().into()));
+        config.bucket = " bad bucket".to_string();
+
+        let error = config
+            .build(SinkContext::default())
+            .await
+            .err()
+            .expect("build should fail for a bucket that forms an invalid URL");
+        assert!(
+            error.to_string().contains("invalid endpoint/bucket"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn component_spec_compliance() {
         let mock_endpoint = spawn_blackhole_http_server(always_200_response).await;
 
@@ -515,12 +541,7 @@ mod tests {
         let config =
             default_config(stack_encoding_config(JsonSerializerConfig::default().into()));
         let sink = config
-            .build_sink(
-                client,
-                mock_endpoint.to_string(),
-                GcpAuthenticator::None,
-                context,
-            )
+            .build_sink(client, mock_endpoint, GcpAuthenticator::None, context)
             .expect("failed to build sink");
 
         let event = Event::Log(LogEvent::from("simple message"));

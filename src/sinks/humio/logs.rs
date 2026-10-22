@@ -222,6 +222,7 @@ impl HumioLogsConfig {
             }),
             batch_headers: BatchHeaders::default(),
             rejection_report: Default::default(),
+            effective_bytes_algorithm: Default::default(),
         }
     }
 }

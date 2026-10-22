@@ -12,7 +12,7 @@ use super::{
 use crate::sinks::{
     splunk_hec::common::request::HecRequest,
     util::{
-        metadata::RequestMetadataBuilder, request_builder::EncodeResult, Compression,
+        metadata::RequestMetadataBuilder, request_builder::EncodeResult, Compression, Compressor,
         RequestBuilder,
     },
 };
@@ -20,6 +20,30 @@ use crate::sinks::{
 pub struct HecLogsRequestBuilder {
     pub encoder: HecLogsEncoder,
     pub compression: Compression,
+}
+
+/// Encoded batch body, carrying the batch's effective bytes through to its `HecRequest`.
+pub struct HecLogsPayload {
+    body: Bytes,
+    effective_bytes: u64,
+}
+
+/// Only exists to satisfy the `RequestBuilder::Payload` bound. A payload built this way carries no
+/// effective bytes: they reach the request only through the `encode_events` override below, so
+/// removing that override would silently stop `vector_effective_bytes_total`.
+impl From<Bytes> for HecLogsPayload {
+    fn from(body: Bytes) -> Self {
+        Self {
+            body,
+            effective_bytes: 0,
+        }
+    }
+}
+
+impl AsRef<[u8]> for HecLogsPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +61,7 @@ impl RequestBuilder<(Option<Partitioned>, Vec<HecProcessedEvent>)> for HecLogsRe
     type Metadata = HecRequestMetadata;
     type Events = Vec<HecProcessedEvent>;
     type Encoder = HecLogsEncoder;
-    type Payload = Bytes;
+    type Payload = HecLogsPayload;
     type Request = HecRequest;
     type Error = std::io::Error;
 
@@ -77,6 +101,31 @@ impl RequestBuilder<(Option<Partitioned>, Vec<HecProcessedEvent>)> for HecLogsRe
         )
     }
 
+    /// Same as the default `RequestBuilder::encode_events` (`sinks/util/request_builder.rs`), except
+    /// the payload also carries the effective bytes. Keep in sync with the default so upstream fixes
+    /// also reach this sink.
+    fn encode_events(
+        &self,
+        events: Self::Events,
+    ) -> Result<EncodeResult<Self::Payload>, Self::Error> {
+        let mut compressor = Compressor::from(self.compression);
+        let is_compressed = compressor.is_compressed();
+        let (_, json_size, effective_bytes) = self.encoder.encode_batch(events, &mut compressor)?;
+
+        let payload = HecLogsPayload {
+            body: compressor.into_inner().freeze(),
+            effective_bytes,
+        };
+        let result = if is_compressed {
+            let compressed_byte_size = payload.body.len();
+            EncodeResult::compressed(payload, compressed_byte_size, json_size)
+        } else {
+            EncodeResult::uncompressed(payload, json_size)
+        };
+
+        Ok(result)
+    }
+
     fn build_request(
         &self,
         hec_metadata: Self::Metadata,
@@ -89,8 +138,10 @@ impl RequestBuilder<(Option<Partitioned>, Vec<HecProcessedEvent>)> for HecLogsRe
             .filter_map(|(k, v)| v.map(|v| (k, v)))
             .collect();
 
+        let payload = payload.into_payload();
         HecRequest {
-            body: payload.into_payload(),
+            body: payload.body,
+            effective_bytes: payload.effective_bytes,
             finalizers: hec_metadata.finalizers,
             passthrough_token: hec_metadata.partition,
             source: hec_metadata.source,

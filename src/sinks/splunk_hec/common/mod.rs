@@ -1,9 +1,11 @@
 pub mod acknowledgements;
+mod effective_bytes;
 pub mod request;
 pub mod response;
 pub mod service;
 pub mod util;
 
+pub use effective_bytes::{EffectiveBytesAlgorithm, SentEvent, SentMetadata};
 pub use util::*;
 use vector_lib::configurable::configurable_component;
 

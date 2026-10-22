@@ -13,7 +13,7 @@ use crate::{
             acknowledgements::HecClientAcknowledgementsConfig,
             build_healthcheck, build_http_batch_service, create_client,
             service::{HecRejectionContext, HecService, HttpRequestBuilder, Token},
-            EndpointTarget, SplunkHecDefaultBatchSettings,
+            EffectiveBytesAlgorithm, EndpointTarget, SplunkHecDefaultBatchSettings,
         },
         util::{http::HttpRetryLogic, RejectionReport},
     },
@@ -199,6 +199,11 @@ pub struct HecLogsSinkConfig {
     /// Controls how much detail is logged when Splunk HEC rejects a batch.
     #[serde(default)]
     pub rejection_report: RejectionReport,
+
+    #[configurable(derived)]
+    #[configurable(metadata(docs::advanced))]
+    #[serde(default)]
+    pub effective_bytes_algorithm: EffectiveBytesAlgorithm,
 }
 
 
@@ -272,6 +277,7 @@ impl GenerateConfig for HecLogsSinkConfig {
             endpoint_target: EndpointTarget::Event,
             timestamp_configuration: None,
             rejection_report: RejectionReport::default(),
+            effective_bytes_algorithm: EffectiveBytesAlgorithm::default(),
         })
         .unwrap()
     }
@@ -321,6 +327,7 @@ impl HecLogsSinkConfig {
             transformer,
             encoder,
             auto_extract_timestamp: self.auto_extract_timestamp.unwrap_or_default(),
+            effective_bytes_algorithm: self.effective_bytes_algorithm,
         };
         let request_builder = HecLogsRequestBuilder {
             encoder,
@@ -362,7 +369,7 @@ impl HecLogsSinkConfig {
             ),
         });
 
-        let service = HecService::new(
+        let mut service = HecService::new(
             http_service,
             ack_client,
             http_request_builder,
@@ -372,6 +379,11 @@ impl HecLogsSinkConfig {
             rej_ctx,
             cx.globals.ops_limits.compression,
         );
+        // Registered only for an active algorithm, so a `none` sink leaves the series absent
+        // (downstream analytics falls back).
+        if self.effective_bytes_algorithm != EffectiveBytesAlgorithm::None {
+            service = service.with_effective_bytes(metrics::counter!("effective_bytes_total"));
+        }
 
         let batch_settings = self.batch.into_batcher_settings()?;
 
@@ -401,7 +413,17 @@ impl HecLogsSinkConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use chrono::{TimeZone, Utc};
     use indexmap::IndexMap;
+    use metrics::{
+        Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
     use super::*;
     use crate::components::validation::prelude::*;
     use vector_lib::{
@@ -590,6 +612,181 @@ mod tests {
         assert_eq!(config.rejection_report, RejectionReport::RequestResponse);
     }
 
+    #[test]
+    fn test_effective_bytes_algorithm_parses() {
+        for (setting, expected) in [
+            ("", EffectiveBytesAlgorithm::None),
+            (
+                r#"effective_bytes_algorithm = "value_bytes""#,
+                EffectiveBytesAlgorithm::ValueBytes,
+            ),
+            (
+                r#"effective_bytes_algorithm = "none""#,
+                EffectiveBytesAlgorithm::None,
+            ),
+        ] {
+            let config = hec_logs_config_from_toml(&format!(
+                r#"
+                default_token = "t"
+                endpoint = "https://hec.example.com"
+                {setting}
+                [encoding]
+                codec = "json"
+                "#
+            ));
+            assert_eq!(
+                config.effective_bytes_algorithm, expected,
+                "setting: {setting:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_effective_bytes_algorithm_raw_bytes_fails_to_deserialize() {
+        let result = toml::from_str::<HecLogsSinkConfig>(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            effective_bytes_algorithm = "raw_bytes"
+            [encoding]
+            codec = "json"
+            "#,
+        );
+        // raw_bytes is not a defined variant in Phase 1 and must be rejected at deserialization.
+        let error = result
+            .expect_err("raw_bytes must not deserialize")
+            .to_string();
+        assert!(
+            error.contains("unknown variant `raw_bytes`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Records registered counters by name, with their current values.
+    #[derive(Default)]
+    struct RegisteredCounters(std::sync::Mutex<Vec<(String, Arc<AtomicU64>)>>);
+
+    impl RegisteredCounters {
+        fn value(&self, name: &str) -> Option<u64> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(registered, _)| registered == name)
+                .map(|(_, value)| value.load(Ordering::Relaxed))
+        }
+    }
+
+    impl Recorder for RegisteredCounters {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+            let value = Arc::new(AtomicU64::new(0));
+            self.0
+                .lock()
+                .unwrap()
+                .push((key.name().to_owned(), Arc::clone(&value)));
+            Counter::from_arc(value)
+        }
+        fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+            Gauge::noop()
+        }
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    fn registers_effective_bytes(algorithm: &str) -> bool {
+        let config = hec_logs_config_from_toml(&format!(
+            r#"
+            default_token = "t"
+            endpoint = "https://hec.example.com"
+            effective_bytes_algorithm = "{algorithm}"
+            [encoding]
+            codec = "json"
+            "#
+        ));
+        let client = HttpClient::new(None, &Default::default(), &crate::app_info()).unwrap();
+        let recorder = RegisteredCounters::default();
+        metrics::with_local_recorder(&recorder, || {
+            config
+                .build_processor(client, SinkContext::default())
+                .unwrap();
+        });
+        recorder.value("effective_bytes_total").is_some()
+    }
+
+    #[tokio::test]
+    async fn value_bytes_algorithm_registers_effective_bytes_counter() {
+        assert!(registers_effective_bytes("value_bytes"));
+    }
+
+    #[tokio::test]
+    async fn none_algorithm_registers_no_effective_bytes_counter() {
+        assert!(!registers_effective_bytes("none"));
+    }
+
+    /// Runs two events through the full sink (encoder, request builder, service) against a mock HEC
+    /// endpoint answering `status`, and returns the `effective_bytes` counter afterwards.
+    async fn sink_effective_bytes(status: u16) -> u64 {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/collector/event"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let config = hec_logs_config_from_toml(&format!(
+            r#"
+            default_token = "t"
+            endpoint = "{}"
+            source = "src"
+            sourcetype = "type"
+            index = "idx"
+            effective_bytes_algorithm = "value_bytes"
+            [encoding]
+            codec = "json"
+            [acknowledgements]
+            indexer_acknowledgements_enabled = false
+            "#,
+            server.uri()
+        ));
+        let client = HttpClient::new(None, &Default::default(), &crate::app_info()).unwrap();
+        let recorder = RegisteredCounters::default();
+        let sink = metrics::with_local_recorder(&recorder, || {
+            config
+                .build_processor(client, SinkContext::default())
+                .unwrap()
+        });
+
+        let event = || {
+            let mut log = crate::event::LogEvent::from("hello world");
+            log.insert("key", "value");
+            log.insert(
+                crate::config::log_schema()
+                    .timestamp_key_target_path()
+                    .unwrap(),
+                Utc.timestamp_nanos(1_638_366_107_111_456_123),
+            );
+            crate::event::Event::from(log)
+        };
+        sink.run_events(vec![event(), event()]).await.unwrap();
+
+        recorder.value("effective_bytes_total").unwrap()
+    }
+
+    #[tokio::test]
+    async fn sink_counts_effective_bytes_of_delivered_events() {
+        // Per event: "hello world"(11) + "value"(5) + "src"(3) + "type"(4) + "idx"(3) + the
+        // timestamp moved into `time`, "1638366107.111"(14) = 40.
+        assert_eq!(sink_effective_bytes(200).await, 2 * 40);
+    }
+
+    #[tokio::test]
+    async fn sink_counts_no_effective_bytes_for_rejected_events() {
+        assert_eq!(sink_effective_bytes(400).await, 0);
+    }
+
     impl ValidatableComponent for HecLogsSinkConfig {
         fn validation_configuration() -> ValidationConfiguration {
             let endpoint = "http://127.0.0.1:9001".to_string();
@@ -638,6 +835,7 @@ mod tests {
                 endpoint_target: EndpointTarget::Raw,
                 timestamp_configuration: None,
                 rejection_report: RejectionReport::default(),
+                effective_bytes_algorithm: EffectiveBytesAlgorithm::default(),
             };
 
             let endpoint = format!("{endpoint}/services/collector/raw");
