@@ -1,4 +1,4 @@
-FROM artifactory.eng.sentinelone.tech/docker-release/common/ubuntu-base/ubuntu:2.0.77 AS builder
+FROM artifactory.eng.sentinelone.tech/docker-release/common/ubuntu-base/ubuntu:2.0.85 AS builder
 
 WORKDIR /vector
 
@@ -7,7 +7,7 @@ RUN tar -xvf vector-*-$(uname -m)-unknown-linux-*.tar.gz --strip-components=2
 
 RUN mkdir -p /var/lib/vector
 
-FROM artifactory.eng.sentinelone.tech/docker-release/common/ubuntu-base/ubuntu:2.0.77
+FROM artifactory.eng.sentinelone.tech/docker-release/common/ubuntu-base/ubuntu:2.0.85
 
 # Install dependencies for Vector and FIPS
 # hadolint ignore=DL3008
