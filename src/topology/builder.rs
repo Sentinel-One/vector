@@ -8,7 +8,7 @@ use stream_cancel::{StreamExt as StreamCancelExt, Trigger, Tripwire};
 use tokio::{
     select,
     sync::{mpsc::UnboundedSender, oneshot},
-    time::{timeout, Duration},
+    time::{sleep, timeout, Duration},
 };
 use tracing::Instrument;
 use vector_common::limits::OperationalLimitsOverride;
@@ -74,6 +74,13 @@ static TRANSFORM_CONCURRENCY_LIMIT: LazyLock<usize> = LazyLock::new(|| {
 });
 
 const INTERNAL_SOURCES: [&str; 2] = ["internal_logs", "internal_metrics"];
+
+// How long a reload waits for a detached sink before dropping it.
+const SINK_DETACH_LIMIT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(120)
+};
 
 struct Builder<'a> {
     config: &'a super::Config,
@@ -621,6 +628,11 @@ impl<'a> Builder<'a> {
             };
 
             let (trigger, tripwire) = Tripwire::new();
+            let detached = tripwire.clone();
+            let detach_limit = self
+                .config
+                .graceful_shutdown_duration
+                .map(|_| SINK_DETACH_LIMIT);
 
             let cx = SinkContext {
                 healthcheck,
@@ -630,7 +642,6 @@ impl<'a> Builder<'a> {
                 app_name: crate::get_app_name().to_string(),
                 app_name_slug: crate::get_slugified_app_name(),
                 extra_context: self.extra_context.clone(),
-                shutdown: tripwire.clone(),
             };
 
             let (sink, healthcheck) = match sink.inner.build(cx).await {
@@ -659,7 +670,7 @@ impl<'a> Builder<'a> {
                 let mut rx = wrap(rx);
 
                 let events_received = register!(EventsReceived);
-                sink.run(
+                let run = sink.run(
                     rx.by_ref()
                         .filter(|events: &EventArray| ready(filter_events_type(events, input_type)))
                         .inspect(|events| {
@@ -669,16 +680,36 @@ impl<'a> Builder<'a> {
                             ))
                         })
                         .take_until_if(tripwire),
-                )
-                .await
-                .map(|_| {
-                    debug!("Sink finished normally.");
-                    TaskOutput::Sink(rx)
-                })
-                .map_err(|_| {
-                    debug!("Sink finished with an error.");
-                    TaskError::Opaque
-                })
+                );
+
+                let abandon = async move {
+                    match detach_limit {
+                        Some(limit) if detached.await => sleep(limit).await,
+                        _ => std::future::pending::<()>().await,
+                    }
+                };
+
+                select! {
+                    result = run => {
+                        result
+                            .map(|_| {
+                                debug!("Sink finished normally.");
+                                TaskOutput::Sink(rx)
+                            })
+                            .map_err(|_| {
+                                debug!("Sink finished with an error.");
+                                TaskError::Opaque
+                            })
+                    }
+                    () = abandon => {
+                        warn!(
+                            message = "Sink did not finish after its inputs were detached; dropping it and any events it has in flight.",
+                            limit_secs = detach_limit.unwrap_or_default().as_secs(),
+                            internal_log_rate_limit = false,
+                        );
+                        Ok(TaskOutput::Sink(rx))
+                    }
+                }
             };
 
             let task = Task::new(key.clone(), typetag, sink);

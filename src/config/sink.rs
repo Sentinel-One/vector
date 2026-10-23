@@ -4,7 +4,6 @@ use vector_common::limits::OperationalLimitsOverride;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use serde::Serialize;
-use stream_cancel::Tripwire;
 use vector_lib::buffers::{BufferConfig, BufferType};
 use vector_lib::configurable::attributes::CustomAttribute;
 use vector_lib::configurable::schema::{SchemaGenerator, SchemaObject};
@@ -261,13 +260,10 @@ pub struct SinkContext {
     /// Extra context data provided by the running app and shared across all components. This can be
     /// used to pass shared settings or other data from outside the components.
     pub extra_context: ExtraContext,
-    pub shutdown: Tripwire,
 }
 
 impl Default for SinkContext {
     fn default() -> Self {
-        let (trigger, wire) = Tripwire::new();
-        trigger.disable();
         Self {
             healthcheck: Default::default(),
             globals: Default::default(),
@@ -276,7 +272,6 @@ impl Default for SinkContext {
             app_name: crate::get_app_name().to_string(),
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: Default::default(),
-            shutdown: wire,
         }
     }
 }

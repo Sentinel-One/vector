@@ -222,10 +222,12 @@ impl RunningTopology {
     /// cannot be fully restored, then `Err(())` is returned.
     pub async fn reload_config_and_respawn(
         &mut self,
-        new_config: Config,
+        mut new_config: Config,
         extra_context: ExtraContext,
     ) -> Result<bool, ()> {
         info!("Reloading running topology with new configuration.");
+
+        new_config.graceful_shutdown_duration = self.graceful_shutdown_duration;
 
         if self.config.global != new_config.global {
             error!(
@@ -508,12 +510,10 @@ impl RunningTopology {
                 debug!(message = "Waiting for sink to shutdown.", %key);
                 previous.await.unwrap().unwrap();
             } else {
-                debug!(message = "Abandoning sink (without wait)", %key);
                 drop(previous); // detach and forget
             }
         }
 
-        debug!(message = "Now processing changed sinks...");
         let mut buffers = HashMap::<ComponentKey, BuiltBuffer>::new();
         for key in &diff.sinks.to_change {
             if wait_for_sinks.contains(key) {

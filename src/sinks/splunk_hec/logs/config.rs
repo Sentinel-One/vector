@@ -404,7 +404,6 @@ impl HecLogsSinkConfig {
             auto_extract_timestamp: self.auto_extract_timestamp.unwrap_or_default(),
             timestamp_configuration: self.timestamp_configuration.clone(),
             batch_headers,
-            shutdown: cx.shutdown.clone(),
         };
 
         Ok(VectorSink::from_event_streamsink(sink))
