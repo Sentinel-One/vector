@@ -16,6 +16,8 @@ path = "src/lib.rs"
 arc-swap = { version = "1.7", default-features = false }
 dashmap = { version = "5.5" }
 lext = { path = "../lext" }
+jaqwasm = { path = "../jaqwasm" }
+ciborium = "0.2"
 mlua = { version = "0.10.2", default-features = false, features = ["lua54", "send", "vendored", "macros", "async"]}
 serde.workspace = true
 serde_json.workspace = true
@@ -68,6 +70,10 @@ reqwest = { version = "0.12", default-features = false }
 hyper1 = { package = "hyper", version = "1", default-features = false }
 async-compression = { workspace = true }
 snap.workspace = true
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = { version = "2", features = ["serde"] }
+ordered-float = { version = "4.5.0", default-features = false }
 
 # Optional dependencies for testing (below)
 testcontainers = { version = "0.19", optional = true }
@@ -101,6 +107,7 @@ scol = { path = ".", features = ["test-scenarios"] }
 chkpts = { path = "../chkpts" }
 flate2 = { workspace = true }
 zstd = { workspace = true }
+criterion = { version = "0.5.1", features = ["html_reports"] }
 
 [features]
 test-scenarios = ["vector-lib/test", "dep:textwrap", "dep:rstest", "dep:oxide-auth",
@@ -108,4 +115,13 @@ test-scenarios = ["vector-lib/test", "dep:textwrap", "dep:rstest", "dep:oxide-au
   "dep:pathsearch", "tokio/macros", "tokio/rt-multi-thread", "dep:stream-cancel", "dep:poem",
   "dep:vrl"]
 integration-tests = ["dep:testcontainers", "dep:aws-sdk-s3", "dep:azure_storage", "dep:azure_storage_blobs"]
+# Exposes `scol::bench` (the real offload processing primitives + an equivalent Lua handler) for the
+# offloads benchmark: `cargo bench -p scol --features bench`.
+bench = []
 default = []
+
+[[bench]]
+name = "offloads"
+path = "src/scol/benches/offloads.rs"
+harness = false
+required-features = ["bench"]

@@ -1,6 +1,6 @@
 [package]
 name = "vector"
-version = "0.44.13"
+version = "0.44.14"
 authors = ["Vector Contributors <vector@datadoghq.com>"]
 edition = "2021"
 description = "A lightweight and ultra-fast tool for building observability pipelines"
@@ -113,6 +113,7 @@ members = [
   "lib/observo/ssa",
   "lib/observo/obvrl",
   "lib/observo/gcs",
+  "lib/observo/jaqwasm",
   "lib/dnsmsg-parser",
   "lib/dnstap-parser",
   "lib/docs-renderer",
@@ -143,6 +144,10 @@ members = [
   "lib/vector-vrl/web-playground",
   "vdev",
 ]
+
+# The jaqwasm guest is a standalone workspace built only by its own regen.sh (to wasm32), never part
+# of this workspace.
+exclude = ["lib/observo/private/jaqwasm/guest"]
 
 [workspace.dependencies]
 anyhow = "1.0.94"
