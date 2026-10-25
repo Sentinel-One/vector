@@ -6,6 +6,7 @@ use std::{
 
 use base64::prelude::{Engine as _, BASE64_URL_SAFE};
 pub use goauth::scopes::Scope;
+use vector_common::backoff::ExponentialBackoff;
 use goauth::{
     auth::{JwtClaims, Token, TokenErr},
     credentials::Credentials,
@@ -201,12 +202,16 @@ impl GcpAuthenticator {
                 let expires_in = inner.token.read().unwrap().expires_in() as u64;
                 let mut deadline =
                     Duration::from_secs(expires_in - METADATA_TOKEN_EXPIRY_MARGIN_SECS);
+                let mut error_backoff = ExponentialBackoff::from_millis(2)
+                    .factor(1000)
+                    .max_delay(Duration::from_secs(300));
                 loop {
                     tokio::time::sleep(deadline).await;
                     debug!("Renewing GCP authentication token.");
                     match inner.regenerate_token(app_info).await {
                         Ok(()) => {
                             sender.send_replace(());
+                            error_backoff.reset();
                             let expires_in = inner.token.read().unwrap().expires_in() as u64;
                             // Rather than an expected fresh token, the Metadata Server may return
                             // the same (cached) token during the last 300 seconds of its lifetime.
@@ -220,11 +225,14 @@ impl GcpAuthenticator {
                             deadline = Duration::from_secs(new_deadline);
                         }
                         Err(error) => {
+                            deadline = error_backoff
+                                .next()
+                                .unwrap_or(Duration::from_secs(300));
                             error!(
                                 message = "Failed to update GCP authentication token.",
+                                retry_in_secs = deadline.as_secs(),
                                 %error
                             );
-                            deadline = Duration::from_secs(METADATA_TOKEN_ERROR_RETRY_SECS);
                         }
                     }
                 }

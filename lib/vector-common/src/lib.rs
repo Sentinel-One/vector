@@ -98,4 +98,6 @@ pub mod net;
 
 pub mod multiline;
 
+pub mod backoff;
+
 pub mod compression;
