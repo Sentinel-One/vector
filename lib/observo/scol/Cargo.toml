@@ -56,6 +56,7 @@ hyper.workspace = true
 ipnet = { version = "2", default-features = false, features = ["std"] }
 itertools.workspace = true
 moka = { version = "0.12", default-features = false, features = ["sync"] }
+lru.workspace = true
 async-recursion = "1.1.1"
 inventory.workspace = true
 tokio-util.workspace = true
