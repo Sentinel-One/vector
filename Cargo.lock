@@ -10778,6 +10778,7 @@ dependencies = [
  "jaqwasm",
  "keyed_priority_queue",
  "lext",
+ "lru",
  "metrics",
  "mlua",
  "mlua-json",
