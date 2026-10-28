@@ -29,6 +29,7 @@
             cyrus_sasl
             krb5
             cargo-nextest
+            cargo-sweep
             openssl
             lldb
             cue
