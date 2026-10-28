@@ -205,6 +205,7 @@ impl Application {
             opts.root.log_format,
             opts.log_level(),
             opts.root.internal_log_rate_limit,
+            opts.root.disable_console_logs,
         );
 
         // After logging (so invalid overrides are reported) and before any config is loaded.
@@ -449,6 +450,12 @@ impl FinishedApplication {
     }
 
     async fn stop(topology_controller: TopologyController, mut signal_rx: SignalRx) -> ExitStatus {
+        // Re-enable console logging for the shutdown phase. If it was disabled via
+        // `--disable-console-logs`, the `internal_logs` source stops reading as soon
+        // as shutdown is signaled, so shutdown-phase logs would otherwise be lost;
+        // routing them back to the console keeps them visible.
+        crate::trace::enable_console_output();
+
         emit!(VectorStopped);
         tokio::select! {
             _ = topology_controller.stop() => ExitStatus::from_raw({
@@ -581,19 +588,44 @@ pub async fn load_configs(
     Ok(config)
 }
 
-pub fn init_logging(color: bool, format: LogFormat, log_level: &str, rate: u64) {
+pub fn init_logging(
+    color: bool,
+    format: LogFormat,
+    log_level: &str,
+    rate: u64,
+    disable_console: bool,
+) {
     let level = get_log_levels(log_level);
     let json = match format {
         LogFormat::Text => false,
         LogFormat::Json => true,
     };
 
-    trace::init(color, json, &level, rate);
+    trace::init(color, json, &level, rate, disable_console);
+
+    // When console logging is disabled the tracing output no longer reaches the
+    // console, so a normal `info!` below would be invisible precisely when an
+    // operator is wondering why the console is silent. Emit a single breadcrumb
+    // directly to stderr (bypassing the muted tracing layer) to explain it.
+    if disable_console {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!(
+                "Console logging disabled via --disable-console-logs. Configure an \
+                 `internal_logs` source to capture these logs."
+            );
+        }
+    }
+
     debug!(
         message = "Internal log rate limit configured.",
         internal_log_rate_secs = rate,
     );
-    info!(message = "Log level is enabled.", level = ?level);
+    info!(
+        message = "Log level is enabled.",
+        level = ?level,
+        console_logs = !disable_console,
+    );
 }
 
 pub fn watcher_config(
