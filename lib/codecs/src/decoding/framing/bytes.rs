@@ -14,12 +14,19 @@ pub struct BytesDecoderConfig {
     /// Fewer buffered bytes are held until more arrive or the stream ends, at which point whatever
     /// remains is emitted. The default (`i64::MAX`) effectively holds everything until the end of
     /// the stream/message.
-    #[serde(default = "default_min_chunk_bytes")]
+    #[serde(
+        default = "default_min_chunk_bytes",
+        skip_serializing_if = "is_default_min_chunk_bytes"
+    )]
     pub min_chunk_bytes: u64,
 }
 
 const fn default_min_chunk_bytes() -> u64 {
     i64::MAX as u64
+}
+
+const fn is_default_min_chunk_bytes(value: &u64) -> bool {
+    *value == default_min_chunk_bytes()
 }
 
 impl Default for BytesDecoderConfig {
@@ -154,6 +161,18 @@ mod tests {
 
         assert_eq!(reader.next().await.unwrap().unwrap(), "hello world");
         assert!(reader.next().await.is_none());
+    }
+
+    #[test]
+    fn config_omits_default_min_chunk_bytes_when_serialized() {
+        assert_eq!(
+            serde_json::to_string(&BytesDecoderConfig::new()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::to_string(&BytesDecoderConfig { min_chunk_bytes: 8 }).unwrap(),
+            r#"{"min_chunk_bytes":8}"#
+        );
     }
 
     #[test]
