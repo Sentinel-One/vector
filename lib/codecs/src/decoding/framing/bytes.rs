@@ -4,20 +4,26 @@ use vector_config::configurable_component;
 
 use super::BoxedFramingError;
 
-/// Config used to build a `BytesDecoderConfig`.
+/// Config used to build a `BytesDecoder`.
 #[configurable_component]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BytesDecoderConfig {
+    /// Options for the bytes decoder.
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
+    pub bytes: BytesDecoderOptions,
+}
+
+/// Options for building a `BytesDecoder`.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BytesDecoderOptions {
     /// Emit buffered bytes as soon as at least this many have accumulated.
     ///
     /// The whole buffer is emitted as a single frame (it is not split into pieces of this size).
     /// Fewer buffered bytes are held until more arrive or the stream ends, at which point whatever
     /// remains is emitted. The default (`i64::MAX`) effectively holds everything until the end of
     /// the stream/message.
-    #[serde(
-        default = "default_min_chunk_bytes",
-        skip_serializing_if = "is_default_min_chunk_bytes"
-    )]
+    #[serde(default = "default_min_chunk_bytes")]
     pub min_chunk_bytes: u64,
 }
 
@@ -25,13 +31,11 @@ const fn default_min_chunk_bytes() -> u64 {
     i64::MAX as u64
 }
 
-const fn is_default_min_chunk_bytes(value: &u64) -> bool {
-    *value == default_min_chunk_bytes()
-}
-
-impl Default for BytesDecoderConfig {
+impl Default for BytesDecoderOptions {
     fn default() -> Self {
-        Self::new()
+        Self {
+            min_chunk_bytes: default_min_chunk_bytes(),
+        }
     }
 }
 
@@ -39,13 +43,22 @@ impl BytesDecoderConfig {
     /// Creates a new `BytesDecoderConfig`.
     pub const fn new() -> Self {
         Self {
-            min_chunk_bytes: default_min_chunk_bytes(),
+            bytes: BytesDecoderOptions {
+                min_chunk_bytes: default_min_chunk_bytes(),
+            },
+        }
+    }
+
+    /// Creates a `BytesDecoderConfig` that emits early once `min_chunk_bytes` have been buffered.
+    pub const fn new_with_min_chunk_bytes(min_chunk_bytes: u64) -> Self {
+        Self {
+            bytes: BytesDecoderOptions { min_chunk_bytes },
         }
     }
 
     /// Build the `ByteDecoder` from this configuration.
     pub const fn build(&self) -> BytesDecoder {
-        BytesDecoder::with_min_chunk_bytes(self.min_chunk_bytes)
+        BytesDecoder::with_min_chunk_bytes(self.bytes.min_chunk_bytes)
     }
 }
 
@@ -164,23 +177,35 @@ mod tests {
     }
 
     #[test]
-    fn config_omits_default_min_chunk_bytes_when_serialized() {
+    fn config_omits_default_options_when_serialized() {
         assert_eq!(
             serde_json::to_string(&BytesDecoderConfig::new()).unwrap(),
             "{}"
         );
         assert_eq!(
-            serde_json::to_string(&BytesDecoderConfig { min_chunk_bytes: 8 }).unwrap(),
-            r#"{"min_chunk_bytes":8}"#
+            serde_json::to_string(&BytesDecoderConfig::new_with_min_chunk_bytes(8)).unwrap(),
+            r#"{"bytes":{"min_chunk_bytes":8}}"#
         );
     }
 
     #[test]
-    fn config_deserializes_min_chunk_bytes() {
-        let config: BytesDecoderConfig = serde_json::from_str(r#"{"min_chunk_bytes": 8}"#).unwrap();
-        assert_eq!(config.min_chunk_bytes, 8);
+    fn config_deserializes_min_chunk_bytes_from_bytes_options() {
+        let config: BytesDecoderConfig =
+            serde_json::from_str(r#"{"bytes": {"min_chunk_bytes": 8}}"#).unwrap();
+        assert_eq!(config.bytes.min_chunk_bytes, 8);
         let config: BytesDecoderConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.min_chunk_bytes, i64::MAX as u64);
+        assert_eq!(config.bytes.min_chunk_bytes, i64::MAX as u64);
+    }
+
+    #[test]
+    fn framing_config_parses_method_bytes_with_nested_bytes_options() {
+        let config: crate::decoding::FramingConfig =
+            serde_json::from_str(r#"{"method": "bytes", "bytes": {"min_chunk_bytes": 8}}"#)
+                .unwrap();
+        assert_eq!(
+            config,
+            crate::decoding::FramingConfig::Bytes(BytesDecoderConfig::new_with_min_chunk_bytes(8))
+        );
     }
 
     #[tokio::test]
