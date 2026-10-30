@@ -187,7 +187,7 @@ fn deserializer_config_to_serializer(config: &DeserializerConfig) -> encoding::S
 
 fn decoder_framing_to_encoding_framer(framing: &decoding::FramingConfig) -> encoding::Framer {
     let framing_config = match framing {
-        decoding::FramingConfig::Bytes => encoding::FramingConfig::Bytes,
+        decoding::FramingConfig::Bytes(_) => encoding::FramingConfig::Bytes,
         decoding::FramingConfig::CharacterDelimited(config) => {
             encoding::FramingConfig::CharacterDelimited(encoding::CharacterDelimitedEncoderConfig {
                 character_delimited: encoding::CharacterDelimitedEncoderOptions {
@@ -245,7 +245,7 @@ fn serializer_config_to_deserializer(
 
 fn encoder_framing_to_decoding_framer(framing: encoding::FramingConfig) -> decoding::Framer {
     let framing_config = match framing {
-        encoding::FramingConfig::Bytes => decoding::FramingConfig::Bytes,
+        encoding::FramingConfig::Bytes => decoding::FramingConfig::Bytes(Default::default()),
         encoding::FramingConfig::CharacterDelimited(config) => {
             decoding::FramingConfig::CharacterDelimited(decoding::CharacterDelimitedDecoderConfig {
                 character_delimited: decoding::CharacterDelimitedDecoderOptions {
