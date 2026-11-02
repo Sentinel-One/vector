@@ -90,7 +90,7 @@ impl StreamDecodingError for Error {
 #[configurable(metadata(docs::enum_tag_description = "The framing method."))]
 pub enum FramingConfig {
     /// Byte frames are passed through as-is according to the underlying I/O boundaries (for example, split between messages or stream segments).
-    Bytes,
+    Bytes(BytesDecoderConfig),
 
     /// Byte frames which are delimited by a chosen character.
     CharacterDelimited(CharacterDelimitedDecoderConfig),
@@ -125,8 +125,8 @@ pub enum FramingConfig {
 }
 
 impl From<BytesDecoderConfig> for FramingConfig {
-    fn from(_: BytesDecoderConfig) -> Self {
-        Self::Bytes
+    fn from(config: BytesDecoderConfig) -> Self {
+        Self::Bytes(config)
     }
 }
 
@@ -182,7 +182,7 @@ impl FramingConfig {
     /// here so no framer has to reach for process state.
     pub fn build(&self, limits: OperationalLimits) -> Framer {
         match self {
-            FramingConfig::Bytes => Framer::Bytes(BytesDecoderConfig.build()),
+            FramingConfig::Bytes(config) => Framer::Bytes(config.build()),
             FramingConfig::CharacterDelimited(config) => {
                 Framer::CharacterDelimited(config.build(limits.framing))
             }
@@ -451,8 +451,8 @@ impl DeserializerConfig {
     /// Return an appropriate default framer for the given deserializer
     pub fn default_stream_framing(&self) -> FramingConfig {
         match self {
-            DeserializerConfig::Avro { .. } => FramingConfig::Bytes,
-            DeserializerConfig::Csv(_) => FramingConfig::Bytes,
+            DeserializerConfig::Avro { .. } => FramingConfig::Bytes(BytesDecoderConfig::new()),
+            DeserializerConfig::Csv(_) => FramingConfig::Bytes(BytesDecoderConfig::new()),
             DeserializerConfig::Native => FramingConfig::LengthDelimited(Default::default()),
             DeserializerConfig::Bytes
             | DeserializerConfig::Json(_)
@@ -461,10 +461,10 @@ impl DeserializerConfig {
             | DeserializerConfig::NativeJson(_) => {
                 FramingConfig::NewlineDelimited(Default::default())
             }
-            DeserializerConfig::Protobuf(_) => FramingConfig::Bytes,
+            DeserializerConfig::Protobuf(_) => FramingConfig::Bytes(BytesDecoderConfig::new()),
             #[cfg(feature = "syslog")]
             DeserializerConfig::Syslog(_) => FramingConfig::NewlineDelimited(Default::default()),
-            DeserializerConfig::Vrl(_) => FramingConfig::Bytes,
+            DeserializerConfig::Vrl(_) => FramingConfig::Bytes(BytesDecoderConfig::new()),
             DeserializerConfig::Gelf(_) => {
                 FramingConfig::CharacterDelimited(CharacterDelimitedDecoderConfig::new(0))
             }
@@ -476,8 +476,8 @@ impl DeserializerConfig {
     pub fn default_message_based_framing(&self) -> FramingConfig {
         match self {
             DeserializerConfig::Gelf(_) => FramingConfig::ChunkedGelf(Default::default()),
-            DeserializerConfig::Strata(_) => FramingConfig::Bytes,
-            _ => FramingConfig::Bytes,
+            DeserializerConfig::Strata(_) => FramingConfig::Bytes(BytesDecoderConfig::new()),
+            _ => FramingConfig::Bytes(BytesDecoderConfig::new()),
         }
     }
 

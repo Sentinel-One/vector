@@ -29,7 +29,7 @@ pub use octet_counting::{
 };
 use tokio_util::codec::LinesCodecError;
 
-pub use self::bytes::{BytesDecoder, BytesDecoderConfig};
+pub use self::bytes::{BytesDecoder, BytesDecoderConfig, BytesDecoderOptions};
 
 pub use self::netflow::{
     NetflowDecoder, NetflowDecoderConfig, NetflowDecoderOptions,

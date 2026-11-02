@@ -561,7 +561,7 @@ mod integration_tests {
             batch_size: None,
             auth: None,
             dead_letter_queue_policy: None,
-            framing: FramingConfig::Bytes,
+            framing: FramingConfig::Bytes(Default::default()),
             decoding: DeserializerConfig::Bytes,
             acknowledgements: acknowledgements.into(),
             log_namespace: None,
