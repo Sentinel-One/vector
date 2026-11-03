@@ -395,8 +395,8 @@ struct ParserState {
     value_stack: Vec<ValueBuilder>,
     /// Events that have been emitted
     events: Vec<(String, Value)>,
-    /// Depth (`path.len()`) of the array currently being exploded, if any
-    explode_depth: Option<usize>,
+    /// `value_stack.len()` of the array being exploded, if any (nested arrays share its path)
+    explode_stack_len: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -411,7 +411,7 @@ impl ParserState {
             path: Vec::with_capacity(8),
             value_stack: Vec::with_capacity(8),
             events: Vec::with_capacity(16),
-            explode_depth: None,
+            explode_stack_len: None,
         }
     }
 
@@ -578,24 +578,27 @@ impl JsonPathDeserializer {
                     .map(|node| node.op == PathOperation::Explode)
                     .unwrap_or(false);
 
-                if should_explode && state.explode_depth.is_none() {
-                    state.explode_depth = Some(state.path.len());
-                }
-
                 state.value_stack.push(ValueBuilder::Array(Vec::new()));
+
+                if should_explode && state.explode_stack_len.is_none() {
+                    state.explode_stack_len = Some(state.value_stack.len());
+                }
             }
             JsonEvent::EndArray => {
-                let is_exploded = state.explode_depth == Some(state.path.len());
+                let is_exploded = state.explode_stack_len == Some(state.value_stack.len());
 
                 if let Some(ValueBuilder::Array(arr)) = state.value_stack.pop() {
                     if is_exploded {
-                        state.explode_depth = None;
+                        state.explode_stack_len = None;
                     } else {
                         self.handle_value(state, Value::Array(arr))?;
                     }
                 }
 
-                state.pop_path();
+                // Only an array that is an object field value has a `FieldName` segment to pop.
+                if matches!(state.value_stack.last(), Some(ValueBuilder::Object(_))) {
+                    state.pop_path();
+                }
             }
             JsonEvent::FieldName => {
                 let field_name = parser
@@ -641,7 +644,7 @@ impl JsonPathDeserializer {
     }
 
     fn handle_value(&self, state: &mut ParserState, value: Value) -> Result<(), String> {
-        let inside_exploded_array = state.explode_depth == Some(state.path.len())
+        let inside_exploded_array = state.explode_stack_len == Some(state.value_stack.len())
             && matches!(state.value_stack.last(), Some(ValueBuilder::Array(_)));
 
         let is_container = matches!(value, Value::Object(_) | Value::Array(_));
@@ -2100,6 +2103,444 @@ op = "explode"
             parse_ok(&deserializer, r#"rce": "foo"}}"#),
             1,
             "streaming across frames broke"
+        );
+    }
+
+    fn explode_data(path: &str, chunks: &[&str]) -> Vec<String> {
+        let config = PathOperationConfig::new(
+            path.split('.')
+                .filter(|segment| !segment.is_empty())
+                .fold(OwnedValuePath::root(), |acc, segment| {
+                    acc.with_field_appended(segment)
+                }),
+            PathOperation::Explode.into(),
+        );
+        let deserializer =
+            JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
+
+        chunks
+            .iter()
+            .flat_map(|chunk| {
+                deserializer
+                    .parse(Bytes::from(chunk.to_string()), LogNamespace::Vector)
+                    .unwrap()
+            })
+            .map(|event| serde_json::to_string(&event.as_log()["data"]).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn explode_keeps_every_element_for_arrays_nested_in_elements() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "r",
+                r#"{"r":[{"a":1},{"a":2}]}"#,
+                &[r#"{"a":1}"#, r#"{"a":2}"#],
+            ),
+            ("r", r#"{"r":[{"c":[1,2]}]}"#, &[r#"{"c":[1,2]}"#]),
+            ("r", r#"{"r":[{"c":[[1]]}]}"#, &[r#"{"c":[[1]]}"#]),
+            (
+                "r",
+                r#"{"r":[{"c":[{"d":[1]}]}]}"#,
+                &[r#"{"c":[{"d":[1]}]}"#],
+            ),
+            ("r", r#"{"r":[{"o":{"c":[1]}}]}"#, &[r#"{"o":{"c":[1]}}"#]),
+            ("r", r#"{"r":[[1,2],[3]]}"#, &["[1,2]", "[3]"]),
+            (
+                "r",
+                r#"{"r":[{"c":[[1]]},{"a":2}]}"#,
+                &[r#"{"c":[[1]]}"#, r#"{"a":2}"#],
+            ),
+            (
+                "r",
+                r#"{"r":[{"a":1},{"c":[[1]]}]}"#,
+                &[r#"{"a":1}"#, r#"{"c":[[1]]}"#],
+            ),
+            (
+                "r",
+                r#"{"x":[[1,2]],"r":[{"a":1},{"a":2}]}"#,
+                &[r#"{"a":1}"#, r#"{"a":2}"#],
+            ),
+            (
+                "r",
+                r#"{"r":[{"a":1},{"a":2}],"x":[[1,2]]}"#,
+                &[r#"{"a":1}"#, r#"{"a":2}"#],
+            ),
+            (
+                ".",
+                r#"[{"c":[[1]]},{"a":2}]"#,
+                &[r#"{"c":[[1]]}"#, r#"{"a":2}"#],
+            ),
+            (".", r#"[{"a":1},{"a":2}]"#, &[r#"{"a":1}"#, r#"{"a":2}"#]),
+            (
+                "r",
+                r#"{"r":[{"c":[[]]},{"a":2}]}"#,
+                &[r#"{"c":[[]]}"#, r#"{"a":2}"#],
+            ),
+            (
+                "r",
+                r#"{"r":[{"c":[[[1]]]},{"a":2}]}"#,
+                &[r#"{"c":[[[1]]]}"#, r#"{"a":2}"#],
+            ),
+            ("r", r#"{"r":[[[1],[2]],[[3]]]}"#, &["[[1],[2]]", "[[3]]"]),
+        ];
+
+        cases.iter().for_each(|(path, doc, expected)| {
+            assert_eq!(&explode_data(path, &[doc]), expected, "doc: {doc}");
+        });
+    }
+
+    fn events_for_rules(rules: &[(&str, PathOperation)], doc: &str) -> Vec<(String, String)> {
+        let to_path = |dotted: &str| {
+            dotted
+                .split('.')
+                .fold(OwnedValuePath::root(), |acc, segment| {
+                    acc.with_field_appended(segment)
+                })
+        };
+        let (first_path, first_op) = rules[0];
+        let config = rules[1..].iter().fold(
+            PathOperationConfig::new(to_path(first_path), first_op.into()),
+            |config, (path, op)| config.with_rule(to_path(path), (*op).into()),
+        );
+        let deserializer =
+            JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
+
+        deserializer
+            .parse(Bytes::from(doc.to_string()), LogNamespace::Vector)
+            .unwrap()
+            .into_iter()
+            .map(|event| {
+                let log = event.as_log();
+                (
+                    log["expr"].to_string_lossy().into_owned(),
+                    serde_json::to_string(&log["data"]).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn path_operations_apply_to_objects_inside_arrays_nested_to_depth_1_through_4() {
+        const OBJECTS: &str = r#"{"id":1,"tags":["a","b"]},{"id":2,"tags":["c"]}"#;
+        fn ev(expr: &str, data: &str) -> (String, String) {
+            (expr.to_string(), data.to_string())
+        }
+        let wrapped = |depth: usize| format!("{}{OBJECTS}{}", "[".repeat(depth), "]".repeat(depth));
+
+        type Case = (
+            &'static str,
+            &'static [(&'static str, PathOperation)],
+            fn(usize) -> Vec<(String, String)>,
+        );
+        let cases: &[Case] = &[
+            (
+                "identity on a scalar field",
+                &[("r.id", PathOperation::Identity)],
+                |_| vec![ev("r.id", "1"), ev("r.id", "2")],
+            ),
+            (
+                "bytes on a scalar field",
+                &[("r.id", PathOperation::Bytes)],
+                |_| vec![ev("r.id", r#""1""#), ev("r.id", r#""2""#)],
+            ),
+            (
+                "identity on an array field emits each scalar element, then the whole array",
+                &[("r.tags", PathOperation::Identity)],
+                |_| {
+                    vec![
+                        ev("r.tags", r#""a""#),
+                        ev("r.tags", r#""b""#),
+                        ev("r.tags", r#"["a","b"]"#),
+                        ev("r.tags", r#""c""#),
+                        ev("r.tags", r#"["c"]"#),
+                    ]
+                },
+            ),
+            (
+                "explode on an array field",
+                &[("r.tags", PathOperation::Explode)],
+                |_| {
+                    vec![
+                        ev("r.tags", r#""a""#),
+                        ev("r.tags", r#""b""#),
+                        ev("r.tags", r#""c""#),
+                    ]
+                },
+            ),
+            (
+                "drop on one field leaves the sibling field's events",
+                &[
+                    ("r.id", PathOperation::Drop),
+                    ("r.tags", PathOperation::Identity),
+                ],
+                |_| {
+                    vec![
+                        ev("r.tags", r#""a""#),
+                        ev("r.tags", r#""b""#),
+                        ev("r.tags", r#"["a","b"]"#),
+                        ev("r.tags", r#""c""#),
+                        ev("r.tags", r#"["c"]"#),
+                    ]
+                },
+            ),
+            (
+                "identity and explode on sibling fields keep document order",
+                &[
+                    ("r.id", PathOperation::Identity),
+                    ("r.tags", PathOperation::Explode),
+                ],
+                |_| {
+                    vec![
+                        ev("r.id", "1"),
+                        ev("r.tags", r#""a""#),
+                        ev("r.tags", r#""b""#),
+                        ev("r.id", "2"),
+                        ev("r.tags", r#""c""#),
+                    ]
+                },
+            ),
+            (
+                "explode on the outermost array yields its direct elements",
+                &[("r", PathOperation::Explode)],
+                |depth| match depth {
+                    1 => vec![
+                        ev("r", r#"{"id":1,"tags":["a","b"]}"#),
+                        ev("r", r#"{"id":2,"tags":["c"]}"#),
+                    ],
+                    _ => vec![ev(
+                        "r",
+                        &format!(
+                            "{}{OBJECTS}{}",
+                            "[".repeat(depth - 1),
+                            "]".repeat(depth - 1)
+                        ),
+                    )],
+                },
+            ),
+        ];
+
+        (1..=4).for_each(|depth| {
+            let doc = format!(r#"{{"r":{}}}"#, wrapped(depth));
+            cases.iter().for_each(|(name, rules, expected)| {
+                assert_eq!(
+                    events_for_rules(rules, &doc),
+                    expected(depth),
+                    "case: {name}, depth: {depth}, doc: {doc}"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn path_operations_apply_to_attributes_of_objects_nested_in_arrays_of_objects() {
+        const INNER_1: &str = r#"{"k":10,"tags":["a","b"]},{"k":11,"tags":["c"]}"#;
+        const INNER_2: &str = r#"{"k":20,"tags":["d"]}"#;
+        fn ev(expr: &str, data: &str) -> (String, String) {
+            (expr.to_string(), data.to_string())
+        }
+        fn wrap(items: &str, depth: usize) -> String {
+            format!("{}{items}{}", "[".repeat(depth), "]".repeat(depth))
+        }
+
+        type Case = (
+            &'static str,
+            &'static [(&'static str, PathOperation)],
+            fn(usize) -> Vec<(String, String)>,
+        );
+        let cases: &[Case] = &[
+            (
+                "explode on the tags of the inner objects",
+                &[("r.inner.tags", PathOperation::Explode)],
+                |_| {
+                    ["a", "b", "c", "d"]
+                        .into_iter()
+                        .map(|tag| ev("r.inner.tags", &format!(r#""{tag}""#)))
+                        .collect()
+                },
+            ),
+            (
+                "identity on a scalar of the inner objects",
+                &[("r.inner.k", PathOperation::Identity)],
+                |_| {
+                    vec![
+                        ev("r.inner.k", "10"),
+                        ev("r.inner.k", "11"),
+                        ev("r.inner.k", "20"),
+                    ]
+                },
+            ),
+            (
+                "bytes on a scalar of the inner objects",
+                &[("r.inner.k", PathOperation::Bytes)],
+                |_| {
+                    vec![
+                        ev("r.inner.k", r#""10""#),
+                        ev("r.inner.k", r#""11""#),
+                        ev("r.inner.k", r#""20""#),
+                    ]
+                },
+            ),
+            (
+                "drop on a scalar leaves the sibling explode intact",
+                &[
+                    ("r.inner.k", PathOperation::Drop),
+                    ("r.inner.tags", PathOperation::Explode),
+                ],
+                |_| {
+                    ["a", "b", "c", "d"]
+                        .into_iter()
+                        .map(|tag| ev("r.inner.tags", &format!(r#""{tag}""#)))
+                        .collect()
+                },
+            ),
+            (
+                "drop on the inner array does not suppress a deeper explode",
+                &[
+                    ("r.inner", PathOperation::Drop),
+                    ("r.inner.tags", PathOperation::Explode),
+                ],
+                |_| {
+                    ["a", "b", "c", "d"]
+                        .into_iter()
+                        .map(|tag| ev("r.inner.tags", &format!(r#""{tag}""#)))
+                        .collect()
+                },
+            ),
+            (
+                "outer scalar and inner explode keep document order",
+                &[
+                    ("r.id", PathOperation::Identity),
+                    ("r.inner.tags", PathOperation::Explode),
+                ],
+                |_| {
+                    vec![
+                        ev("r.id", "1"),
+                        ev("r.inner.tags", r#""a""#),
+                        ev("r.inner.tags", r#""b""#),
+                        ev("r.inner.tags", r#""c""#),
+                        ev("r.id", "2"),
+                        ev("r.inner.tags", r#""d""#),
+                    ]
+                },
+            ),
+            (
+                "inner scalar and inner explode keep document order",
+                &[
+                    ("r.inner.k", PathOperation::Identity),
+                    ("r.inner.tags", PathOperation::Explode),
+                ],
+                |_| {
+                    vec![
+                        ev("r.inner.k", "10"),
+                        ev("r.inner.tags", r#""a""#),
+                        ev("r.inner.tags", r#""b""#),
+                        ev("r.inner.k", "11"),
+                        ev("r.inner.tags", r#""c""#),
+                        ev("r.inner.k", "20"),
+                        ev("r.inner.tags", r#""d""#),
+                    ]
+                },
+            ),
+            (
+                "explode on the inner array yields its direct elements per outer object",
+                &[("r.inner", PathOperation::Explode)],
+                |inner_depth| match inner_depth {
+                    1 => vec![
+                        ev("r.inner", r#"{"k":10,"tags":["a","b"]}"#),
+                        ev("r.inner", r#"{"k":11,"tags":["c"]}"#),
+                        ev("r.inner", r#"{"k":20,"tags":["d"]}"#),
+                    ],
+                    _ => vec![
+                        ev("r.inner", &wrap(INNER_1, inner_depth - 1)),
+                        ev("r.inner", &wrap(INNER_2, inner_depth - 1)),
+                    ],
+                },
+            ),
+        ];
+
+        (1..=2).for_each(|outer_depth| {
+            (1..=2).for_each(|inner_depth| {
+                let outer_1 = format!(r#"{{"id":1,"inner":{}}}"#, wrap(INNER_1, inner_depth));
+                let outer_2 = format!(r#"{{"id":2,"inner":{}}}"#, wrap(INNER_2, inner_depth));
+                let doc = format!(
+                    r#"{{"r":{}}}"#,
+                    wrap(&format!("{outer_1},{outer_2}"), outer_depth)
+                );
+                cases.iter().for_each(|(name, rules, expected)| {
+                    assert_eq!(
+                        events_for_rules(rules, &doc),
+                        expected(inner_depth),
+                        "case: {name}, outer depth: {outer_depth}, inner depth: {inner_depth}, doc: {doc}"
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn explode_keeps_every_element_when_array_of_arrays_is_split_across_parse_calls() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &[r#"{"r":[{"c":[["#, r#"1]]},{"a":2}]}"#],
+                &[r#"{"c":[[1]]}"#, r#"{"a":2}"#],
+            ),
+            (
+                &[r#"{"r":[{"c":[[1]"#, r#"]},{"a":2}]}"#],
+                &[r#"{"c":[[1]]}"#, r#"{"a":2}"#],
+            ),
+            (&[r#"{"r":[[1,"#, r#"2],[3]]}"#], &["[1,2]", "[3]"]),
+        ];
+
+        cases.iter().for_each(|(chunks, expected)| {
+            assert_eq!(&explode_data("r", chunks), expected, "chunks: {chunks:?}");
+        });
+    }
+
+    #[test]
+    fn explode_emits_one_event_per_geojson_feature_with_nested_polygon_rings() {
+        let features = (0..3)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"Feature","properties":{{"id":{i}}},"geometry":{{"type":"Polygon","coordinates":[[[0.5,1.5],[2.5,3.5],[0.5,1.5]],[[1.0,1.0],[2.0,2.0],[1.0,1.0]]]}}}}"#
+                )
+            })
+            .collect::<Vec<_>>();
+        let doc = format!(
+            r#"{{"type":"FeatureCollection","features":[{}]}}"#,
+            features.join(",")
+        );
+
+        let out = explode_data("features", &[&doc]);
+
+        assert_eq!(out.len(), 3);
+        out.iter().enumerate().for_each(|(i, data)| {
+            let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+            assert_eq!(parsed["properties"]["id"], i);
+            assert_eq!(
+                parsed["geometry"]["coordinates"].as_array().unwrap().len(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn explode_emits_every_element_of_a_large_document_of_arrays_of_arrays() {
+        let n = 5_000;
+        let doc = format!(
+            r#"{{"r":[{}]}}"#,
+            (0..n)
+                .map(|i| format!(r#"{{"i":{i},"c":[[{i}]]}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let out = explode_data("r", &[&doc]);
+
+        assert_eq!(out.len(), n);
+        assert_eq!(
+            out[n - 1],
+            format!(r#"{{"c":[[{}]],"i":{}}}"#, n - 1, n - 1)
         );
     }
 }
