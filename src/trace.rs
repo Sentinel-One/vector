@@ -19,10 +19,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{Event, Subscriber};
 use tracing_limit::RateLimitedLayer;
 use tracing_subscriber::{
-    filter::LevelFilter,
-    fmt::writer::MakeWriterExt,
+    filter::{LevelFilter, Targets},
     layer::{Context, SubscriberExt},
     registry::LookupSpan,
+    reload,
     util::SubscriberInitExt,
     Layer,
 };
@@ -57,20 +57,46 @@ fn metrics_layer_enabled() -> bool {
     !matches!(std::env::var("DISABLE_INTERNAL_METRICS_TRACING_INTEGRATION"), Ok(x) if x == "true")
 }
 
-/// Controls whether the console log output is written.
-///
-/// Initialized from the `--disable-console-logs` flag and re-enabled via
-/// [`enable_console_output`] once topology shutdown begins, so shutdown-phase
-/// logs — which the `internal_logs` source can no longer capture after it stops
-/// reading — remain visible on the console.
-static CONSOLE_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Type-erased `reload::Handle<Targets, S>`. `S` is the subscriber stack beneath the filtered layer, which
+/// differs per layer and per cfg (`tokio-console`, `allocation-tracing`), so it can't be named in a static.
+type SetFilter = Box<dyn Fn(Targets) + Send + Sync>;
 
-/// Returns whether console log output is currently enabled.
+/// The `--log-level` targets, kept so a filter emptied via [`set_filter`] can be restored.
+static ENABLED_TARGETS: OnceLock<Targets> = OnceLock::new();
+
+/// Switches the console `fmt` layer between [`ENABLED_TARGETS`] and an empty (enable-nothing) `Targets`.
+static CONSOLE_FILTER: OnceLock<SetFilter> = OnceLock::new();
+
+/// Switches the [`BroadcastLayer`] the same way, so it costs nothing while no `internal_logs` source exists.
+static BROADCAST_FILTER: OnceLock<SetFilter> = OnceLock::new();
+
+/// Live [`TraceSubscription`] count. A `Mutex` rather than an atomic so the count change and the matching
+/// filter reload are one step; otherwise a racing subscribe/drop could leave the filter in the wrong state.
+static ACTIVE_SUBSCRIPTIONS: Mutex<usize> = Mutex::new(0);
+
+/// Wraps `initial` in a reloadable per-layer filter and stores its handle in `slot`.
 ///
-/// Used as the console writer's per-event predicate (see [`init`]): when it
-/// returns `false`, the writer discards the event.
-fn console_enabled() -> bool {
-    CONSOLE_ENABLED.load(Ordering::Acquire)
+/// The filter (not the layer) is what gets reloaded: a reloaded `Filtered` layer never receives a `FilterId`
+/// and so can't be re-enabled (tokio-rs/tracing#1629). `OnceLock::set` keeps the first handle when `init` is
+/// called repeatedly (as in tests), which is the one belonging to the subscriber `try_init` actually installed.
+fn reloadable<S: Subscriber + 'static>(
+    initial: Targets,
+    slot: &OnceLock<SetFilter>,
+) -> reload::Layer<Targets, S> {
+    let (filter, handle) = reload::Layer::new(initial);
+    _ = slot.set(Box::new(move |targets| _ = handle.reload(targets)));
+    filter
+}
+
+/// Reloading rebuilds the callsite interest cache, so callsites no remaining layer wants become fully disabled.
+fn set_filter(slot: &OnceLock<SetFilter>, enabled: bool) {
+    if let Some(set) = slot.get() {
+        set(if enabled {
+            ENABLED_TARGETS.get().cloned().unwrap_or_default()
+        } else {
+            Targets::new()
+        })
+    }
 }
 
 /// Re-enables console log output at runtime.
@@ -79,7 +105,7 @@ fn console_enabled() -> bool {
 /// disabled via `--disable-console-logs`, this restores stderr output for the
 /// shutdown phase; when it was already enabled, this is a no-op.
 pub fn enable_console_output() {
-    CONSOLE_ENABLED.store(true, Ordering::Release);
+    set_filter(&CONSOLE_FILTER, true);
 }
 
 pub fn init(
@@ -89,16 +115,18 @@ pub fn init(
     internal_log_rate_limit: u64,
     disable_console: bool,
 ) {
-    let fmt_filter = tracing_subscriber::filter::Targets::from_str(levels).expect(
+    let fmt_filter = Targets::from_str(levels).expect(
         "logging filter targets were not formatted correctly or did not specify a valid level",
     );
+    _ = ENABLED_TARGETS.set(fmt_filter.clone());
 
     let metrics_layer =
         metrics_layer_enabled().then(|| MetricsLayer::new().with_filter(LevelFilter::INFO));
 
+    // Starts enabled: the early buffer must capture startup logs for `internal_logs` sources not yet built.
     let broadcast_layer = RateLimitedLayer::new(BroadcastLayer::new())
         .with_default_limit(internal_log_rate_limit)
-        .with_filter(fmt_filter.clone());
+        .with_filter(reloadable(fmt_filter.clone(), &BROADCAST_FILTER));
 
     let subscriber = tracing_subscriber::registry()
         .with(metrics_layer)
@@ -124,38 +152,43 @@ pub fn init(
     // The console formatter is an independent layer from the `BroadcastLayer`
     // that feeds the `internal_logs` source, so toggling it never affects
     // `internal_logs`. Both formats write to stderr (stdout is reserved for
-    // pipeline output such as the `console` sink). The writer is gated on
-    // `console_enabled()`: while console logging is disabled it discards events
-    // (`OptionalWriter::none()`), and the gate is re-enabled at shutdown via
-    // `enable_console_output()` so shutdown-phase logs stay visible.
-    CONSOLE_ENABLED.store(!disable_console, Ordering::Release);
-    let console_writer = std::io::stderr.with_filter(|_meta| console_enabled());
+    // pipeline output such as the `console` sink). While console logging is
+    // disabled the filter enables nothing, so events are never formatted; it is
+    // re-enabled at shutdown via `enable_console_output()`.
+    let console_filter = reloadable(
+        if disable_console {
+            Targets::new()
+        } else {
+            fmt_filter
+        },
+        &CONSOLE_FILTER,
+    );
 
     if json {
         let formatter = tracing_subscriber::fmt::layer()
             .json()
             .flatten_event(true)
-            .with_writer(console_writer);
+            .with_writer(std::io::stderr);
 
         #[cfg(test)]
         let formatter = formatter.with_test_writer();
 
         let rate_limited =
             RateLimitedLayer::new(formatter).with_default_limit(internal_log_rate_limit);
-        let subscriber = subscriber.with(rate_limited.with_filter(fmt_filter));
+        let subscriber = subscriber.with(rate_limited.with_filter(console_filter));
 
         _ = subscriber.try_init();
     } else {
         let formatter = tracing_subscriber::fmt::layer()
             .with_ansi(color)
-            .with_writer(console_writer);
+            .with_writer(std::io::stderr);
 
         #[cfg(test)]
         let formatter = formatter.with_test_writer();
 
         let rate_limited =
             RateLimitedLayer::new(formatter).with_default_limit(internal_log_rate_limit);
-        let subscriber = subscriber.with(rate_limited.with_filter(fmt_filter));
+        let subscriber = subscriber.with(rate_limited.with_filter(console_filter));
 
         _ = subscriber.try_init();
     }
@@ -284,6 +317,37 @@ pub fn stop_early_buffering() {
             _ = subscriber_tx.send(buffered_events.clone());
         }
     }
+
+    let active = ACTIVE_SUBSCRIPTIONS
+        .lock()
+        .expect("poisoned locks are dumb");
+    (*active == 0).then(|| set_filter(&BROADCAST_FILTER, false));
+}
+
+/// Keeps the [`BroadcastLayer`] filter enabled while any [`TraceSubscription`] (or the stream made from one) is alive.
+struct SubscriptionGuard;
+
+impl SubscriptionGuard {
+    fn acquire() -> Self {
+        let mut active = ACTIVE_SUBSCRIPTIONS
+            .lock()
+            .expect("poisoned locks are dumb");
+        *active += 1;
+        (*active == 1).then(|| set_filter(&BROADCAST_FILTER, true));
+        SubscriptionGuard
+    }
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_SUBSCRIPTIONS
+            .lock()
+            .expect("poisoned locks are dumb");
+        *active -= 1;
+        // During early buffering the layer must stay on; `stop_early_buffering` switches it off instead.
+        (*active == 0 && !SHOULD_BUFFER.load(Ordering::Acquire))
+            .then(|| set_filter(&BROADCAST_FILTER, false));
+    }
 }
 
 /// A subscription to the log events flowing in via `tracing`, in the Vector native format.
@@ -294,17 +358,20 @@ pub fn stop_early_buffering() {
 pub struct TraceSubscription {
     buffered_events_rx: Option<oneshot::Receiver<Vec<LogEvent>>>,
     trace_rx: Receiver<LogEvent>,
+    guard: SubscriptionGuard,
 }
 
 impl TraceSubscription {
     /// Registers a subscription to the internal log event stream.
     pub fn subscribe() -> TraceSubscription {
+        let guard = SubscriptionGuard::acquire();
         let buffered_events_rx = try_register_for_early_events();
         let trace_rx = get_trace_receiver();
 
         Self {
             buffered_events_rx,
             trace_rx,
+            guard,
         }
     }
 
@@ -326,7 +393,14 @@ impl TraceSubscription {
     pub fn into_stream(self) -> impl Stream<Item = LogEvent> + Unpin {
         // We ignore errors because the only error we get is when the broadcast receiver lags, and there's nothing we
         // can actually do about that so there's no reason to force callers to even deal with it.
-        BroadcastStream::new(self.trace_rx).filter_map(|event| ready(event.ok()))
+        let Self {
+            trace_rx, guard, ..
+        } = self;
+        // The stream owns the guard, so dropping the `internal_logs` source de-registers the layer.
+        BroadcastStream::new(trace_rx).filter_map(move |event| {
+            let _ = &guard;
+            ready(event.ok())
+        })
     }
 }
 
@@ -422,199 +496,79 @@ impl tracing::field::Visit for SpanFields {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
-    use std::thread;
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    use super::{console_enabled, enable_console_output, CONSOLE_ENABLED};
+    use tracing_subscriber::{
+        filter::{LevelFilter, Targets},
+        fmt::writer::MakeWriter,
+        layer::SubscriberExt,
+        Layer,
+    };
 
-    // `CONSOLE_ENABLED` is a process-global. These tests both read and write it,
-    // so when several of them share a process (as under plain `cargo test`) they
-    // must not run concurrently or they would clobber each other's assertions.
-    // This lock serializes them; each test also restores the flag on exit via
-    // `save_gate`. (Under `cargo-nextest`, the fork's runner, every test gets its
-    // own process, so this is simply a no-op safety net.)
-    static GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use super::{reloadable, SetFilter, TraceSubscription, ACTIVE_SUBSCRIPTIONS};
 
-    fn gate_guard() -> MutexGuard<'static, ()> {
-        // Tolerate poisoning: a panic in one test must not wedge the others.
-        GATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
-    /// Restores `CONSOLE_ENABLED` to its captured value when dropped, even if the
-    /// test panics.
-    struct RestoreGate(bool);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
 
-    impl Drop for RestoreGate {
-        fn drop(&mut self) {
-            CONSOLE_ENABLED.store(self.0, Ordering::Release);
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
-    fn save_gate() -> RestoreGate {
-        RestoreGate(CONSOLE_ENABLED.load(Ordering::Acquire))
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
-    /// `enable_console_output` flips the gate on, and it is idempotent.
+    fn active_subscriptions() -> usize {
+        *ACTIVE_SUBSCRIPTIONS.lock().unwrap()
+    }
+
     #[test]
-    fn enable_console_output_sets_the_gate() {
-        let _lock = gate_guard();
-        let _restore = save_gate();
-
-        // Simulate `--disable-console-logs`.
-        CONSOLE_ENABLED.store(false, Ordering::Release);
-        assert!(!console_enabled(), "gate should start disabled");
-
-        enable_console_output();
-        assert!(
-            console_enabled(),
-            "gate should be enabled after shutdown hook"
-        );
-
-        // Idempotent: calling again keeps it enabled.
-        enable_console_output();
-        assert!(console_enabled());
-    }
-
-    /// End-to-end at the layer level: the console writer discards output while the
-    /// gate is disabled, then emits once it is re-enabled (the shutdown path).
-    /// Wired exactly like `init` — `writer.with_filter(|_| console_enabled())` —
-    /// but capturing into a buffer instead of writing to stderr.
-    #[test]
-    fn console_writer_suppresses_while_disabled_then_emits_after_enable() {
-        use tracing_subscriber::filter::LevelFilter;
-        use tracing_subscriber::fmt::writer::{MakeWriter, MakeWriterExt};
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::Layer;
-
-        // Captures everything the console layer writes so we can assert on it.
-        #[derive(Clone)]
-        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let _lock = gate_guard();
-        let _restore = save_gate();
+    fn console_filter_drops_events_while_empty_then_emits_after_reload() {
+        static SLOT: OnceLock<SetFilter> = OnceLock::new();
 
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        // Same wiring as `init`: the writer is gated on `console_enabled()`.
-        let writer = CaptureWriter(Arc::clone(&buf)).with_filter(|_meta| console_enabled());
         let layer = tracing_subscriber::fmt::layer()
-            .with_writer(writer)
-            .with_filter(LevelFilter::INFO);
+            .with_writer(CaptureWriter(Arc::clone(&buf)))
+            .with_filter(reloadable(Targets::new(), &SLOT));
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
-            CONSOLE_ENABLED.store(false, Ordering::Release);
             tracing::info!("while-disabled");
-            enable_console_output(); // the shutdown hook
+            SLOT.get().unwrap()(Targets::new().with_default(LevelFilter::INFO));
             tracing::info!("after-enable");
+            tracing::debug!("below-level");
         });
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(
-            !out.contains("while-disabled"),
-            "the writer must discard output while the gate is disabled; got: {out:?}"
-        );
-        assert!(
-            out.contains("after-enable"),
-            "the writer must emit once the gate is re-enabled; got: {out:?}"
-        );
+        assert!(!out.contains("while-disabled"), "got: {out:?}");
+        assert!(out.contains("after-enable"), "got: {out:?}");
+        assert!(!out.contains("below-level"), "got: {out:?}");
     }
 
-    /// Race coverage: many threads concurrently read the gate (`console_enabled`,
-    /// the per-event filter path) while others flip it in both directions —
-    /// including the shutdown hook. No thread may panic, and the atomic must never
-    /// tear, regardless of how reads and writes interleave.
+    // Counts are compared relative to a baseline since other tests in the process may hold subscriptions.
     #[test]
-    fn concurrent_gate_access_never_panics() {
-        let _lock = gate_guard();
-        let _restore = save_gate();
+    fn subscription_count_released_when_subscription_or_its_stream_dropped() {
+        let baseline = active_subscriptions();
 
-        const THREADS: usize = 16;
-        const ITERS: usize = 5_000;
-        let barrier = Arc::new(Barrier::new(THREADS));
+        let subscription = TraceSubscription::subscribe();
+        assert_eq!(active_subscriptions(), baseline + 1);
+        drop(subscription);
+        assert_eq!(active_subscriptions(), baseline);
 
-        let handles: Vec<_> = (0..THREADS)
-            .map(|t| {
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait(); // maximize overlap
-                    for i in 0..ITERS {
-                        match t % 3 {
-                            // Readers: the hot per-event filter check. `black_box`
-                            // keeps the read from being optimized away.
-                            0 => {
-                                std::hint::black_box(console_enabled());
-                            }
-                            // Writers: flip the gate both ways for maximum contention.
-                            1 => CONSOLE_ENABLED.store(i % 2 == 0, Ordering::Release),
-                            // The shutdown hook, racing everything else.
-                            _ => enable_console_output(),
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle
-                .join()
-                .expect("no thread may panic under concurrent gate access");
-        }
-
-        // With all threads joined and no concurrent writers, the shutdown hook
-        // leaves the gate enabled.
-        enable_console_output();
-        assert!(console_enabled());
-    }
-
-    /// Visibility/idempotency under concurrency: many threads calling the shutdown
-    /// hook at once converge to "enabled", and the final `Release` store is observed
-    /// by a subsequent `Acquire` read.
-    #[test]
-    fn concurrent_enable_converges_to_enabled() {
-        let _lock = gate_guard();
-        let _restore = save_gate();
-
-        CONSOLE_ENABLED.store(false, Ordering::Release);
-
-        const THREADS: usize = 32;
-        let barrier = Arc::new(Barrier::new(THREADS));
-        let handles: Vec<_> = (0..THREADS)
-            .map(|_| {
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    enable_console_output();
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle.join().expect("enable_console_output must not panic");
-        }
-
-        assert!(
-            console_enabled(),
-            "concurrent enable calls must leave the gate enabled"
-        );
+        let stream = TraceSubscription::subscribe().into_stream();
+        assert_eq!(active_subscriptions(), baseline + 1);
+        drop(stream);
+        assert_eq!(active_subscriptions(), baseline);
     }
 }
