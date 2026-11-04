@@ -493,11 +493,19 @@ base: components: sinks: prometheus_remote_write: configuration: {
 			}
 		}
 	}
+	tenant_header: {
+		description: "The name of the header that carries `tenant_id`."
+		required:    false
+		type: string: {
+			default: "X-Scope-OrgID"
+			examples: ["THANOS-TENANT"]
+		}
+	}
 	tenant_id: {
 		description: """
 			The tenant ID to send.
 
-			If set, a header named `X-Scope-OrgID` is added to outgoing requests with the value of this setting.
+			If set, a header named by `tenant_header` is added to outgoing requests with the value of this setting.
 
 			This may be used by Cortex or other remote services to identify the tenant making the request.
 			"""

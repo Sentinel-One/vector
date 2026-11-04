@@ -137,6 +137,37 @@ async fn sends_templated_x_scope_orgid_header() {
 }
 
 #[tokio::test]
+async fn sends_tenant_id_in_custom_header() {
+    let outputs = send_request(
+        indoc! {r#"
+            tenant_id = "tenant"
+            tenant_header = "TENANT_ID"
+        "#},
+        vec![create_event("gauge-3".into(), 12.0)],
+    )
+    .await;
+
+    assert_eq!(outputs.len(), 1);
+    let (headers, _) = &outputs[0];
+    assert_eq!(headers["tenant_id"], "tenant");
+    assert!(!headers.contains_key("x-scope-orgid"));
+}
+
+#[tokio::test]
+async fn rejects_invalid_tenant_header() {
+    let config: RemoteWriteConfig = toml::from_str(indoc! {r#"
+        endpoint = "http://localhost:9090/write"
+        tenant_id = "tenant"
+        tenant_header = "not a header"
+    "#})
+    .unwrap();
+
+    let result = config.build(SinkContext::default()).await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn retains_state_between_requests() {
     // This sink converts all incremental events to absolute, and
     // should accumulate their totals between batches.
