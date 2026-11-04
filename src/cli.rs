@@ -145,6 +145,14 @@ pub struct RootOpts {
     #[arg(long, default_value = "text", env = "VECTOR_LOG_FORMAT")]
     pub log_format: LogFormat,
 
+    /// Discard internal logs to the console instead of writing them to stderr/stdout.
+    ///
+    /// Does not affect the `internal_logs` source or panic output. Use this when an
+    /// `internal_logs` source already ships these logs, to avoid double-shipping them
+    /// to both the console collector and the configured sink.
+    #[arg(long, env = "VECTOR_DISABLE_CONSOLE_LOGS")]
+    pub disable_console_logs: bool,
+
     /// Control when ANSI terminal formatting is used.
     ///
     /// By default `vector` will try and detect if `stdout` is a terminal, if it is

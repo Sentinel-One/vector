@@ -238,7 +238,10 @@ mod tests {
     // `start_source` helper) panics when called more than once.
     #[tokio::test]
     async fn receives_logs() {
-        trace::init(false, false, "debug", 10);
+        // `disable_console = true` here is deliberate: it proves that muting the
+        // console output (the `--disable-console-logs` path) does not disturb the
+        // broadcast path, so the `internal_logs` source still receives every event.
+        trace::init(false, false, "debug", 10, true);
         trace::reset_early_buffer();
 
         assert_source_compliance(&SOURCE_TAGS, run_test()).await;
