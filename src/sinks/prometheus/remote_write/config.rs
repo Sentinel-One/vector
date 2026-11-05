@@ -3,10 +3,16 @@ use snafu::prelude::*;
 
 use crate::{
     http::HttpClient,
-    sinks::{prelude::*, prometheus::PrometheusRemoteWriteAuth, util::auth::Auth, UriParseSnafu},
+    sinks::{
+        prelude::*,
+        prometheus::PrometheusRemoteWriteAuth,
+        util::{adaptive_concurrency::AdaptiveConcurrencyLimitLayer, auth::Auth},
+        UriParseSnafu,
+    },
 };
 
 use super::{
+    bucket::{BucketConfig, BucketConfigError, OrderedByBucketLayer},
     conflict::RemoteWriteRetryLogic,
     service::{build_request, RemoteWriteService},
     sink::{PrometheusRemoteWriteDefaultBatchSettings, RemoteWriteSink},
@@ -95,6 +101,10 @@ pub struct RemoteWriteConfig {
     #[configurable(metadata(docs::examples = "THANOS-TENANT"))]
     #[configurable(metadata(docs::advanced))]
     pub tenant_header: String,
+
+    #[configurable(derived)]
+    #[configurable(metadata(docs::advanced))]
+    pub bucket: Option<BucketConfig>,
 
     #[configurable(derived)]
     pub tls: Option<TlsConfig>,
@@ -189,19 +199,40 @@ impl SinkConfig for RemoteWriteConfig {
         )
         .boxed();
 
+        let bucket = self.bucket.clone().map(BucketConfig::build).transpose()?;
+        if bucket.is_some() && request_settings.concurrency.is_none() {
+            return Err(BucketConfigError::AdaptiveConcurrency.into());
+        }
+
         let service = RemoteWriteService {
             endpoint,
             client,
             auth,
             compression: self.compression,
             tenant_header,
+            bucket_header: bucket.as_ref().and_then(|settings| settings.header.clone()),
         };
+        // The stack `settings()` builds, with per-bucket ordering between the concurrency limit
+        // and the retries: a retried request must hold back the newer requests of its bucket.
+        let retry_logic = RemoteWriteRetryLogic;
         let service = ServiceBuilder::new()
-            .settings(request_settings, RemoteWriteRetryLogic)
+            .rate_limit(
+                request_settings.rate_limit_num,
+                request_settings.rate_limit_duration,
+            )
+            .layer(AdaptiveConcurrencyLimitLayer::new(
+                request_settings.concurrency,
+                request_settings.adaptive_concurrency,
+                retry_logic.clone(),
+            ))
+            .layer(OrderedByBucketLayer)
+            .retry(request_settings.retry_policy(retry_logic))
+            .timeout(request_settings.timeout)
             .service(service);
 
         let sink = RemoteWriteSink {
             tenant_id: self.tenant_id.clone(),
+            bucket,
             compression: self.compression,
             aggregate: self.batch.aggregate,
             batch_settings: self
@@ -230,8 +261,16 @@ async fn healthcheck(
     auth: Option<Auth>,
 ) -> crate::Result<()> {
     let body = bytes::Bytes::new();
-    let request =
-        build_request(http::Method::GET, &endpoint, compression, body, None, auth).await?;
+    let request = build_request(
+        http::Method::GET,
+        &endpoint,
+        compression,
+        body,
+        None,
+        None,
+        auth,
+    )
+    .await?;
     let response = client.send(request).await?;
 
     match response.status() {

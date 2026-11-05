@@ -12,6 +12,7 @@ use crate::sinks::{
     util::buffer::metrics::{MetricNormalize, MetricSet},
 };
 
+mod bucket;
 mod config;
 mod conflict;
 mod request_builder;
@@ -39,6 +40,7 @@ enum Errors {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct PartitionKey {
     tenant_id: Option<String>,
+    bucket: Option<u32>,
 }
 
 #[derive(Default)]

@@ -35,6 +35,7 @@ pub(super) struct RemoteWriteService {
     pub(super) client: HttpClient,
     pub(super) compression: super::Compression,
     pub(super) tenant_header: HeaderName,
+    pub(super) bucket_header: Option<HeaderName>,
 }
 
 impl Service<RemoteWriteRequest> for RemoteWriteService {
@@ -53,6 +54,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
         let auth = self.auth.clone();
         let compression = self.compression;
         let tenant_header = self.tenant_header.clone();
+        let bucket = self.bucket_header.clone().zip(request.bucket);
 
         Box::pin(async move {
             let metadata = std::mem::take(request.metadata_mut());
@@ -65,6 +67,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
                 compression,
                 request.request,
                 request.tenant_id.as_ref().map(|id| (&tenant_header, id)),
+                bucket,
                 auth,
             )
             .await?;
@@ -107,6 +110,7 @@ pub(super) async fn build_request(
     compression: Compression,
     body: Bytes,
     tenant: Option<(&HeaderName, &String)>,
+    bucket: Option<(HeaderName, u32)>,
     auth: Option<Auth>,
 ) -> crate::Result<http::Request<hyper::Body>> {
     let mut builder = http::Request::builder()
@@ -121,6 +125,10 @@ pub(super) async fn build_request(
 
     if let Some((header, tenant_id)) = tenant {
         builder = builder.header(header, tenant_id);
+    }
+
+    if let Some((header, bucket)) = bucket {
+        builder = builder.header(header, bucket);
     }
 
     let mut request = builder.body(body)?;

@@ -7,6 +7,7 @@ use vector_lib::stream::batcher::{data::BatchData, limiter::ByteSizeOfItemSize};
 use crate::sinks::{prelude::*, util::buffer::metrics::MetricSet};
 
 use super::{
+    bucket::BucketSettings,
     request_builder::{RemoteWriteEncoder, RemoteWriteRequest, RemoteWriteRequestBuilder},
     PartitionKey, PrometheusMetricNormalize,
 };
@@ -14,6 +15,7 @@ use super::{
 pub(super) struct RemoteWriteMetric {
     pub(super) metric: Metric,
     tenant_id: Option<String>,
+    bucket: Option<u32>,
 }
 
 impl Finalizable for RemoteWriteMetric {
@@ -58,6 +60,7 @@ impl Partitioner for PrometheusTenantIdPartitioner {
     fn partition(&self, item: &Self::Item) -> Self::Key {
         PartitionKey {
             tenant_id: item.tenant_id.clone(),
+            bucket: item.bucket,
         }
     }
 }
@@ -143,6 +146,7 @@ impl BatchData<RemoteWriteMetric> for EventCollection {
 
 pub(super) struct RemoteWriteSink<S> {
     pub(super) tenant_id: Option<Template>,
+    pub(super) bucket: Option<BucketSettings>,
     pub(super) batch_settings: BatcherSettings,
     pub(super) aggregate: bool,
     pub(super) compression: super::Compression,
@@ -171,13 +175,18 @@ where
 
         let batch_settings = self.batch_settings;
         let tenant_id = self.tenant_id.clone();
+        let bucket = self.bucket.clone();
         let service = self.service;
 
         input
             .filter_map(|event| future::ready(event.try_into_metric()))
             .normalized_with_default::<PrometheusMetricNormalize>()
             .filter_map(move |event| {
-                future::ready(make_remote_write_event(tenant_id.as_ref(), event))
+                future::ready(make_remote_write_event(
+                    tenant_id.as_ref(),
+                    bucket.as_ref(),
+                    event,
+                ))
             })
             .batched_partitioned(PrometheusTenantIdPartitioner, || {
                 batch_settings
@@ -214,6 +223,7 @@ where
 
 fn make_remote_write_event(
     tenant_id: Option<&Template>,
+    bucket: Option<&BucketSettings>,
     metric: Metric,
 ) -> Option<RemoteWriteMetric> {
     let tenant_id = tenant_id.and_then(|template| {
@@ -229,5 +239,11 @@ fn make_remote_write_event(
             .ok()
     });
 
-    Some(RemoteWriteMetric { metric, tenant_id })
+    let bucket = bucket.map(|settings| settings.bucket_of(&metric));
+
+    Some(RemoteWriteMetric {
+        metric,
+        tenant_id,
+        bucket,
+    })
 }

@@ -9,7 +9,7 @@ use crate::sinks::{
     prometheus::{collector, collector::MetricCollector as _},
 };
 
-use super::{sink::EventCollection, PartitionKey};
+use super::{bucket::Bucketed, sink::EventCollection, PartitionKey};
 
 pub(crate) struct RemoteWriteEncoder {
     pub(super) default_namespace: Option<String>,
@@ -53,8 +53,15 @@ impl encoding::Encoder<Vec<Metric>> for RemoteWriteEncoder {
 pub(super) struct RemoteWriteRequest {
     pub(super) request: Bytes,
     pub(super) tenant_id: Option<String>,
+    pub(super) bucket: Option<u32>,
     finalizers: EventFinalizers,
     metadata: RequestMetadata,
+}
+
+impl Bucketed for RemoteWriteRequest {
+    fn bucket(&self) -> Option<u32> {
+        self.bucket
+    }
 }
 
 impl Finalizable for RemoteWriteRequest {
@@ -76,6 +83,7 @@ impl MetaDescriptive for RemoteWriteRequest {
 pub(super) struct RemoteWriteMetadata {
     finalizers: EventFinalizers,
     tenant_id: Option<String>,
+    bucket: Option<u32>,
 }
 
 pub(super) struct RemoteWriteRequestBuilder {
@@ -110,6 +118,7 @@ impl RequestBuilder<(PartitionKey, EventCollection)> for RemoteWriteRequestBuild
         let metadata = RemoteWriteMetadata {
             finalizers,
             tenant_id: key.tenant_id,
+            bucket: key.bucket,
         };
 
         (metadata, builder, metrics)
@@ -125,6 +134,7 @@ impl RequestBuilder<(PartitionKey, EventCollection)> for RemoteWriteRequestBuild
             request: payload.into_payload(),
             finalizers: metadata.finalizers,
             tenant_id: metadata.tenant_id,
+            bucket: metadata.bucket,
             metadata: request_metadata,
         }
     }
