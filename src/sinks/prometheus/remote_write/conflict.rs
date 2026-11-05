@@ -8,7 +8,9 @@ use http::StatusCode;
 
 use crate::{
     http::HttpError,
-    internal_events::PrometheusRemoteWriteRejectedSamples,
+    internal_events::{
+        PrometheusRemoteWriteRejectedSamples, PrometheusRemoteWriteUnclassifiedConflict,
+    },
     sinks::util::{
         http::{http_response_retry_logic, HttpResponse},
         retries::{RetryAction, RetryLogic},
@@ -52,9 +54,27 @@ impl RetryLogic for RemoteWriteRetryLogic {
         if !rejections.is_empty() && rejections.iter().all(|(reason, _)| reason == OUT_OF_ORDER) {
             RetryAction::Successful
         } else {
+            emit!(PrometheusRemoteWriteUnclassifiedConflict {
+                body: logged_body(&body),
+            });
             http_response_retry_logic().should_retry_response(response)
         }
     }
+}
+
+/// Longest part of a 409 body that is logged, in bytes.
+pub(super) const LOGGED_BODY_LIMIT: usize = 2048;
+
+/// The start of `body`, at most `LOGGED_BODY_LIMIT` bytes, cut on a character boundary.
+pub(super) fn logged_body(body: &str) -> &str {
+    if body.len() <= LOGGED_BODY_LIMIT {
+        return body;
+    }
+    let mut end = LOGGED_BODY_LIMIT;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
 }
 
 /// Parses the `add <count> samples: <reason>` entries of a Thanos Receive 409 body.

@@ -2,7 +2,7 @@ use bytes::Bytes;
 use http::StatusCode;
 use vector_lib::request_metadata::GroupedCountByteSize;
 
-use super::conflict::{parse_rejections, RemoteWriteRetryLogic};
+use super::conflict::{logged_body, parse_rejections, RemoteWriteRetryLogic, LOGGED_BODY_LIMIT};
 use crate::sinks::util::{
     http::HttpResponse,
     retries::{RetryAction, RetryLogic},
@@ -101,4 +101,26 @@ fn keeps_other_statuses_unchanged() {
         logic.should_retry_response(&response(StatusCode::BAD_REQUEST, OUT_OF_ORDER_BODY)),
         RetryAction::DontRetry(_)
     ));
+}
+
+#[test]
+fn logs_short_bodies_whole() {
+    assert_eq!(logged_body(DUPLICATE_BODY), DUPLICATE_BODY);
+}
+
+#[test]
+fn cuts_long_bodies_at_the_limit() {
+    let body = "x".repeat(LOGGED_BODY_LIMIT + 100);
+
+    assert_eq!(logged_body(&body).len(), LOGGED_BODY_LIMIT);
+}
+
+#[test]
+fn cuts_long_bodies_on_a_character_boundary() {
+    let body = "é".repeat(LOGGED_BODY_LIMIT);
+
+    let logged = logged_body(&body);
+
+    assert!(logged.len() <= LOGGED_BODY_LIMIT);
+    assert!(logged.chars().all(|c| c == 'é'));
 }

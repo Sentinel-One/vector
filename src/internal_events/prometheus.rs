@@ -119,3 +119,20 @@ impl InternalEvent for PrometheusRemoteWriteRejectedSamples<'_> {
         .increment(self.count);
     }
 }
+
+/// A 409 response from a remote write receiver that is not only out-of-order rejections, so the
+/// request is dropped. Carries the start of the body, to show what the receiver rejected.
+#[derive(Debug)]
+pub struct PrometheusRemoteWriteUnclassifiedConflict<'a> {
+    pub body: &'a str,
+}
+
+impl InternalEvent for PrometheusRemoteWriteUnclassifiedConflict<'_> {
+    fn emit(self) {
+        warn!(
+            message = "Receiver conflict is not only out-of-order samples; dropping the request.",
+            body = %self.body,
+            internal_log_rate_limit = true,
+        );
+    }
+}
