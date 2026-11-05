@@ -13,10 +13,13 @@ use crate::sinks::{
 };
 
 mod config;
+mod conflict;
 mod request_builder;
 mod service;
 mod sink;
 
+#[cfg(test)]
+mod conflict_tests;
 #[cfg(test)]
 mod tests;
 

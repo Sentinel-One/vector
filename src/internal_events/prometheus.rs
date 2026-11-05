@@ -88,3 +88,34 @@ impl InternalEvent for PrometheusNormalizationError {
         });
     }
 }
+
+/// Samples a remote write receiver rejected in a 409 response, by reason.
+#[derive(Debug)]
+pub struct PrometheusRemoteWriteRejectedSamples<'a> {
+    pub reason: &'a str,
+    pub count: u64,
+}
+
+impl InternalEvent for PrometheusRemoteWriteRejectedSamples<'_> {
+    fn emit(self) {
+        // The receiver's reason text is free-form, so the metric tag uses a fixed set of values.
+        let reason_tag = match self.reason {
+            "out of order sample" => "out_of_order",
+            "duplicate sample for timestamp" => "duplicate",
+            "out of bounds" => "out_of_bounds",
+            "too old sample" => "too_old",
+            _ => "other",
+        };
+        warn!(
+            message = "Receiver rejected samples.",
+            reason = %self.reason,
+            count = %self.count,
+            internal_log_rate_limit = true,
+        );
+        counter!(
+            "remote_write_rejected_samples_total",
+            "reason" => reason_tag,
+        )
+        .increment(self.count);
+    }
+}

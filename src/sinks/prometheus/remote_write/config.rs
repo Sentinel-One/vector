@@ -3,15 +3,11 @@ use snafu::prelude::*;
 
 use crate::{
     http::HttpClient,
-    sinks::{
-        prelude::*,
-        prometheus::PrometheusRemoteWriteAuth,
-        util::{auth::Auth, http::http_response_retry_logic},
-        UriParseSnafu,
-    },
+    sinks::{prelude::*, prometheus::PrometheusRemoteWriteAuth, util::auth::Auth, UriParseSnafu},
 };
 
 use super::{
+    conflict::RemoteWriteRetryLogic,
     service::{build_request, RemoteWriteService},
     sink::{PrometheusRemoteWriteDefaultBatchSettings, RemoteWriteSink},
 };
@@ -201,7 +197,7 @@ impl SinkConfig for RemoteWriteConfig {
             tenant_header,
         };
         let service = ServiceBuilder::new()
-            .settings(request_settings, http_response_retry_logic())
+            .settings(request_settings, RemoteWriteRetryLogic)
             .service(service);
 
         let sink = RemoteWriteSink {
