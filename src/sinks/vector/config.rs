@@ -1,13 +1,18 @@
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
+
 use http::Uri;
 use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
 use hyper_proxy::ProxyConnector;
-use tonic::body::BoxBody;
+use tonic::{
+    body::BoxBody,
+    metadata::{AsciiMetadataKey, AsciiMetadataValue},
+};
 use tower::ServiceBuilder;
 use vector_lib::configurable::configurable_component;
 
 use super::{
-    service::{VectorResponse, VectorService},
+    service::{MetadataHeader, VectorResponse, VectorService},
     sink::VectorSink,
     VectorSinkError,
 };
@@ -46,7 +51,6 @@ pub struct VectorSinkAuthConfig {
     /// Source of the bearer token attached to every request.
     pub token: AuthTokenConfig,
 }
-
 
 /// Configuration for the `vector` sink.
 #[configurable_component(sink("vector", "Relay observability data to a Vector instance."))]
@@ -103,6 +107,15 @@ pub struct VectorConfig {
     /// When configured, each request carries a bearer token and site ID in its gRPC metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<VectorSinkAuthConfig>,
+
+    /// Extra gRPC metadata sent with every request, as header name and value.
+    ///
+    /// Values are fixed for the sink's lifetime and can use environment variables like the rest
+    /// of the configuration, for example `${HOSTNAME}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[configurable(metadata(docs::additional_props_description = "A gRPC metadata value."))]
+    #[configurable(metadata(docs::advanced))]
+    pub headers: BTreeMap<String, String>,
 }
 
 impl VectorConfig {
@@ -129,7 +142,22 @@ fn default_config(address: &str) -> VectorConfig {
         tls: None,
         acknowledgements: Default::default(),
         auth: None,
+        headers: BTreeMap::new(),
     }
+}
+
+fn parse_headers(headers: &BTreeMap<String, String>) -> crate::Result<Arc<[MetadataHeader]>> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let key = AsciiMetadataKey::from_str(name)
+                .map_err(|_| format!("headers: {name:?} is not a valid gRPC metadata name"))?;
+            let value = AsciiMetadataValue::from_str(value).map_err(|_| {
+                format!("headers: the value of {name:?} is not valid gRPC metadata")
+            })?;
+            Ok((key, value))
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -147,10 +175,17 @@ impl SinkConfig for VectorConfig {
             .clone()
             .map(|uri| uri.uri)
             .unwrap_or_else(|| uri.clone());
-        let healthcheck_client =
-            VectorService::new(client.clone(), healthcheck_uri, false, self.auth.clone())?;
+        let headers = parse_headers(&self.headers)?;
+        let healthcheck_client = VectorService::new(
+            client.clone(),
+            healthcheck_uri,
+            false,
+            self.auth.clone(),
+            Arc::clone(&headers),
+        )?;
         let healthcheck = healthcheck(healthcheck_client, cx.healthcheck);
-        let service = VectorService::new(client, uri, self.compression, self.auth.clone())?;
+        let service =
+            VectorService::new(client, uri, self.compression, self.auth.clone(), headers)?;
         let request_settings = self.request.into_settings();
         let batch_settings = self.batch.into_batcher_settings()?;
 
@@ -193,9 +228,9 @@ async fn healthcheck(
     // healthcheck even though the sink has valid credentials.
     let mut request = tonic::Request::new(proto::HealthCheckRequest {});
     if let Some(auth) = service.auth() {
-        let bearer = auth.bearer_token().map_err(|message| {
-            Box::new(VectorSinkError::AuthTokenUnavailable { message })
-        })?;
+        let bearer = auth
+            .bearer_token()
+            .map_err(|message| Box::new(VectorSinkError::AuthTokenUnavailable { message }))?;
         request.metadata_mut().insert("authorization", bearer);
     }
 

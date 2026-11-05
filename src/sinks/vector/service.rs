@@ -7,7 +7,11 @@ use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
 use hyper_proxy::ProxyConnector;
 use prost::Message;
-use tonic::{body::BoxBody, IntoRequest};
+use tonic::{
+    body::BoxBody,
+    metadata::{AsciiMetadataKey, AsciiMetadataValue},
+    IntoRequest,
+};
 use tower::Service;
 use tracing::warn;
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
@@ -22,12 +26,16 @@ use crate::{
     Error,
 };
 
+/// A gRPC metadata entry sent with every request.
+pub(super) type MetadataHeader = (AsciiMetadataKey, AsciiMetadataValue);
+
 #[derive(Clone, Debug)]
 pub struct VectorService {
     pub client: proto_vector::Client<HyperSvc>,
     pub protocol: String,
     pub endpoint: String,
     auth: Option<Arc<AuthState>>,
+    headers: Arc<[MetadataHeader]>,
 }
 
 pub struct VectorResponse {
@@ -73,6 +81,7 @@ impl VectorService {
         uri: Uri,
         compression: bool,
         auth: Option<VectorSinkAuthConfig>,
+        headers: Arc<[MetadataHeader]>,
     ) -> crate::Result<Self> {
         let (protocol, endpoint) = uri::protocol_endpoint(uri.clone());
         let mut proto_client = proto_vector::Client::new(HyperSvc {
@@ -97,6 +106,7 @@ impl VectorService {
             protocol,
             endpoint,
             auth,
+            headers,
         })
     }
 
@@ -135,10 +145,13 @@ impl Service<VectorRequest> for VectorService {
 
             // Inject auth token on every call so a rotated token is always used.
             if let Some(auth) = &service.auth {
-                let bearer = auth.bearer_token().map_err(|message| {
-                    VectorSinkError::AuthTokenUnavailable { message }
-                })?;
+                let bearer = auth
+                    .bearer_token()
+                    .map_err(|message| VectorSinkError::AuthTokenUnavailable { message })?;
                 request.metadata_mut().insert("authorization", bearer);
+            }
+            for (key, value) in service.headers.iter() {
+                request.metadata_mut().insert(key.clone(), value.clone());
             }
 
             service

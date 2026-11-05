@@ -55,7 +55,9 @@ mod retry_logic_tests {
     fn permission_denied_is_not_retriable() {
         // Source returns PermissionDenied when events fail auth → must not retry.
         let err = VectorSinkError::Request {
-            source: tonic::Status::permission_denied("partial auth failure: accepted=0 unauthenticated=5 forbidden=0"),
+            source: tonic::Status::permission_denied(
+                "partial auth failure: accepted=0 unauthenticated=5 forbidden=0",
+            ),
         };
         assert!(!logic().is_retriable_error(&err));
     }
@@ -285,8 +287,8 @@ mod tests {
 
     // -- JWT auth integration tests --
 
-    fn make_ok_responder() -> impl Fn() -> hyper::Response<hyper::Body> + Clone + Send + Sync + 'static
-    {
+    fn make_ok_responder(
+    ) -> impl Fn() -> hyper::Response<hyper::Body> + Clone + Send + Sync + 'static {
         move || {
             hyper::Response::builder()
                 .header("grpc-status", "0")
@@ -296,7 +298,10 @@ mod tests {
         }
     }
 
-    async fn run_auth_sink(config: VectorConfig, in_addr: std::net::SocketAddr) -> http::request::Parts {
+    async fn run_auth_sink(
+        config: VectorConfig,
+        in_addr: std::net::SocketAddr,
+    ) -> http::request::Parts {
         let cx = SinkContext::default();
         let (sink, _) = config.build(cx).await.expect("sink should build");
 
@@ -330,13 +335,58 @@ mod tests {
         let parts = run_auth_sink(config, in_addr).await;
 
         assert_eq!(
-            parts.headers.get("authorization").unwrap().to_str().unwrap(),
+            parts
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer my-auth-token"
         );
         assert!(
             parts.headers.get("x-site-id").is_none(),
             "x-site-id header must not be sent"
         );
+    }
+
+    #[tokio::test]
+    async fn sends_configured_headers() {
+        let in_addr = next_addr();
+        let config: VectorConfig = toml::from_str(&format!(
+            r#"
+            address = "http://{}/"
+            [headers]
+            x-observo-host = "data-plane-14477-dev-95d856588-4f4x5"
+            "#,
+            in_addr
+        ))
+        .unwrap();
+
+        let parts = run_auth_sink(config, in_addr).await;
+
+        assert_eq!(
+            parts
+                .headers
+                .get("x-observo-host")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "data-plane-14477-dev-95d856588-4f4x5"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_header_name() {
+        let config: VectorConfig = toml::from_str(
+            r#"
+            address = "http://localhost:6000/"
+            [headers]
+            "not a header" = "x"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.build(SinkContext::default()).await.is_err());
     }
 
     #[tokio::test]
@@ -361,7 +411,12 @@ mod tests {
         let parts = run_auth_sink(config, in_addr).await;
 
         assert_eq!(
-            parts.headers.get("authorization").unwrap().to_str().unwrap(),
+            parts
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer file-token"
         );
     }
@@ -433,8 +488,9 @@ mod tests {
         .unwrap();
 
         use crate::sinks::util::AuthTokenConfig;
-        config.auth.as_mut().unwrap().token =
-            AuthTokenConfig::Inline { value: "bad\0token".to_string().into() };
+        config.auth.as_mut().unwrap().token = AuthTokenConfig::Inline {
+            value: "bad\0token".to_string().into(),
+        };
 
         let cx = SinkContext::default();
         assert!(
