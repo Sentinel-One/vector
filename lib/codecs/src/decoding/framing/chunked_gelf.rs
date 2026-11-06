@@ -36,21 +36,13 @@ pub struct ChunkedGelfDecoderConfig {
 impl ChunkedGelfDecoderConfig {
     /// Build a `ChunkedGelfDecoderFactory` from this configuration.
     pub fn build(&self, compression_limits: CompressionLimits) -> ChunkedGelfDecoderFactory {
-        let decoder = ChunkedGelfDecoder::new(
+        ChunkedGelfDecoderFactory::new(
             self.chunked_gelf.timeout_secs,
             self.chunked_gelf.pending_messages_limit,
             self.chunked_gelf.max_length,
             self.chunked_gelf.decompression,
             compression_limits,
-        );
-        ChunkedGelfDecoderFactory {
-            compression_limits: decoder.compression_limits,
-            decompression_config: decoder.decompression_config,
-            state: decoder.state,
-            timeout: decoder.timeout,
-            pending_messages_limit: decoder.pending_messages_limit,
-            max_length: decoder.max_length,
-        }
+        )
     }
 }
 
@@ -67,6 +59,23 @@ pub struct ChunkedGelfDecoderFactory {
 }
 
 impl ChunkedGelfDecoderFactory {
+    fn new(
+        timeout_secs: f64,
+        pending_messages_limit: Option<usize>,
+        max_length: Option<usize>,
+        decompression_config: ChunkedGelfDecompressionConfig,
+        compression_limits: CompressionLimits,
+    ) -> Self {
+        Self {
+            compression_limits,
+            decompression_config,
+            state: Arc::new(Mutex::new(HashMap::new())),
+            timeout: Duration::from_secs_f64(timeout_secs),
+            pending_messages_limit,
+            max_length,
+        }
+    }
+
     /// Builds a `ChunkedGelfDecoder` sharing this factory's partially received messages.
     pub fn build(&self) -> ChunkedGelfDecoder {
         ChunkedGelfDecoder {
@@ -354,15 +363,14 @@ impl ChunkedGelfDecoder {
         decompression_config: ChunkedGelfDecompressionConfig,
         compression_limits: CompressionLimits,
     ) -> Self {
-        Self {
-            bytes_decoder: BytesDecoder::new(),
-            decompression_config,
-            compression_limits,
-            state: Arc::new(Mutex::new(HashMap::new())),
-            timeout: Duration::from_secs_f64(timeout_secs),
+        ChunkedGelfDecoderFactory::new(
+            timeout_secs,
             pending_messages_limit,
             max_length,
-        }
+            decompression_config,
+            compression_limits,
+        )
+        .build()
     }
 
     /// Decode a GELF chunk

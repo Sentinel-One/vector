@@ -28,9 +28,9 @@ pub struct ProtobufDeserializerConfig {
 impl ProtobufDeserializerConfig {
     /// Build a `ProtobufDeserializerFactory` from this configuration, loading the descriptor once.
     pub fn build(&self) -> vector_common::Result<ProtobufDeserializerFactory> {
-        ProtobufDeserializer::try_from(self).map(|deserializer| ProtobufDeserializerFactory {
-            message_descriptor: deserializer.message_descriptor,
-        })
+        vrl::protobuf::get_message_descriptor(&self.protobuf.desc_file, &self.protobuf.message_type)
+            .map(|message_descriptor| ProtobufDeserializerFactory { message_descriptor })
+            .map_err(Into::into)
     }
 
     /// Return the type of event build by this deserializer.
@@ -134,11 +134,7 @@ impl Deserializer for ProtobufDeserializer {
 impl TryFrom<&ProtobufDeserializerConfig> for ProtobufDeserializer {
     type Error = vector_common::Error;
     fn try_from(config: &ProtobufDeserializerConfig) -> vector_common::Result<Self> {
-        let message_descriptor = vrl::protobuf::get_message_descriptor(
-            &config.protobuf.desc_file,
-            &config.protobuf.message_type,
-        )?;
-        Ok(Self::new(message_descriptor))
+        config.build().map(|factory| factory.build())
     }
 }
 

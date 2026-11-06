@@ -254,7 +254,6 @@ impl HttpClientConfig {
 }
 
 /// Captures the configuration options required to decode the incoming requests into events.
-#[derive(Clone)]
 pub struct HttpClientContextBuilder {
     pub decoder: DecoderFactory<Stream>,
     pub log_namespace: LogNamespace,

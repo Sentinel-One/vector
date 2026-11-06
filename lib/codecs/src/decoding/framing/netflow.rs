@@ -57,18 +57,17 @@ pub struct NetflowDecoderConfig {
     pub netflow_decoder_options: NetflowDecoderOptions,
 }
 
+/// 64KB is a common maximum for UDP packets.
+const DEFAULT_MAX_LENGTH: usize = 65536;
+
 impl NetflowDecoderConfig {
     /// Build a `NetflowDecoderFactory` from this configuration.
     pub fn build(&self) -> NetflowDecoderFactory {
-        let decoder = if let Some(max_length) = self.netflow_decoder_options.max_length {
-            NetflowDecoder::new_with_max_length(max_length)
-        } else {
-            NetflowDecoder::new()
-        };
-        NetflowDecoderFactory {
-            max_length: decoder.max_length,
-            parsers: decoder.parsers,
-        }
+        NetflowDecoderFactory::new(
+            self.netflow_decoder_options
+                .max_length
+                .unwrap_or(DEFAULT_MAX_LENGTH),
+        )
     }
 }
 
@@ -81,6 +80,13 @@ pub struct NetflowDecoderFactory {
 }
 
 impl NetflowDecoderFactory {
+    fn new(max_length: usize) -> Self {
+        Self {
+            max_length,
+            parsers: Arc::new(Mutex::new(IndexMap::new())),
+        }
+    }
+
     /// Builds a decoder scoped to `peer`'s templates, or to a fresh connection when there is no peer.
     pub(crate) fn build(&self, peer: Option<IpAddr>) -> NetflowDecoder {
         NetflowDecoder {
@@ -146,18 +152,14 @@ impl NetflowDecoder {
     /// Any frames longer than `max_length` bytes will be discarded entirely.
     pub fn new() -> Self {
         // Use a more reasonable default maximum length
-        Self::new_with_max_length(65536) // 64KB is a common maximum for UDP packets
+        Self::new_with_max_length(DEFAULT_MAX_LENGTH)
     }
 
     /// Creates a `NetflowDecoderDecoder` with a maximum frame length limit.
     ///
     /// Any frames longer than `max_length` bytes will be discarded entirely.
     pub fn new_with_max_length(max_length: usize) -> Self {
-        Self {
-            max_length,
-            parsers: Arc::new(Mutex::new(IndexMap::new())),
-            scope: ExporterScope::Connection(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)),
-        }
+        NetflowDecoderFactory::new(max_length).build(None)
     }
 
     /// Returns the maximum frame length when decoding.
