@@ -266,7 +266,7 @@ async fn test_spawn_reader_thread() {
 
     let buf = Cursor::new("hello world\nhello rocket 🚀");
     let reader = BufReader::new(buf);
-    let decoder = test_decoder();
+    let decoder = test_decoder().build();
     let (sender, mut receiver) = channel(1024);
 
     spawn_reader_thread(reader, decoder, STDOUT, sender);
@@ -437,7 +437,7 @@ async fn test_graceful_shutdown() {
     }
 }
 
-fn test_decoder() -> Decoder {
+fn test_decoder() -> DecoderFactory<Stream> {
     DecodingConfig::new(
         NewlineDelimitedDecoderConfig::new().into(),
         BytesDeserializerConfig::new().into(),
@@ -504,4 +504,40 @@ async fn scheduled_exec_stops_decoding_at_line_over_ops_limits_frame_cap() {
         })
         .collect();
     assert_eq!(messages, vec!["a".repeat(100)]);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn scheduled_exec_runs_do_not_share_json_paths_state() {
+    use crate::test_util::bleed_probe;
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let config = ExecConfig {
+        scheduled: Some(ScheduledConfig {
+            exec_interval_secs: 1,
+        }),
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "if [ -e \"$1\" ]; then echo '{}'; else touch \"$1\"; echo '{}'; fi",
+                bleed_probe::COMPLETE,
+                bleed_probe::HALF_OPEN,
+            ),
+            "sh".to_owned(),
+            marker_dir.path().join("ran").display().to_string(),
+        ],
+        decoding: bleed_probe::decoding(),
+        ..standard_scheduled_test_config()
+    };
+    let (tx, rx) = SourceSender::new_test();
+
+    let source = config
+        .build(SourceContext::new_test(tx, None))
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(2500), source).await;
+
+    let events = crate::test_util::collect_ready(rx).await;
+    bleed_probe::assert_every_event_is_complete_document(&events);
 }

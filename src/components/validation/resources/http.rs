@@ -297,7 +297,7 @@ impl HttpResourceOutputContext<'_> {
         // via an output sender. We accept/collect events until we're told to shutdown.
 
         // First, we'll build and spawn our HTTP server.
-        let decoder = self.codec.into_decoder(self.log_namespace)?;
+        let decoder = self.codec.into_decoder_factory(self.log_namespace)?;
 
         // Note that we currently don't differentiate which events should and shouldn't be rejected-
         // we reject all events in this server if any are marked for rejection.
@@ -319,7 +319,7 @@ impl HttpResourceOutputContext<'_> {
             self.runner_metrics,
             move |request, output_runner_metrics| {
                 let output_tx = output_tx.clone();
-                let mut decoder = decoder.clone();
+                let mut decoder = decoder.build();
 
                 async move {
                     match hyper::body::to_bytes(request.into_body()).await {

@@ -12,7 +12,7 @@ use tokio_util::codec::Decoder as _;
 
 use crate::sources::util::http_client;
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{Decoder, DecoderFactory, DecodingConfig, Stream},
     config::{SourceConfig, SourceContext},
     http::Auth,
     serde::{default_decoding, default_framing_message_based},
@@ -195,7 +195,7 @@ impl SourceConfig for HttpClientConfig {
         let content_type = self.decoding.content_type(&self.framing).to_string();
 
         // the only specific context needed is the codec decoding
-        let context = HttpClientContext {
+        let context = HttpClientContextBuilder {
             decoder,
             log_namespace,
         };
@@ -255,6 +255,12 @@ impl HttpClientConfig {
 
 /// Captures the configuration options required to decode the incoming requests into events.
 #[derive(Clone)]
+pub struct HttpClientContextBuilder {
+    pub decoder: DecoderFactory<Stream>,
+    pub log_namespace: LogNamespace,
+}
+
+/// Decodes the response to one request into events.
 pub struct HttpClientContext {
     pub decoder: Decoder,
     pub log_namespace: LogNamespace,
@@ -284,12 +290,15 @@ impl HttpClientContext {
     }
 }
 
-impl HttpClientBuilder for HttpClientContext {
+impl HttpClientBuilder for HttpClientContextBuilder {
     type Context = HttpClientContext;
 
     /// No additional context from request data is needed from this particular client.
     fn build(&self, _uri: &Uri) -> Self::Context {
-        self.clone()
+        HttpClientContext {
+            decoder: self.decoder.build(),
+            log_namespace: self.log_namespace,
+        }
     }
 }
 

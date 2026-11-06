@@ -19,21 +19,25 @@ mod syslog;
 mod vrl;
 
 use ::bytes::Bytes;
-pub use avro::{AvroDeserializer, AvroDeserializerConfig, AvroDeserializerOptions};
+pub use avro::{
+    AvroDeserializer, AvroDeserializerConfig, AvroDeserializerFactory, AvroDeserializerOptions,
+};
 pub use self::csv::{CsvDeserializer, CsvDeserializerConfig, CsvDeserializerOptions};
-use dyn_clone::DynClone;
 pub use gelf::{GelfDeserializer, GelfDeserializerConfig, GelfDeserializerOptions};
 pub use influxdb::{InfluxdbDeserializer, InfluxdbDeserializerConfig};
 pub use json::{JsonDeserializer, JsonDeserializerConfig, JsonDeserializerOptions};
 pub use json_paths::{
-    JsonPathDeserializer, JsonPathDeserializerConfig, JsonPathDeserializerOptions,
-    PathOperation, PathOperationConfig,
+    JsonPathDeserializer, JsonPathDeserializerConfig, JsonPathDeserializerFactory,
+    JsonPathDeserializerOptions, PathOperation, PathOperationConfig,
 };
 pub use native::{NativeDeserializer, NativeDeserializerConfig};
 pub use native_json::{
     NativeJsonDeserializer, NativeJsonDeserializerConfig, NativeJsonDeserializerOptions,
 };
-pub use protobuf::{ProtobufDeserializer, ProtobufDeserializerConfig, ProtobufDeserializerOptions};
+pub use protobuf::{
+    ProtobufDeserializer, ProtobufDeserializerConfig, ProtobufDeserializerFactory,
+    ProtobufDeserializerOptions,
+};
 use smallvec::SmallVec;
 pub use strata::{StrataDeserializer, StrataDeserializerConfig, StrataDeserializerOptions};
 #[cfg(feature = "syslog")]
@@ -43,10 +47,12 @@ use vector_core::event::Event;
 
 pub use self::bytes::{BytesDeserializer, BytesDeserializerConfig};
 
-pub use self::vrl::{VrlDeserializer, VrlDeserializerConfig, VrlDeserializerOptions};
+pub use self::vrl::{
+    VrlDeserializer, VrlDeserializerConfig, VrlDeserializerFactory, VrlDeserializerOptions,
+};
 
 /// Parse structured events from bytes.
-pub trait Deserializer: DynClone + Send + Sync {
+pub trait Deserializer: Send {
     /// Parses structured events from bytes.
     ///
     /// It returns a `SmallVec` rather than an `Event` directly, since one byte
@@ -54,13 +60,11 @@ pub trait Deserializer: DynClone + Send + Sync {
     /// array. However, we optimize the most common case of emitting one event
     /// by not requiring heap allocations for it.
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>>;
 }
-
-dyn_clone::clone_trait_object!(Deserializer);
 
 /// A `Box` containing a `Deserializer`.
 pub type BoxedDeserializer = Box<dyn Deserializer>;

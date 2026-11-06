@@ -52,7 +52,7 @@ use vector_lib::{
 use vrl::value::{kind::Collection, Kind, ObjectMap};
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{Decoder, DecoderFactory, DecodingConfig, Stream as StreamScope},
     config::{
         log_schema, LogSchema, SourceAcknowledgementsConfig, SourceConfig, SourceContext,
         SourceOutput,
@@ -432,7 +432,7 @@ async fn kafka_source(
     config: KafkaSourceConfig,
     consumer: StreamConsumer<KafkaSourceContext>,
     callback_rx: UnboundedReceiver<KafkaCallback>,
-    decoder: Decoder,
+    decoder: DecoderFactory<StreamScope>,
     out: SourceSender,
     shutdown: ShutdownSignal,
     eof: bool,
@@ -509,7 +509,7 @@ async fn kafka_source(
 /// coordination task should exit when this state is reached.
 struct ConsumerStateInner<S> {
     config: KafkaSourceConfig,
-    decoder: Decoder,
+    decoder: DecoderFactory<StreamScope>,
     out: SourceSender,
     log_namespace: LogNamespace,
     consumer_state: S,
@@ -570,7 +570,7 @@ impl<C> ConsumerStateInner<C> {
 impl ConsumerStateInner<Consuming> {
     const fn new(
         config: KafkaSourceConfig,
-        decoder: Decoder,
+        decoder: DecoderFactory<StreamScope>,
         out: SourceSender,
         log_namespace: LogNamespace,
         span: Span,
@@ -661,7 +661,7 @@ impl ConsumerStateInner<Consuming> {
                                 topic: msg.topic(),
                                 partition: msg.partition(),
                             });
-                            parse_message(msg, decoder.clone(), &keys, &mut out, acknowledgements, &finalizer, log_namespace).await;
+                            parse_message(msg, decoder.build(), &keys, &mut out, acknowledgements, &finalizer, log_namespace).await;
                         }
                     },
                 )

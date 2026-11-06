@@ -10,7 +10,7 @@ use vector_lib::configurable::configurable_component;
 use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path};
 
 use crate::{
-    codecs::Decoder,
+    codecs::{Decoder, DecoderFactory, Stream},
     event::Event,
     serde::default_decoding,
     sources::util::net::{SocketListenAddr, TcpNullAcker, TcpSource},
@@ -192,12 +192,16 @@ impl TcpConfig {
 #[derive(Clone)]
 pub struct RawTcpSource {
     config: TcpConfig,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     log_namespace: LogNamespace,
 }
 
 impl RawTcpSource {
-    pub const fn new(config: TcpConfig, decoder: Decoder, log_namespace: LogNamespace) -> Self {
+    pub const fn new(
+        config: TcpConfig,
+        decoder: DecoderFactory<Stream>,
+        log_namespace: LogNamespace,
+    ) -> Self {
         Self {
             config,
             decoder,
@@ -214,7 +218,7 @@ impl TcpSource for RawTcpSource {
 
     fn decoder(&self) -> Self::Decoder {
         // Called once per accepted connection.
-        self.decoder.clone_for_connection()
+        self.decoder.build()
     }
 
     fn handle_events(&self, events: &mut [Event], host: std::net::SocketAddr) {

@@ -27,7 +27,7 @@ use super::{
     Compression,
 };
 use crate::{
-    codecs::Decoder,
+    codecs::{DecoderFactory, Stream},
     config::log_schema,
     event::{BatchStatus, Event},
     internal_events::{
@@ -46,7 +46,7 @@ pub(super) struct Context {
     /// Limits to decompress records under, from this component's context.
     pub(super) compression_limits: CompressionLimits,
     pub(super) store_access_key: bool,
-    pub(super) decoder: Decoder,
+    pub(super) decoder: DecoderFactory<Stream>,
     pub(super) acknowledgements: bool,
     pub(super) bytes_received: Registered<BytesReceived>,
     pub(super) out: SourceSender,
@@ -71,7 +71,7 @@ pub(super) async fn firehose(
             .map_err(reject::custom)?;
         context.bytes_received.emit(ByteSize(bytes.len()));
 
-        let mut stream = FramedRead::new(bytes.as_ref(), context.decoder.clone());
+        let mut stream = FramedRead::new(bytes.as_ref(), context.decoder.build());
         loop {
             match stream.next().await {
                 Some(Ok((mut events, _byte_size))) => {

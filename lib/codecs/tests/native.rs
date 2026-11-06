@@ -37,7 +37,7 @@ fn roundtrip_current_native_json_fixtures() {
     roundtrip_fixtures(
         "json",
         "",
-        &NativeJsonDeserializerConfig::default().build(),
+        &mut NativeJsonDeserializerConfig::default().build(),
         &mut NativeJsonSerializerConfig.build(),
         false,
     );
@@ -48,7 +48,7 @@ fn roundtrip_current_native_proto_fixtures() {
     roundtrip_fixtures(
         "proto",
         "",
-        &NativeDeserializerConfig.build(),
+        &mut NativeDeserializerConfig.build(),
         &mut NativeSerializerConfig.build(),
         false,
     );
@@ -61,7 +61,7 @@ fn reserialize_pre_v24_native_json_fixtures() {
     roundtrip_fixtures(
         "json",
         "pre-v24",
-        &NativeJsonDeserializerConfig::default().build(),
+        &mut NativeJsonDeserializerConfig::default().build(),
         &mut NativeJsonSerializerConfig.build(),
         true,
     );
@@ -72,7 +72,7 @@ fn reserialize_pre_v24_native_proto_fixtures() {
     roundtrip_fixtures(
         "proto",
         "pre-v24",
-        &NativeDeserializerConfig.build(),
+        &mut NativeDeserializerConfig.build(),
         &mut NativeSerializerConfig.build(),
         true,
     );
@@ -86,7 +86,7 @@ fn reserialize_pre_v26_native_proto_fixtures() {
     roundtrip_fixtures(
         "proto",
         "pre-v26",
-        &NativeDeserializerConfig.build(),
+        &mut NativeDeserializerConfig.build(),
         &mut NativeSerializerConfig.build(),
         true,
     );
@@ -99,7 +99,7 @@ fn reserialize_pre_v34_native_json_fixtures() {
     roundtrip_fixtures(
         "json",
         "pre-v34",
-        &NativeJsonDeserializerConfig::default().build(),
+        &mut NativeJsonDeserializerConfig::default().build(),
         &mut NativeJsonSerializerConfig.build(),
         true,
     );
@@ -110,7 +110,7 @@ fn reserialize_pre_v34_native_proto_fixtures() {
     roundtrip_fixtures(
         "proto",
         "pre-v34",
-        &NativeDeserializerConfig.build(),
+        &mut NativeDeserializerConfig.build(),
         &mut NativeSerializerConfig.build(),
         true,
     );
@@ -123,7 +123,7 @@ fn reserialize_pre_v41_native_json_fixtures() {
     roundtrip_fixtures(
         "json",
         "pre-v41",
-        &NativeJsonDeserializerConfig::default().build(),
+        &mut NativeJsonDeserializerConfig::default().build(),
         &mut NativeJsonSerializerConfig.build(),
         true,
     );
@@ -134,7 +134,7 @@ fn reserialize_pre_v41_native_proto_fixtures() {
     roundtrip_fixtures(
         "proto",
         "pre-v41",
-        &NativeDeserializerConfig.build(),
+        &mut NativeDeserializerConfig.build(),
         &mut NativeSerializerConfig.build(),
         true,
     );
@@ -178,7 +178,7 @@ fn pre_v24_native_decoding_matches() {
 fn rebuild_json_fixtures() {
     rebuild_fixtures(
         "json",
-        &NativeJsonDeserializerConfig::default().build(),
+        &mut NativeJsonDeserializerConfig::default().build(),
         &mut NativeJsonSerializerConfig.build(),
     );
 }
@@ -191,7 +191,7 @@ fn rebuild_json_fixtures() {
 fn rebuild_proto_fixtures() {
     rebuild_fixtures(
         "proto",
-        &NativeDeserializerConfig.build(),
+        &mut NativeDeserializerConfig.build(),
         &mut NativeSerializerConfig.build(),
     );
 }
@@ -212,16 +212,16 @@ fn fixtures_match(suffix: &str) {
 /// This test ensures we can load the serialized binaries binary and that they match across
 /// protocols.
 fn decoding_matches(suffix: &str) {
-    let json_deserializer = NativeJsonDeserializerConfig::default().build();
-    let proto_deserializer = NativeDeserializerConfig.build();
+    let mut json_deserializer = NativeJsonDeserializerConfig::default().build();
+    let mut proto_deserializer = NativeDeserializerConfig.build();
 
     let json_entries = list_fixtures("json", suffix);
     let proto_entries = list_fixtures("proto", suffix);
 
     for (json_path, proto_path) in json_entries.into_iter().zip(proto_entries.into_iter()) {
-        let (_, json_event) = load_deserialize(&json_path, &json_deserializer);
+        let (_, json_event) = load_deserialize(&json_path, &mut json_deserializer);
 
-        let (_, proto_event) = load_deserialize(&proto_path, &proto_deserializer);
+        let (_, proto_event) = load_deserialize(&proto_path, &mut proto_deserializer);
 
         // Ensure that the json version and proto versions were parsed into equivalent
         // native representations
@@ -256,7 +256,7 @@ fn fixtures_path(proto: &str, suffix: &str) -> PathBuf {
 fn roundtrip_fixtures(
     proto: &str,
     suffix: &str,
-    deserializer: &dyn Deserializer,
+    deserializer: &mut dyn Deserializer,
     serializer: &mut dyn Serializer,
     reserialize: bool,
 ) {
@@ -284,7 +284,7 @@ fn roundtrip_fixtures(
     }
 }
 
-fn load_deserialize(path: &Path, deserializer: &dyn Deserializer) -> (Bytes, Event) {
+fn load_deserialize(path: &Path, deserializer: &mut dyn Deserializer) -> (Bytes, Event) {
     let mut file = File::open(path).unwrap();
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
@@ -298,7 +298,11 @@ fn load_deserialize(path: &Path, deserializer: &dyn Deserializer) -> (Bytes, Eve
     (buf, events.pop().unwrap())
 }
 
-fn rebuild_fixtures(proto: &str, deserializer: &dyn Deserializer, serializer: &mut dyn Serializer) {
+fn rebuild_fixtures(
+    proto: &str,
+    deserializer: &mut dyn Deserializer,
+    serializer: &mut dyn Serializer,
+) {
     for path in list_fixtures(proto, "") {
         let (_, event) = load_deserialize(&path, deserializer);
 

@@ -313,7 +313,7 @@ mod tests {
         event::{Event, EventStatus},
         log_event,
         test_util::{
-            collect_n,
+            bleed_probe, collect_n,
             components::{assert_source_compliance, SOURCE_TAGS},
             next_addr, wait_for_tcp,
         },
@@ -743,6 +743,51 @@ mod tests {
                 assert_eq!(400, res.status().as_u16());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn aws_kinesis_firehose_records_do_not_share_json_paths_state() {
+        let (sender, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let address = next_addr();
+        tokio::spawn(async move {
+            AwsKinesisFirehoseConfig {
+                address,
+                tls: None,
+                access_key: None,
+                access_keys: None,
+                store_access_key: false,
+                record_compression: Compression::None,
+                framing: default_framing_message_based(),
+                decoding: bleed_probe::decoding(),
+                acknowledgements: true.into(),
+                log_namespace: None,
+                keepalive: Default::default(),
+                permit_origin: None,
+            }
+            .build(SourceContext::new_test(sender, None))
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+        });
+        wait_for_tcp(address).await;
+
+        let res = spawn_send(
+            address,
+            Utc::now(),
+            vec![
+                bleed_probe::HALF_OPEN.as_bytes(),
+                bleed_probe::COMPLETE.as_bytes(),
+            ],
+            None,
+            false,
+            Compression::None,
+        )
+        .await;
+        let events = bleed_probe::within_deadline(collect_n(rx, 1)).await;
+
+        bleed_probe::assert_only_complete_document(&events);
+        assert_eq!(200, res.await.unwrap().unwrap().status().as_u16());
     }
 
     #[tokio::test]

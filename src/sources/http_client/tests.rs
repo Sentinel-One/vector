@@ -15,6 +15,7 @@ use vector_lib::event::Event;
 
 use super::HttpClientConfig;
 use crate::test_util::{
+    bleed_probe,
     components::{run_and_assert_source_compliance, HTTP_PULL_SOURCE_TAGS},
     next_addr, test_generate_config, wait_for_tcp,
 };
@@ -127,6 +128,41 @@ async fn json_decoding_newline_delimited() {
         log_namespace: None,
     })
     .await;
+}
+
+#[tokio::test]
+async fn http_client_requests_do_not_share_json_paths_state() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let in_addr = next_addr();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let endpoint =
+        warp::path!("endpoint").map(move || match requests.fetch_add(1, Ordering::SeqCst) {
+            0 => bleed_probe::HALF_OPEN,
+            _ => bleed_probe::COMPLETE,
+        });
+    tokio::spawn(warp::serve(endpoint).run(in_addr));
+    wait_for_tcp(in_addr).await;
+
+    let events = run_compliance(HttpClientConfig {
+        endpoint: format!("http://{in_addr}/endpoint"),
+        interval: INTERVAL,
+        timeout: TIMEOUT,
+        query: HashMap::new(),
+        decoding: bleed_probe::decoding(),
+        framing: default_framing_message_based(),
+        headers: HashMap::new(),
+        method: HttpMethod::Get,
+        tls: None,
+        auth: None,
+        log_namespace: None,
+    })
+    .await;
+
+    bleed_probe::assert_every_event_is_complete_document(&events);
 }
 
 /// JSON with character delimiter should be decoded and HTTP header set to application/json.

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::decoding::format::Deserializer;
 use crate::BytesDeserializerConfig;
 use bytes::Bytes;
@@ -46,8 +48,8 @@ pub struct VrlDeserializerOptions {
 }
 
 impl VrlDeserializerConfig {
-    /// Build the `VrlDeserializer` from this configuration.
-    pub fn build(&self) -> vector_common::Result<VrlDeserializer> {
+    /// Build a `VrlDeserializerFactory` from this configuration, compiling the program once.
+    pub fn build(&self) -> vector_common::Result<VrlDeserializerFactory> {
         let state = TypeState {
             local: Default::default(),
             external: ExternalEnv::default(),
@@ -59,8 +61,8 @@ impl VrlDeserializerConfig {
         let fns = fns.into_iter().chain(obvrl::all()).collect::<Vec<_>>();
 
         match compile_vrl(&self.vrl.source, &fns, &state, CompileConfig::default()) {
-            Ok(result) => Ok(VrlDeserializer {
-                program: result.program,
+            Ok(result) => Ok(VrlDeserializerFactory {
+                program: Arc::new(result.program),
                 timezone: self.vrl.timezone.unwrap_or(TimeZone::Local),
             }),
             Err(diagnostics) => Err(Formatter::new(&self.vrl.source, diagnostics)
@@ -87,11 +89,30 @@ impl VrlDeserializerConfig {
     }
 }
 
-/// Deserializer that builds `Event`s from a byte frame containing logs compatible with VRL.
+/// Builds `VrlDeserializer`s that share one compiled program.
 #[derive(Debug, Clone)]
-pub struct VrlDeserializer {
-    program: Program,
+pub struct VrlDeserializerFactory {
+    program: Arc<Program>,
     timezone: TimeZone,
+}
+
+impl VrlDeserializerFactory {
+    /// Builds a `VrlDeserializer` running the compiled program.
+    pub fn build(&self) -> VrlDeserializer {
+        VrlDeserializer {
+            program: Arc::clone(&self.program),
+            timezone: self.timezone,
+            runtime: Runtime::default(),
+        }
+    }
+}
+
+/// Deserializer that builds `Event`s from a byte frame containing logs compatible with VRL.
+#[derive(Debug)]
+pub struct VrlDeserializer {
+    program: Arc<Program>,
+    timezone: TimeZone,
+    runtime: Runtime,
 }
 
 fn parse_bytes(bytes: Bytes, log_namespace: LogNamespace) -> Event {
@@ -102,7 +123,7 @@ fn parse_bytes(bytes: Bytes, log_namespace: LogNamespace) -> Event {
 
 impl Deserializer for VrlDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -116,13 +137,16 @@ impl Deserializer for VrlDeserializer {
 
 impl VrlDeserializer {
     fn run_vrl(
-        &self,
+        &mut self,
         event: Event,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
-        let mut runtime = Runtime::default();
         let mut target = VrlTarget::new(event, self.program.info(), true);
-        match runtime.resolve(&mut target, &self.program, &self.timezone) {
+        let resolved = self
+            .runtime
+            .resolve(&mut target, &self.program, &self.timezone);
+        self.runtime.clear();
+        match resolved {
             Ok(_) => match target.into_events(log_namespace) {
                 TargetEvents::One(event) => Ok(smallvec![event]),
                 TargetEvents::Logs(events_iter) => Ok(SmallVec::from_iter(events_iter)),
@@ -151,6 +175,7 @@ mod tests {
         }
         .build()
         .expect("Failed to build VrlDeserializer")
+        .build()
     }
 
     #[test]
@@ -163,7 +188,7 @@ mod tests {
             "#
         );
 
-        let decoder = make_decoder(source);
+        let mut decoder = make_decoder(source);
 
         let log_bytes = Bytes::from(r#"{ "message": "Hello VRL" }"#);
         let result = decoder.parse(log_bytes, LogNamespace::Vector).unwrap();
@@ -191,7 +216,7 @@ mod tests {
         "#
         );
 
-        let decoder = make_decoder(source);
+        let mut decoder = make_decoder(source);
 
         let log_bytes = Bytes::from("some bytes");
         let result = decoder.parse(log_bytes, LogNamespace::Vector).unwrap();
@@ -217,7 +242,7 @@ mod tests {
         "#
         );
 
-        let decoder = make_decoder(source);
+        let mut decoder = make_decoder(source);
 
         let log_bytes = Bytes::from("some bytes");
         let result = decoder.parse(log_bytes, LogNamespace::Vector).unwrap();
@@ -232,7 +257,7 @@ mod tests {
     #[test]
     fn test_multiple_events() {
         let source = indoc!(". = [0,1,2]");
-        let decoder = make_decoder(source);
+        let mut decoder = make_decoder(source);
         let log_bytes = Bytes::from("some bytes");
         let result = decoder.parse(log_bytes, LogNamespace::Vector).unwrap();
         assert_eq!(result.len(), 3);
@@ -255,7 +280,7 @@ mod tests {
             "#
         );
 
-        let decoder = make_decoder(source);
+        let mut decoder = make_decoder(source);
 
         // Syslog input
         let syslog_bytes = Bytes::from(
@@ -335,12 +360,67 @@ mod tests {
 
     #[test]
     fn test_abort() {
-        let decoder = make_decoder("abort");
+        let mut decoder = make_decoder("abort");
         let log_bytes = Bytes::from(r#"{ "message": "Hello VRL" }"#);
         let error = decoder
             .parse(log_bytes, LogNamespace::Vector)
             .unwrap_err()
             .to_string();
         assert!(error.contains("aborted"));
+    }
+
+    #[test]
+    fn consecutive_parses_on_one_deserializer_match_parses_on_fresh_deserializers() {
+        let source = r#"
+            parts = split(string!(.), ",")
+            . = { "leftover": join!(parts, "+") }
+        "#;
+        let mut reused = make_decoder(source);
+        let leftover = |events: SmallVec<[Event; 1]>| events[0].as_log()["leftover"].clone();
+
+        let frames = ["a,b,c", "d", "e,f"];
+        let reused_results: Vec<Value> = frames
+            .iter()
+            .map(|frame| {
+                leftover(
+                    reused
+                        .parse(Bytes::from(*frame), LogNamespace::Vector)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let fresh_results: Vec<Value> = frames
+            .iter()
+            .map(|frame| {
+                leftover(
+                    make_decoder(source)
+                        .parse(Bytes::from(*frame), LogNamespace::Vector)
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        assert_eq!(reused_results, fresh_results);
+    }
+
+    #[test]
+    fn runtime_is_cleared_after_a_parse_that_succeeds_and_after_one_that_aborts() {
+        let mut decoder = make_decoder(
+            r#"
+                parts = split(string!(.), ",")
+                if length(parts) > 1 { abort }
+                . = { "count": length(parts) }
+            "#,
+        );
+
+        decoder
+            .parse(Bytes::from("a"), LogNamespace::Vector)
+            .unwrap();
+        assert!(decoder.runtime.is_empty());
+
+        decoder
+            .parse(Bytes::from("a,b"), LogNamespace::Vector)
+            .unwrap_err();
+        assert!(decoder.runtime.is_empty());
     }
 }

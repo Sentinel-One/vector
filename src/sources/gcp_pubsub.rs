@@ -29,7 +29,7 @@ use vrl::value::{kind::Collection, Kind};
 
 use crate::APP_INFO;
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream as StreamScope},
     config::{DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput},
     event::{BatchNotifier, BatchStatus, Event, MaybeAsLogMut, Value},
     gcp::{GcpAuthConfig, GcpAuthenticator, Scope, PUBSUB_URL},
@@ -372,7 +372,7 @@ struct PubsubSource {
     auth: GcpAuthenticator,
     token_generator: watch::Receiver<()>,
     subscription: String,
-    decoder: Decoder,
+    decoder: DecoderFactory<StreamScope>,
     acknowledgements: bool,
     ack_deadline_secs: Duration,
     shutdown: ShutdownSignal,
@@ -666,7 +666,7 @@ impl PubsubSource {
         );
         let log_namespace = self.log_namespace;
         util::decode_message(
-            self.decoder.clone(),
+            self.decoder.build(),
             "gcp_pubsub",
             &message.data,
             message.publish_time.map(|dt| {

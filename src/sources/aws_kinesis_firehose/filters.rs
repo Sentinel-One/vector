@@ -14,7 +14,7 @@ use super::{
     Compression,
 };
 use crate::{
-    codecs,
+    codecs::{DecoderFactory, Stream},
     internal_events::{AwsKinesisFirehoseRequestError, AwsKinesisFirehoseRequestReceived},
     sources::util::{
         decompression::{CappedDecoder, CompressionLimits},
@@ -29,7 +29,7 @@ pub fn firehose(
     access_keys: Vec<String>,
     store_access_key: bool,
     record_compression: Compression,
-    decoder: codecs::Decoder,
+    decoder: DecoderFactory<Stream>,
     acknowledgements: bool,
     out: SourceSender,
     log_namespace: LogNamespace,

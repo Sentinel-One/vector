@@ -9,7 +9,7 @@ use vector_lib::lookup::{lookup_v2::OptionalValuePath, path};
 use vector_lib::shutdown::ShutdownSignal;
 
 use crate::{
-    codecs::Decoder,
+    codecs::{DecoderFactory, Stream},
     event::Event,
     serde::default_decoding,
     sources::{
@@ -119,7 +119,7 @@ fn handle_events(
 
 pub(super) fn unix_datagram(
     config: UnixConfig,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     shutdown: ShutdownSignal,
     out: SourceSender,
     log_namespace: LogNamespace,
@@ -149,7 +149,7 @@ pub(super) fn unix_datagram(
 
 pub(super) fn unix_stream(
     config: UnixConfig,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     shutdown: ShutdownSignal,
     out: SourceSender,
     log_namespace: LogNamespace,
@@ -157,7 +157,7 @@ pub(super) fn unix_stream(
     build_unix_stream_source(
         config.path,
         config.socket_file_mode,
-        decoder,
+        move || decoder.build(),
         move |events, received_from| {
             handle_events(events, &config.host_key, received_from, log_namespace)
         },

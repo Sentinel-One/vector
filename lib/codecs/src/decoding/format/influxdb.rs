@@ -110,7 +110,7 @@ impl InfluxdbDeserializer {
 
 impl Deserializer for InfluxdbDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         _log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn deserialize_success() {
-        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        let mut deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
         let now = chrono::Utc::now();
         let now_timestamp_nanos = now.timestamp_nanos_opt().unwrap();
         let buffer = Bytes::from(format!(
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn deserialize_error() {
-        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        let mut deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
         let buffer = Bytes::from("some invalid string");
         assert!(deser.parse(buffer, LogNamespace::default()).is_err());
     }
@@ -273,7 +273,7 @@ mod tests {
     /// materialised.
     #[test]
     fn line_over_the_tag_entry_limit_is_rejected() {
-        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        let mut deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         // 400 x 400 = 160,000 entries, above the 100,000 ceiling.
         let error = deser
@@ -290,7 +290,7 @@ mod tests {
     /// The ceiling must sit far above real line protocol: a wide-but-ordinary line still decodes.
     #[test]
     fn ordinary_wide_line_is_still_accepted() {
-        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        let mut deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         // 20 tags x 200 fields = 4,000 entries — generous for real telemetry, well under the cap.
         let events = deser
@@ -306,7 +306,7 @@ mod tests {
     /// drift into rejecting legitimate traffic.
     #[test]
     fn line_just_under_the_limit_is_accepted() {
-        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        let mut deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         // 100 x 1000 = 100,000 entries, exactly the ceiling.
         let events = deser
@@ -322,10 +322,10 @@ mod tests {
         // 20 x 200 = 4,000 entries — accepted at the default, refused once the cap is lowered.
         let line = line_with(20, 200);
 
-        let default = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        let mut default = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
         assert!(default.parse(line.clone(), LogNamespace::default()).is_ok());
 
-        let strict = InfluxdbDeserializer::new(true, 1_000);
+        let mut strict = InfluxdbDeserializer::new(true, 1_000);
         let error = strict
             .parse(line, LogNamespace::default())
             .expect_err("the configured ceiling must be the one enforced");
@@ -359,7 +359,7 @@ mod tests {
     /// the complete tag set — the hoist must not have changed what is emitted.
     #[test]
     fn every_metric_carries_the_full_tag_set() {
-        let deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
+        let mut deser = InfluxdbDeserializer::new(true, default_max_tag_entries_per_line());
 
         let events = deser
             .parse(

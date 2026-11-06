@@ -26,9 +26,11 @@ pub struct ProtobufDeserializerConfig {
 }
 
 impl ProtobufDeserializerConfig {
-    /// Build the `ProtobufDeserializer` from this configuration.
-    pub fn build(&self) -> vector_common::Result<ProtobufDeserializer> {
-        ProtobufDeserializer::try_from(self)
+    /// Build a `ProtobufDeserializerFactory` from this configuration, loading the descriptor once.
+    pub fn build(&self) -> vector_common::Result<ProtobufDeserializerFactory> {
+        ProtobufDeserializer::try_from(self).map(|deserializer| ProtobufDeserializerFactory {
+            message_descriptor: deserializer.message_descriptor,
+        })
     }
 
     /// Return the type of event build by this deserializer.
@@ -73,6 +75,19 @@ pub struct ProtobufDeserializerOptions {
     pub message_type: String,
 }
 
+/// Builds `ProtobufDeserializer`s that share one loaded message descriptor.
+#[derive(Debug, Clone)]
+pub struct ProtobufDeserializerFactory {
+    message_descriptor: MessageDescriptor,
+}
+
+impl ProtobufDeserializerFactory {
+    /// Builds a `ProtobufDeserializer` for the loaded message descriptor.
+    pub fn build(&self) -> ProtobufDeserializer {
+        ProtobufDeserializer::new(self.message_descriptor.clone())
+    }
+}
+
 /// Deserializer that builds `Event`s from a byte frame containing protobuf.
 #[derive(Debug, Clone)]
 pub struct ProtobufDeserializer {
@@ -88,7 +103,7 @@ impl ProtobufDeserializer {
 
 impl Deserializer for ProtobufDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -150,7 +165,7 @@ mod tests {
         let input = Bytes::from(protobuf_bin_message);
         let message_descriptor =
             vrl::protobuf::get_message_descriptor(&protobuf_desc_path, message_type).unwrap();
-        let deserializer = ProtobufDeserializer::new(message_descriptor);
+        let mut deserializer = ProtobufDeserializer::new(message_descriptor);
 
         for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
             let events = deserializer.parse(input.clone(), namespace).unwrap();
@@ -250,7 +265,7 @@ mod tests {
             "test_protobuf.Person",
         )
         .unwrap();
-        let deserializer = ProtobufDeserializer::new(message_descriptor);
+        let mut deserializer = ProtobufDeserializer::new(message_descriptor);
 
         for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
             assert!(deserializer.parse(input.clone(), namespace).is_err());

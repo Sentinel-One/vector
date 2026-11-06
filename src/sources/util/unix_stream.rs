@@ -31,13 +31,13 @@ use crate::{
 };
 
 /// Returns a `Source` object corresponding to a Unix domain stream socket.
-/// Passing in different functions for `decoder` and `handle_events` can allow
+/// Passing in different functions for `build_decoder` and `handle_events` can allow
 /// for different source-specific logic (such as decoding syslog messages in the
 /// syslog source).
 pub fn build_unix_stream_source(
     listen_path: PathBuf,
     socket_file_mode: Option<u32>,
-    decoder: Decoder,
+    build_decoder: impl Fn() -> Decoder + Send + Sync + 'static,
     handle_events: impl Fn(&mut [Event], Option<Bytes>) + Clone + Send + Sync + 'static,
     shutdown: ShutdownSignal,
     out: SourceSender,
@@ -98,10 +98,9 @@ pub fn build_unix_stream_source(
                     bytes_received.emit(ByteSize(byte_size));
                 })
                 .allow_read_until(shutdown.clone().map(|_| ()));
-            // `clone_for_connection` gives Netflow framing (if configured) a fresh, unshared
-            // template scope per accepted connection; a no-op for every other framer. Without it,
-            // every connection built from the same configured decoder would share one scope.
-            let mut stream = FramedRead::new(stream, decoder.clone_for_connection());
+            // One decoder per accepted connection: each connection gets its own decoder state and,
+            // for Netflow framing, a fresh template scope rather than one shared by every connection.
+            let mut stream = FramedRead::new(stream, build_decoder());
 
             let connection_open = connection_open.clone();
             let mut out = out.clone();

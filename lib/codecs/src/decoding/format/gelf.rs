@@ -219,7 +219,7 @@ struct GelfMessage {
 
 impl Deserializer for GelfDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         _log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -248,7 +248,7 @@ mod tests {
         input: &serde_json::Value,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
         let config = GelfDeserializerConfig::default();
-        let deserializer = config.build();
+        let mut deserializer = config.build();
         let buffer = Bytes::from(serde_json::to_vec(&input).unwrap());
         deserializer.parse(buffer, LogNamespace::Legacy)
     }
