@@ -1,15 +1,13 @@
-use crate::decoding::{format::Deserializer as _, BoxedFramingError, Deserializer, Error, Framer};
-use crate::internal_events::codecs::{DecoderDeserializeError, DecoderFramingError};
+use crate::decoding::{BoxedFramingError, Deserializer, Error, Framer};
+use crate::internal_events::codecs::DecoderFramingError;
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
-use std::net::IpAddr;
 use vector_core::config::LogNamespace;
 use vector_core::emit;
 use vector_core::event::Event;
 
 /// A decoder that can decode structured events from a byte stream / byte
 /// messages.
-#[derive(Clone)]
 pub struct Decoder {
     /// The framer being used.
     pub framer: Framer,
@@ -18,6 +16,23 @@ pub struct Decoder {
     /// The `log_namespace` being used.
     pub log_namespace: LogNamespace,
 }
+
+// A decoder owns the mutable state of exactly one unit of input (a connection, a message, a
+// datagram) and is driven through `&mut self`.
+// - Not `Clone`: a clone would have to decide whether that state is copied, reset or shared, and
+//   that decision used to hide in each codec's `Clone` impl. It now lives in one place,
+//   `DecoderFactory`: build a new decoder per unit, and hold anything meant to be shared across
+//   units in the factory.
+// - Not `Sync`: nothing should read a decoder from two threads at once, and requiring `Sync` is what
+//   pushed stateful codecs into `Arc<Mutex<..>>` interior mutability. The `Boxed` variants hold
+//   trait objects without a `Sync` bound, which is what keeps `Framer` and `Deserializer` `!Sync`.
+// - `Send`: a decoder moves into the tokio task that owns its unit.
+static_assertions::assert_impl_all!(Decoder: Send);
+static_assertions::assert_not_impl_any!(Decoder: Clone, Sync);
+static_assertions::assert_impl_all!(Framer: Send);
+static_assertions::assert_not_impl_any!(Framer: Clone, Sync);
+static_assertions::assert_impl_all!(Deserializer: Send);
+static_assertions::assert_not_impl_any!(Deserializer: Clone, Sync);
 
 impl Decoder {
     /// Creates a new `Decoder` with the specified `Framer` to produce byte
@@ -35,39 +50,6 @@ impl Decoder {
     pub const fn with_log_namespace(mut self, log_namespace: LogNamespace) -> Self {
         self.log_namespace = log_namespace;
         self
-    }
-
-    /// Clones this decoder for a newly accepted connection.
-    ///
-    /// If the configured framer is [`Framer::Netflow`], gives the clone a fresh template scope so
-    /// it does not share a template cache with any other connection built from the same configured
-    /// decoder — see `NetflowDecoder::set_new_connection_scope`. A no-op for every other framer.
-    ///
-    /// Call this (not a plain `.clone()`) once per accepted stream connection, whether TCP or Unix
-    /// domain.
-    #[must_use]
-    pub fn clone_for_connection(&self) -> Self {
-        let mut decoder = self.clone();
-        if let Framer::Netflow(netflow) = &mut decoder.framer {
-            netflow.set_new_connection_scope();
-        }
-        decoder
-    }
-
-    /// Clones this decoder for a single datagram received from `peer`.
-    ///
-    /// If the configured framer is [`Framer::Netflow`], scopes the clone's template cache to that
-    /// peer so one exporter cannot redefine the template ids another exporter's records decode
-    /// against — see `NetflowDecoder::set_datagram_peer`. A no-op for every other framer.
-    ///
-    /// Call this (not a plain `.clone()`) once per received UDP datagram.
-    #[must_use]
-    pub fn clone_for_datagram_peer(&self, peer: IpAddr) -> Self {
-        let mut decoder = self.clone();
-        if let Framer::Netflow(netflow) = &mut decoder.framer {
-            netflow.set_datagram_peer(peer);
-        }
-        decoder
     }
 
     /// Handles the framing result and parses it into a structured event, if
@@ -89,17 +71,11 @@ impl Decoder {
     }
 
     /// Parses a frame using the included deserializer, and handles any errors by logging.
-    pub fn deserializer_parse(&self, frame: Bytes) -> Result<(SmallVec<[Event; 1]>, usize), Error> {
-        let byte_size = frame.len();
-
-        // Parse structured events from the byte frame.
-        self.deserializer
-            .parse(frame, self.log_namespace)
-            .map(|events| (events, byte_size))
-            .map_err(|error| {
-                emit!(DecoderDeserializeError { error: &error });
-                Error::ParsingError(error)
-            })
+    pub fn deserializer_parse(
+        &mut self,
+        frame: Bytes,
+    ) -> Result<(SmallVec<[Event; 1]>, usize), Error> {
+        self.deserializer.parse_frame(frame, self.log_namespace)
     }
 }
 
@@ -122,14 +98,20 @@ impl tokio_util::codec::Decoder for Decoder {
 mod tests {
     use super::Decoder;
     use crate::{
-        decoding::{Deserializer, Framer},
+        decoding::{
+            format::{PathOperation, PathOperationConfig},
+            Deserializer, Framer, JsonPathDeserializer, JsonPathDeserializerOptions,
+        },
         JsonDeserializer, NewlineDelimitedDecoder, StreamDecodingError,
     };
     use vector_common::limits::FramingLimits;
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use futures::{stream, StreamExt};
-    use tokio_util::{codec::FramedRead, io::StreamReader};
-    use vrl::value::Value;
+    use tokio_util::{
+        codec::{Decoder as _, FramedRead},
+        io::StreamReader,
+    };
+    use vrl::{owned_value_path, value::Value};
 
     #[tokio::test]
     async fn framed_read_recover_from_error() {
@@ -157,5 +139,31 @@ mod tests {
         let next = stream.next().await.unwrap();
         let event = next.unwrap().0.pop().unwrap().into_log();
         assert_eq!(event.get("bar").unwrap(), &Value::from(2));
+    }
+
+    fn json_paths_decoder() -> Decoder {
+        let config = PathOperationConfig::new(owned_value_path!(), PathOperation::Identity.into());
+        Decoder::new(
+            Framer::NewlineDelimited(NewlineDelimitedDecoder::new(
+                FramingLimits::default().max_frame_length_bytes,
+            )),
+            Deserializer::JsonPaths(JsonPathDeserializer::new(
+                &config,
+                &JsonPathDeserializerOptions::default(),
+            )),
+        )
+    }
+
+    #[test]
+    fn json_paths_decoder_completes_a_document_split_across_its_own_frames() {
+        let mut decoder = json_paths_decoder();
+
+        let mut buf = BytesMut::from("{\"b\":\n");
+        assert_eq!(decoder.decode(&mut buf).unwrap().unwrap().0.len(), 0);
+
+        let mut buf = BytesMut::from("2}\n");
+        let (events, _) = decoder.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].as_log().get("data.b"), Some(&Value::from(2)));
     }
 }

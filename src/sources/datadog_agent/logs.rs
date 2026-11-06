@@ -105,7 +105,7 @@ pub(crate) fn decode_log_body(
         ddtags,
     } in messages
     {
-        let mut decoder = source.decoder.clone();
+        let mut decoder = source.decoder.build();
         let mut buffer = BytesMut::new();
         buffer.put(message);
 

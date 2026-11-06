@@ -23,7 +23,7 @@ use vector_lib::{
 use vrl::value::Kind;
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{Decoder, DecodingConfig, Stream},
     config::{log_schema, SourceOutput},
     internal_events::{EventsReceived, FileDescriptorReadError, StreamClosedError},
     shutdown::ShutdownSignal,
@@ -65,7 +65,8 @@ pub trait FileDescriptorConfig: NamedComponent {
             .framing()
             .unwrap_or_else(|| decoding.default_stream_framing());
         let decoder = DecodingConfig::new(framing, decoding, log_namespace, ops_limits)
-            .build()?;
+            .build::<Stream>()?
+            .build();
 
         let (sender, receiver) = mpsc::channel(1024);
 

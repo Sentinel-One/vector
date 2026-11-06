@@ -10,7 +10,7 @@ use vector_core::event::{MetricKind, MetricValue};
 fn assert_roundtrip(
     input_event: Event,
     serializer: &mut dyn Serializer<Error = vector_common::Error>,
-    deserializer: &dyn Deserializer,
+    deserializer: &mut dyn Deserializer,
     expected_json_value: serde_json::Value,
 ) {
     let mut bytes_mut = BytesMut::new();
@@ -80,7 +80,7 @@ fn histogram_metric_roundtrip() {
     assert_roundtrip(
         histogram_event,
         &mut NativeJsonSerializerConfig.build(),
-        &NativeJsonDeserializerConfig::default().build(),
+        &mut NativeJsonDeserializerConfig::default().build(),
         expected_json_value,
     )
 }

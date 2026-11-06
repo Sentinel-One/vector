@@ -29,7 +29,7 @@ use vector_lib::internal_event::{
     ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
 };
 
-use crate::codecs::Decoder;
+use crate::codecs::{Decoder, DecoderFactory, Stream as StreamScope};
 use crate::event::{Event, LogEvent};
 use crate::{
     aws::{auth::AwsAuthentication, create_client, AwsTimeout},
@@ -264,7 +264,7 @@ pub struct State {
     visibility_timeout_secs: i32,
     delete_message: bool,
     delete_failed_message: bool,
-    decoder: Decoder,
+    decoder: DecoderFactory<StreamScope>,
     pub message_format: SqsMessageFormat,
 }
 
@@ -307,7 +307,7 @@ impl Ingestor {
         config: Config,
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
-        decoder: Decoder,
+        decoder: DecoderFactory<StreamScope>,
         auth: AwsAuthentication,
         endpoint: Option<String>,
         proxy: ProxyConfig,
@@ -673,8 +673,13 @@ impl IngestorProcess {
         let mut read_error = None;
         let bytes_received = self.bytes_received.clone();
         let events_received = self.events_received.clone();
+        let Decoder {
+            framer,
+            mut deserializer,
+            log_namespace: decoder_log_namespace,
+        } = self.state.decoder.build();
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
-            FramedRead::new(object_reader, self.state.decoder.framer.clone())
+            FramedRead::new(object_reader, framer)
                 .map(|res| {
                     res.inspect(|bytes| {
                         bytes_received.emit(ByteSize(bytes.len()));
@@ -700,10 +705,10 @@ impl IngestorProcess {
         };
 
         let mut stream = lines.flat_map(|line| {
-            let events = match self.state.decoder.deserializer_parse(line) {
+            let events = match deserializer.parse_frame(line, decoder_log_namespace) {
                 Ok((events, _events_size)) => events,
                 Err(_error) => {
-                    // Error is handled by `codecs::Decoder`, no further handling
+                    // Error is handled by `Deserializer::parse_frame`, no further handling
                     // is needed here.
                     SmallVec::new()
                 }

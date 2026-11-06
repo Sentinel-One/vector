@@ -269,7 +269,7 @@ pub struct SyslogDeserializer {
 
 impl Deserializer for SyslogDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -489,7 +489,7 @@ mod tests {
 
         let input =
             Bytes::from("<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - MSG");
-        let deserializer = SyslogDeserializer::default();
+        let mut deserializer = SyslogDeserializer::default();
 
         let events = deserializer.parse(input, LogNamespace::Legacy).unwrap();
         assert_eq!(events.len(), 1);
@@ -508,7 +508,7 @@ mod tests {
 
         let input =
             Bytes::from("<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - MSG");
-        let deserializer = SyslogDeserializer::default();
+        let mut deserializer = SyslogDeserializer::default();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 1);

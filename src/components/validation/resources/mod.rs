@@ -18,7 +18,9 @@ use vector_lib::{
 };
 use vector_lib::{config::DataType, event::Event};
 
-use crate::codecs::{Decoder, DecodingConfig, Encoder, EncodingConfig, EncodingConfigWithFraming};
+use crate::codecs::{
+    DecoderFactory, DecodingConfig, Encoder, EncodingConfig, EncodingConfigWithFraming, Stream,
+};
 
 pub use self::event::{encode_test_event, TestEvent};
 pub use self::http::HttpResourceConfig;
@@ -107,24 +109,32 @@ impl ResourceCodec {
     ///
     /// The decoder is generated as an inverse to the input codec: if an encoding configuration was
     /// given, we generate a decoder that satisfies that encoding configuration, and vice versa.
-    pub fn into_decoder(&self, log_namespace: LogNamespace) -> vector_lib::Result<Decoder> {
-        let (framer, deserializer) = match self {
-            Self::Decoding(config) => return config.build(),
-            Self::Encoding(config) => (
-                encoder_framing_to_decoding_framer(config.config().default_stream_framing()),
-                serializer_config_to_deserializer(config.config())?,
-            ),
+    pub fn into_decoder_factory(
+        &self,
+        log_namespace: LogNamespace,
+    ) -> vector_lib::Result<DecoderFactory<Stream>> {
+        match self {
+            Self::Decoding(config) => config.build(),
+            Self::Encoding(config) => DecodingConfig::new(
+                encoder_framing_to_decoding_framing(config.config().default_stream_framing()),
+                serializer_config_to_deserializer_config(config.config()),
+                log_namespace,
+                OperationalLimits::default(),
+            )
+            .build(),
             Self::EncodingWithFraming(config) => {
                 let (maybe_framing, serializer) = config.config();
-                let framing = maybe_framing.clone().unwrap_or(FramingConfig::Bytes);
-                (
-                    encoder_framing_to_decoding_framer(framing),
-                    serializer_config_to_deserializer(serializer)?,
+                DecodingConfig::new(
+                    encoder_framing_to_decoding_framing(
+                        maybe_framing.clone().unwrap_or(FramingConfig::Bytes),
+                    ),
+                    serializer_config_to_deserializer_config(serializer),
+                    log_namespace,
+                    OperationalLimits::default(),
                 )
+                .build()
             }
-        };
-
-        Ok(Decoder::new(framer, deserializer).with_log_namespace(log_namespace))
+        }
     }
 }
 
@@ -216,10 +226,8 @@ fn decoder_framing_to_encoding_framer(framing: &decoding::FramingConfig) -> enco
     framing_config.build()
 }
 
-fn serializer_config_to_deserializer(
-    config: &SerializerConfig,
-) -> vector_lib::Result<decoding::Deserializer> {
-    let deserializer_config = match config {
+fn serializer_config_to_deserializer_config(config: &SerializerConfig) -> DeserializerConfig {
+    match config {
         SerializerConfig::Avro { .. } => todo!(),
         SerializerConfig::Cef { .. } => todo!(),
         SerializerConfig::Csv { .. } => todo!(),
@@ -238,13 +246,13 @@ fn serializer_config_to_deserializer(
         }
         SerializerConfig::RawMessage | SerializerConfig::Text(_) => DeserializerConfig::Bytes,
         SerializerConfig::Syslog(_) => todo!(),
-    };
-
-    deserializer_config.build()
+    }
 }
 
-fn encoder_framing_to_decoding_framer(framing: encoding::FramingConfig) -> decoding::Framer {
-    let framing_config = match framing {
+fn encoder_framing_to_decoding_framing(
+    framing: encoding::FramingConfig,
+) -> decoding::FramingConfig {
+    match framing {
         encoding::FramingConfig::Bytes => decoding::FramingConfig::Bytes(Default::default()),
         encoding::FramingConfig::CharacterDelimited(config) => {
             decoding::FramingConfig::CharacterDelimited(decoding::CharacterDelimitedDecoderConfig {
@@ -265,9 +273,7 @@ fn encoder_framing_to_decoding_framer(framing: encoding::FramingConfig) -> decod
         encoding::FramingConfig::OctetCounted => {
             decoding::FramingConfig::OctetCounting(Default::default())
         },
-    };
-
-    framing_config.build(OperationalLimits::default())
+    }
 }
 
 /// Direction that the resource is operating in.

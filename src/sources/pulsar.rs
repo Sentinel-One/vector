@@ -33,7 +33,7 @@ use vector_lib::{
 use vrl::{owned_value_path, path, value::Kind};
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream},
     config::{SourceConfig, SourceContext},
     event::BatchNotifier,
     internal_events::{
@@ -301,7 +301,7 @@ impl PulsarSourceConfig {
 
 async fn pulsar_source(
     mut consumer: Consumer<String, TokioExecutor>,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     mut shutdown: ShutdownSignal,
     mut out: SourceSender,
     acknowledgements: bool,
@@ -345,7 +345,7 @@ async fn pulsar_source(
 #[allow(clippy::too_many_arguments)]
 async fn parse_message(
     msg: Message<String>,
-    decoder: &Decoder,
+    decoder: &DecoderFactory<Stream>,
     finalizer: &Option<OrderedFinalizer<FinalizerEntry>>,
     out: &mut SourceSender,
     consumer: &mut Consumer<String, TokioExecutor>,
@@ -359,7 +359,7 @@ async fn parse_message(
     let topic = msg.topic.clone();
     let producer_name = msg.payload.metadata.producer_name.clone();
 
-    let mut stream = FramedRead::new(msg.payload.data.as_ref(), decoder.clone());
+    let mut stream = FramedRead::new(msg.payload.data.as_ref(), decoder.build());
     let stream = async_stream::stream! {
         while let Some(next) = stream.next().await {
             match next {

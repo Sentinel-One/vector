@@ -270,7 +270,7 @@ impl StatsdDeserializer {
 
 impl decoding::format::Deserializer for StatsdDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         _log_namespace: LogNamespace,
     ) -> crate::Result<SmallVec<[Event; 1]>> {

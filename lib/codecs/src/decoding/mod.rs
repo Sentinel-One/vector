@@ -5,7 +5,8 @@ mod error;
 pub mod format;
 pub mod framing;
 
-use crate::decoding::format::{VrlDeserializer, VrlDeserializerConfig};
+use crate::decoding::format::{VrlDeserializer, VrlDeserializerConfig, VrlDeserializerFactory};
+use crate::internal_events::codecs::DecoderDeserializeError;
 use bytes::{Bytes, BytesMut};
 pub use error::StreamDecodingError;
 pub use format::{
@@ -13,34 +14,39 @@ pub use format::{
     CsvDeserializerConfig, CsvDeserializerOptions, GelfDeserializer, GelfDeserializerConfig,
     GelfDeserializerOptions, InfluxdbDeserializer, InfluxdbDeserializerConfig, JsonDeserializer,
     JsonDeserializerConfig, JsonDeserializerOptions, JsonPathDeserializer,
-    JsonPathDeserializerConfig, JsonPathDeserializerOptions, NativeDeserializer,
-    NativeDeserializerConfig, NativeJsonDeserializer, NativeJsonDeserializerConfig,
-    NativeJsonDeserializerOptions, ProtobufDeserializer, ProtobufDeserializerConfig,
-    ProtobufDeserializerOptions, StrataDeserializer, StrataDeserializerConfig,
-    StrataDeserializerOptions,
+    JsonPathDeserializerConfig, JsonPathDeserializerFactory, JsonPathDeserializerOptions,
+    NativeDeserializer, NativeDeserializerConfig, NativeJsonDeserializer,
+    NativeJsonDeserializerConfig, NativeJsonDeserializerOptions, ProtobufDeserializer,
+    ProtobufDeserializerConfig, ProtobufDeserializerFactory, ProtobufDeserializerOptions,
+    StrataDeserializer, StrataDeserializerConfig, StrataDeserializerOptions,
 };
 #[cfg(feature = "syslog")]
 pub use format::{SyslogDeserializer, SyslogDeserializerConfig, SyslogDeserializerOptions};
 pub use framing::{
     BoxedFramer, BoxedFramingError, BytesDecoder, BytesDecoderConfig, CharacterDelimitedDecoder,
     CharacterDelimitedDecoderConfig, CharacterDelimitedDecoderOptions, ChunkedGelfDecoder,
-    ChunkedGelfDecoderConfig, ChunkedGelfDecoderOptions, FramingError, LengthDelimitedDecoder,
-    LengthDelimitedDecoderConfig, NetflowDecoder, NetflowDecoderConfig, NetflowDecoderOptions,
-    NewlineDelimitedDecoder, NewlineDelimitedDecoderConfig, NewlineDelimitedDecoderOptions,
-    OctetCountingDecoder, OctetCountingDecoderConfig, OctetCountingDecoderOptions,
-    StrataSnappyDecoder, StrataSnappyDecoderConfig, StrataSnappyDecoderOptions,
+    ChunkedGelfDecoderConfig, ChunkedGelfDecoderFactory, ChunkedGelfDecoderOptions, FramingError,
+    LengthDelimitedDecoder, LengthDelimitedDecoderConfig, NetflowDecoder, NetflowDecoderConfig,
+    NetflowDecoderFactory, NetflowDecoderOptions, NewlineDelimitedDecoder,
+    NewlineDelimitedDecoderConfig, NewlineDelimitedDecoderOptions, OctetCountingDecoder,
+    OctetCountingDecoderConfig, OctetCountingDecoderOptions, StrataSnappyDecoder,
+    StrataSnappyDecoderConfig, StrataSnappyDecoderOptions,
 };
 use smallvec::SmallVec;
 use std::fmt::Debug;
-use vector_common::limits::OperationalLimits;
+use std::net::IpAddr;
+use vector_common::limits::{FramingLimits, OperationalLimits};
 use vector_config::configurable_component;
 use vector_core::{
     config::{DataType, LogNamespace},
+    emit,
     event::Event,
     schema,
 };
 
-use self::format::{AvroDeserializer, AvroDeserializerConfig, AvroDeserializerOptions};
+use self::format::{
+    AvroDeserializer, AvroDeserializerConfig, AvroDeserializerFactory, AvroDeserializerOptions,
+};
 
 /// An error that occurred while decoding structured events from a byte stream /
 /// byte messages.
@@ -175,40 +181,86 @@ impl From<StrataSnappyDecoderConfig> for FramingConfig {
 }
 
 impl FramingConfig {
-    /// Build the `Framer` from this configuration.
+    /// Build the `FramerFactory` from this configuration.
     ///
     /// `limits` is only consumed by framers that decompress (currently `chunked_gelf`) or buffer
     /// an incomplete frame (`character_delimited`, `newline_delimited`); it is threaded through
     /// here so no framer has to reach for process state.
-    pub fn build(&self, limits: OperationalLimits) -> Framer {
+    pub fn build(&self, limits: OperationalLimits) -> FramerFactory {
         match self {
-            FramingConfig::Bytes(config) => Framer::Bytes(config.build()),
+            FramingConfig::Bytes(config) => FramerFactory::Bytes(config.clone()),
             FramingConfig::CharacterDelimited(config) => {
-                Framer::CharacterDelimited(config.build(limits.framing))
+                FramerFactory::CharacterDelimited(config.clone(), limits.framing)
             }
-            FramingConfig::LengthDelimited(config) => Framer::LengthDelimited(config.build()),
-            FramingConfig::Netflow { netflow_decoder } => Framer::Netflow(
+            FramingConfig::LengthDelimited(config) => {
+                FramerFactory::LengthDelimited(config.clone())
+            }
+            FramingConfig::Netflow { netflow_decoder } => FramerFactory::Netflow(
                 NetflowDecoderConfig {
                     netflow_decoder_options: netflow_decoder.clone(),
                 }
                 .build(),
             ),
             FramingConfig::NewlineDelimited(config) => {
-                Framer::NewlineDelimited(config.build(limits.framing))
+                FramerFactory::NewlineDelimited(config.clone(), limits.framing)
             }
             FramingConfig::OctetCounting(config) => {
-                Framer::OctetCounting(config.build(limits.framing))
+                FramerFactory::OctetCounting(config.clone(), limits.framing)
             }
             FramingConfig::ChunkedGelf(config) => {
-                Framer::ChunkedGelf(config.build(limits.compression))
+                FramerFactory::ChunkedGelf(config.build(limits.compression))
             }
-            FramingConfig::StrataSnappy(config) => Framer::StrataSnappy(config.build()),
+            FramingConfig::StrataSnappy(config) => FramerFactory::StrataSnappy(config.clone()),
+        }
+    }
+}
+
+/// Builds a `Framer` for each unit of input (a connection, a datagram, a message), holding any state
+/// that every unit built from the same configuration must share.
+#[derive(Debug, Clone)]
+pub enum FramerFactory {
+    /// Builds a `BytesDecoder`.
+    Bytes(BytesDecoderConfig),
+    /// Builds a `CharacterDelimitedDecoder`.
+    CharacterDelimited(CharacterDelimitedDecoderConfig, FramingLimits),
+    /// Builds a `LengthDelimitedDecoder`.
+    LengthDelimited(LengthDelimitedDecoderConfig),
+    /// Builds a `NewlineDelimitedDecoder`.
+    NewlineDelimited(NewlineDelimitedDecoderConfig, FramingLimits),
+    /// Builds an `OctetCountingDecoder`.
+    OctetCounting(OctetCountingDecoderConfig, FramingLimits),
+    /// Builds a `NetflowDecoder` sharing the factory's template cache.
+    Netflow(NetflowDecoderFactory),
+    /// Builds a `ChunkedGelfDecoder` sharing the factory's partially received messages.
+    ChunkedGelf(ChunkedGelfDecoderFactory),
+    /// Builds a `StrataSnappyDecoder`.
+    StrataSnappy(StrataSnappyDecoderConfig),
+}
+
+impl FramerFactory {
+    /// Builds a `Framer` for a unit received from `peer`, or for a unit with no peer identity.
+    pub(crate) fn build(&self, peer: Option<IpAddr>) -> Framer {
+        match self {
+            FramerFactory::Bytes(config) => Framer::Bytes(config.build()),
+            FramerFactory::CharacterDelimited(config, limits) => {
+                Framer::CharacterDelimited(config.build(*limits))
+            }
+            FramerFactory::LengthDelimited(config) => Framer::LengthDelimited(config.build()),
+            FramerFactory::NewlineDelimited(config, limits) => {
+                Framer::NewlineDelimited(config.build(*limits))
+            }
+            FramerFactory::OctetCounting(config, limits) => {
+                Framer::OctetCounting(config.build(*limits))
+            }
+            FramerFactory::Netflow(factory) => Framer::Netflow(factory.build(peer)),
+            FramerFactory::ChunkedGelf(factory) => Framer::ChunkedGelf(factory.build()),
+            FramerFactory::StrataSnappy(config) => Framer::StrataSnappy(config.build()),
         }
     }
 }
 
 /// Produce byte frames from a byte stream / byte message.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Framer {
     /// Uses a `BytesDecoder` for framing.
     Bytes(BytesDecoder),
@@ -421,31 +473,32 @@ impl From<StrataDeserializerConfig> for DeserializerConfig {
 }
 
 impl DeserializerConfig {
-    /// Build the `Deserializer` from this configuration.
-    pub fn build(&self) -> vector_common::Result<Deserializer> {
-        match self {
-            DeserializerConfig::Avro { avro } => Ok(Deserializer::Avro(
+    /// Build the `DeserializerFactory` from this configuration, doing all fallible and expensive
+    /// preparation (compiling VRL, loading descriptors, parsing schemas) once.
+    pub fn build(&self) -> vector_common::Result<DeserializerFactory> {
+        Ok(match self {
+            DeserializerConfig::Avro { avro } => DeserializerFactory::Avro(
                 AvroDeserializerConfig {
                     avro_options: avro.clone(),
                 }
                 .build(),
-            )),
-            DeserializerConfig::Bytes => Ok(Deserializer::Bytes(BytesDeserializerConfig.build())),
-            DeserializerConfig::Csv(config) => Ok(Deserializer::Csv(config.build())),
-            DeserializerConfig::Json(config) => Ok(Deserializer::Json(config.build())),
-            DeserializerConfig::Protobuf(config) => Ok(Deserializer::Protobuf(config.build()?)),
+            ),
+            DeserializerConfig::Bytes => DeserializerFactory::Bytes,
+            DeserializerConfig::Csv(config) => DeserializerFactory::Csv(config.clone()),
+            DeserializerConfig::Json(config) => DeserializerFactory::Json(config.clone()),
+            DeserializerConfig::Protobuf(config) => DeserializerFactory::Protobuf(config.build()?),
             #[cfg(feature = "syslog")]
-            DeserializerConfig::Syslog(config) => Ok(Deserializer::Syslog(config.build())),
-            DeserializerConfig::Native => {
-                Ok(Deserializer::Native(NativeDeserializerConfig.build()))
+            DeserializerConfig::Syslog(config) => DeserializerFactory::Syslog(config.clone()),
+            DeserializerConfig::Native => DeserializerFactory::Native,
+            DeserializerConfig::NativeJson(config) => {
+                DeserializerFactory::NativeJson(config.clone())
             }
-            DeserializerConfig::NativeJson(config) => Ok(Deserializer::NativeJson(config.build())),
-            DeserializerConfig::Gelf(config) => Ok(Deserializer::Gelf(config.build())),
-            DeserializerConfig::Influxdb(config) => Ok(Deserializer::Influxdb(config.build())),
-            DeserializerConfig::JsonPaths(config) => Ok(Deserializer::JsonPaths(config.build())),
-            DeserializerConfig::Vrl(config) => Ok(Deserializer::Vrl(config.build()?)),
-            DeserializerConfig::Strata(config) => Ok(Deserializer::Strata(config.build())),
-        }
+            DeserializerConfig::Gelf(config) => DeserializerFactory::Gelf(config.clone()),
+            DeserializerConfig::Influxdb(config) => DeserializerFactory::Influxdb(config.clone()),
+            DeserializerConfig::JsonPaths(config) => DeserializerFactory::JsonPaths(config.build()),
+            DeserializerConfig::Vrl(config) => DeserializerFactory::Vrl(config.build()?),
+            DeserializerConfig::Strata(config) => DeserializerFactory::Strata(config.clone()),
+        })
     }
 
     /// Return an appropriate default framer for the given deserializer
@@ -568,8 +621,62 @@ impl DeserializerConfig {
     }
 }
 
+/// Builds a `Deserializer` for each unit of input, holding the parts that are expensive to prepare
+/// (a compiled VRL program, a loaded protobuf descriptor, a parsed Avro schema) once.
+#[derive(Debug, Clone)]
+pub enum DeserializerFactory {
+    /// Builds an `AvroDeserializer`.
+    Avro(AvroDeserializerFactory),
+    /// Builds a `BytesDeserializer`.
+    Bytes,
+    /// Builds a `CsvDeserializer`.
+    Csv(CsvDeserializerConfig),
+    /// Builds a `JsonDeserializer`.
+    Json(JsonDeserializerConfig),
+    /// Builds a `JsonPathDeserializer`.
+    JsonPaths(JsonPathDeserializerFactory),
+    /// Builds a `ProtobufDeserializer`.
+    Protobuf(ProtobufDeserializerFactory),
+    /// Builds a `SyslogDeserializer`.
+    #[cfg(feature = "syslog")]
+    Syslog(SyslogDeserializerConfig),
+    /// Builds a `NativeDeserializer`.
+    Native,
+    /// Builds a `NativeJsonDeserializer`.
+    NativeJson(NativeJsonDeserializerConfig),
+    /// Builds a `GelfDeserializer`.
+    Gelf(GelfDeserializerConfig),
+    /// Builds an `InfluxdbDeserializer`.
+    Influxdb(InfluxdbDeserializerConfig),
+    /// Builds a `VrlDeserializer`.
+    Vrl(VrlDeserializerFactory),
+    /// Builds a `StrataDeserializer`.
+    Strata(StrataDeserializerConfig),
+}
+
+impl DeserializerFactory {
+    /// Builds a `Deserializer` with no state from any other unit.
+    pub fn build(&self) -> Deserializer {
+        match self {
+            DeserializerFactory::Avro(factory) => Deserializer::Avro(factory.build()),
+            DeserializerFactory::Bytes => Deserializer::Bytes(BytesDeserializerConfig.build()),
+            DeserializerFactory::Csv(config) => Deserializer::Csv(config.build()),
+            DeserializerFactory::Json(config) => Deserializer::Json(config.build()),
+            DeserializerFactory::JsonPaths(factory) => Deserializer::JsonPaths(factory.build()),
+            DeserializerFactory::Protobuf(factory) => Deserializer::Protobuf(factory.build()),
+            #[cfg(feature = "syslog")]
+            DeserializerFactory::Syslog(config) => Deserializer::Syslog(config.build()),
+            DeserializerFactory::Native => Deserializer::Native(NativeDeserializerConfig.build()),
+            DeserializerFactory::NativeJson(config) => Deserializer::NativeJson(config.build()),
+            DeserializerFactory::Gelf(config) => Deserializer::Gelf(config.build()),
+            DeserializerFactory::Influxdb(config) => Deserializer::Influxdb(config.build()),
+            DeserializerFactory::Vrl(factory) => Deserializer::Vrl(factory.build()),
+            DeserializerFactory::Strata(config) => Deserializer::Strata(config.build()),
+        }
+    }
+}
+
 /// Parse structured events from bytes.
-#[derive(Clone)]
 pub enum Deserializer {
     /// Uses a `AvroDeserializer` for deserialization.
     Avro(AvroDeserializer),
@@ -602,9 +709,27 @@ pub enum Deserializer {
     Strata(StrataDeserializer),
 }
 
+impl Deserializer {
+    /// Parses a frame into structured events and the frame's byte length, emitting a
+    /// `DecoderDeserializeError` if it fails.
+    pub fn parse_frame(
+        &mut self,
+        frame: Bytes,
+        log_namespace: LogNamespace,
+    ) -> Result<(SmallVec<[Event; 1]>, usize), Error> {
+        let byte_size = frame.len();
+        format::Deserializer::parse(self, frame, log_namespace)
+            .map(|events| (events, byte_size))
+            .map_err(|error| {
+                emit!(DecoderDeserializeError { error: &error });
+                Error::ParsingError(error)
+            })
+    }
+}
+
 impl format::Deserializer for Deserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {

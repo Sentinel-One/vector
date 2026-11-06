@@ -6,7 +6,7 @@ use derivative::Derivative;
 use lookup::OwnedValuePath;
 use smallvec::{smallvec, SmallVec};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vector_config::configurable_component;
 use vector_core::{
     config::{DataType, LogNamespace},
@@ -260,9 +260,9 @@ impl JsonPathDeserializerConfig {
         Self { config, options }
     }
 
-    /// Build the `JsonPathDeserializer` from this configuration.
-    pub fn build(&self) -> JsonPathDeserializer {
-        JsonPathDeserializer::new(&self.config, &self.options)
+    /// Build a `JsonPathDeserializerFactory` from this configuration.
+    pub fn build(&self) -> JsonPathDeserializerFactory {
+        JsonPathDeserializerFactory::new(&self.config, &self.options)
     }
 
     /// Return the type of event built by this deserializer.
@@ -318,29 +318,10 @@ pub struct JsonPathDeserializer {
 
     lossy: bool,
 
-    /// Streaming parser state (wrapped in Arc<Mutex> for interior mutability)
-    parser_state: Arc<Mutex<StreamingParserState>>,
+    /// Streaming parser state
+    parser_state: StreamingParserState,
 
     feeder_capacity: usize,
-}
-
-/// Cloning yields an independent parser, not a second handle to the same one.
-///
-/// `Decoder` is cloned once per accepted connection (and per datagram for message-based sources),
-/// so sharing the `Arc` would feed every client's bytes into a single streaming document: one
-/// client's frame could complete another's half-open object, and one malformed frame would leave
-/// the shared parser in an error state that no later frame from any client could recover from.
-impl Clone for JsonPathDeserializer {
-    fn clone(&self) -> Self {
-        Self {
-            rules: self.rules.clone(),
-            lossy: self.lossy,
-            feeder_capacity: self.feeder_capacity,
-            parser_state: Arc::new(Mutex::new(Self::new_parser_state(
-                self.feeder_capacity,
-            ))),
-        }
-    }
 }
 
 /// State maintained across parse() calls for streaming
@@ -349,8 +330,16 @@ struct StreamingParserState {
     state: ParserState,
 }
 
-impl JsonPathDeserializer {
-    /// Creates a new `JsonPathDeserializer`.
+/// Builds `JsonPathDeserializer`s that share one compiled set of path rules.
+#[derive(Debug, Clone)]
+pub struct JsonPathDeserializerFactory {
+    rules: Arc<PathRules>,
+    lossy: bool,
+    feeder_capacity: usize,
+}
+
+impl JsonPathDeserializerFactory {
+    /// Creates a new `JsonPathDeserializerFactory`.
     pub fn new(config: &PathOperationConfig, options: &JsonPathDeserializerOptions) -> Self {
         let rules = config
             .paths
@@ -363,10 +352,24 @@ impl JsonPathDeserializer {
             rules: Arc::new(rules),
             lossy: options.lossy,
             feeder_capacity: options.feeder_capacity,
-            parser_state: Arc::new(Mutex::new(Self::new_parser_state(
-                options.feeder_capacity,
-            ))),
         }
+    }
+
+    /// Builds a `JsonPathDeserializer` with no parser state.
+    pub fn build(&self) -> JsonPathDeserializer {
+        JsonPathDeserializer {
+            rules: Arc::clone(&self.rules),
+            lossy: self.lossy,
+            feeder_capacity: self.feeder_capacity,
+            parser_state: JsonPathDeserializer::new_parser_state(self.feeder_capacity),
+        }
+    }
+}
+
+impl JsonPathDeserializer {
+    /// Creates a new `JsonPathDeserializer`.
+    pub fn new(config: &PathOperationConfig, options: &JsonPathDeserializerOptions) -> Self {
+        JsonPathDeserializerFactory::new(config, options).build()
     }
 
     /// Builds a parser with no residual state.
@@ -439,7 +442,7 @@ fn value_to_bytes(value: &Value) -> Value {
 
 impl Deserializer for JsonPathDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -456,26 +459,23 @@ impl Deserializer for JsonPathDeserializer {
             bytes.to_vec()
         };
 
-        let mut streaming_state = self
-            .parser_state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         // Any failure below leaves actson in an error state and `ParserState.path` /
         // `value_stack` holding fragments of the half-parsed document. actson's push parser cannot
         // resynchronise after a syntax error, and `Error::ParsingError` is continuable, so without
         // this the source would keep calling a permanently wrecked parser: every later frame on
         // this stream fails or decodes against stale path residue. Discard the state so the next
         // frame starts from a clean parser.
-        let result = self.parse_frame(&mut streaming_state, &bytes_slice, log_namespace);
+        let result = self
+            .rules
+            .parse_frame(&mut self.parser_state, &bytes_slice, log_namespace);
         if result.is_err() {
-            *streaming_state = Self::new_parser_state(self.feeder_capacity);
+            self.parser_state = Self::new_parser_state(self.feeder_capacity);
         }
         result
     }
 }
 
-impl JsonPathDeserializer {
+impl PathRules {
     fn parse_frame(
         &self,
         streaming_state: &mut StreamingParserState,
@@ -522,7 +522,7 @@ impl JsonPathDeserializer {
     }
 }
 
-impl JsonPathDeserializer {
+impl PathRules {
     /// Process events from the parser until NeedMoreInput or None
     fn drain_parser_events(
         &self,
@@ -573,7 +573,6 @@ impl JsonPathDeserializer {
             }
             JsonEvent::StartArray => {
                 let should_explode = self
-                    .rules
                     .lookup(&state.path)
                     .map(|node| node.op == PathOperation::Explode)
                     .unwrap_or(false);
@@ -652,7 +651,7 @@ impl JsonPathDeserializer {
         let emitted: Option<Value> = if inside_exploded_array {
             Some(value.clone())
         } else {
-            match self.rules.lookup(&state.path) {
+            match self.lookup(&state.path) {
                 Some(node) if node.is_wildcard && node.has_children() && is_container => None,
                 Some(node) => match node.op {
                     PathOperation::Identity => Some(value.clone()),
@@ -708,7 +707,7 @@ mod tests {
     fn test_identity_operation() {
         let config =
             PathOperationConfig::new(owned_value_path!("meta"), PathOperation::Identity.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"meta": {"source": "foo"}}"#);
@@ -725,7 +724,7 @@ mod tests {
             owned_value_path!("results", "records"),
             PathOperation::Explode.into(),
         );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"results": {"records": [{"log": "bar"}, {"log": "baz"}]}}"#);
@@ -740,7 +739,7 @@ mod tests {
     fn test_bytes_operation() {
         let config =
             PathOperationConfig::new(owned_value_path!("tail"), PathOperation::Bytes.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"tail": "foo bar baz"}"#);
@@ -760,7 +759,7 @@ mod tests {
                     PathOperation::Explode.into(),
                 )
                 .with_rule(owned_value_path!("tail"), PathOperation::Bytes.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(
@@ -792,7 +791,7 @@ mod tests {
                     PathOperation::Explode.into(),
                 )
                 .with_rule(owned_value_path!("tail"), PathOperation::Bytes.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(
@@ -817,7 +816,7 @@ mod tests {
                     owned_value_path!("results", "records"),
                     PathOperation::Explode.into(),
                 );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(
@@ -848,7 +847,7 @@ mod tests {
                     owned_value_path!("results", "records"),
                     PathOperation::Explode.into(),
                 );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(
@@ -876,7 +875,7 @@ mod tests {
                     owned_value_path!("results", "records"),
                     PathOperation::Explode.into(),
                 );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let chunk1 = Bytes::from(
@@ -903,7 +902,7 @@ mod tests {
                     owned_value_path!("results", "records"),
                     PathOperation::Explode.into(),
                 );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let frame1 =
@@ -937,7 +936,7 @@ mod tests {
                     owned_value_path!("results", "records"),
                     PathOperation::Explode.into(),
                 );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let chunk1 =
@@ -982,7 +981,7 @@ mod tests {
             PathOperationConfig::new(owned_value_path!("meta"), PathOperation::Identity.into())
                 .with_rule(owned_value_path!("meta"), PathOperation::Bytes.into());
 
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
         let input = Bytes::from(r#"{"meta": "test"}"#);
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
@@ -996,7 +995,7 @@ mod tests {
         let config =
             PathOperationConfig::new(owned_value_path!("array1"), PathOperation::Explode.into())
                 .with_rule(owned_value_path!("array2"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"array1": [1, 2], "array2": [3, 4, 5]}"#);
@@ -1021,7 +1020,7 @@ mod tests {
     fn test_explode_with_deeply_nested_objects() {
         let config =
             PathOperationConfig::new(owned_value_path!("events"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(
@@ -1042,7 +1041,7 @@ mod tests {
     fn test_explode_primitive_array() {
         let config =
             PathOperationConfig::new(owned_value_path!("numbers"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"numbers": [1, 2, 3]}"#);
@@ -1063,7 +1062,7 @@ mod tests {
     fn test_explode_string_array() {
         let config =
             PathOperationConfig::new(owned_value_path!("items"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"items": ["a", "b", "c"]}"#);
@@ -1080,7 +1079,7 @@ mod tests {
     fn test_explode_mixed_primitive_array() {
         let config =
             PathOperationConfig::new(owned_value_path!("mixed"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"mixed": [1, "two", true, null]}"#);
@@ -1106,7 +1105,7 @@ mod tests {
         )
         .with_rule(owned_value_path!("metrics"), PathOperation::Identity.into());
 
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let large_json = r#"{
@@ -1360,7 +1359,7 @@ mod tests {
     fn test_bad_json() {
         let config =
             PathOperationConfig::new(owned_value_path!("data"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{invalid json}"#);
@@ -1373,7 +1372,7 @@ mod tests {
     fn test_partial_json_then_bogus() {
         let config =
             PathOperationConfig::new(owned_value_path!("items"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         // First parse with partial but valid JSON
@@ -1394,7 +1393,7 @@ mod tests {
     fn test_explode_on_non_array() {
         let config =
             PathOperationConfig::new(owned_value_path!("user"), PathOperation::Explode.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"user": {"id": 1, "name": "Alice"}}"#);
@@ -1426,9 +1425,9 @@ mod tests {
                 );
                 let cfg: DeserializerConfig = toml::from_str(&toml_config)
                     .unwrap_or_else(|e| panic!("toml parse for key {:?}: {}", key, e));
-                let deser = cfg.build().unwrap();
+                let deser = cfg.build().unwrap().build();
                 let events = match deser {
-                    Deserializer::JsonPaths(d) => {
+                    Deserializer::JsonPaths(mut d) => {
                         d.parse(Bytes::from(input), LogNamespace::Vector).unwrap()
                     }
                     _ => panic!("expected JsonPaths"),
@@ -1473,7 +1472,7 @@ op = "explode"
     fn test_identity_for_array() {
         let config =
             PathOperationConfig::new(owned_value_path!("items"), PathOperation::Identity.into());
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let input = Bytes::from(r#"{"items": [1, 2, 3, 4, 5]}"#);
@@ -1520,7 +1519,7 @@ op = "explode"
     }
 
     fn parse_all(config: &PathOperationConfig, input: &str) -> Vec<(String, Value)> {
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(config, &JsonPathDeserializerOptions::default());
         deserializer
             .parse(Bytes::from(input.to_owned()), LogNamespace::Vector)
@@ -1683,7 +1682,7 @@ op = "explode"
             ("record.*", PathOperation::Identity, "*"),
             ("record.*.*", PathOperation::Identity, "*"),
         ]);
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         let chunk1 = Bytes::from(r#"{"record": {"scalar": 1, "nested": {"x": 1"#);
@@ -2000,27 +1999,34 @@ op = "explode"
         JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default())
     }
 
-    fn parse_ok(d: &JsonPathDeserializer, raw: &str) -> usize {
+    fn test_factory() -> JsonPathDeserializerFactory {
+        let config =
+            PathOperationConfig::new(owned_value_path!("meta"), PathOperation::Identity.into());
+        JsonPathDeserializerFactory::new(&config, &JsonPathDeserializerOptions::default())
+    }
+
+    fn parse_ok(d: &mut JsonPathDeserializer, raw: &str) -> usize {
         d.parse(Bytes::from(raw.to_owned()), LogNamespace::Vector)
             .expect("should parse")
             .len()
     }
 
-    /// A clone is a separate parser, not another handle to the same one.
+    /// Deserializers built from one factory are separate parsers, not handles to the same one.
     ///
-    /// `Decoder` is cloned per connection, so a shared parser would let one client's bytes land in
-    /// the middle of another client's document.
+    /// A deserializer is built per connection, so a shared parser would let one client's bytes land
+    /// in the middle of another client's document.
     #[test]
     fn clones_do_not_share_parser_state() {
-        let first = test_deserializer();
-        let second = first.clone();
+        let factory = test_factory();
+        let mut first = factory.build();
+        let mut second = factory.build();
 
         // `first` is left mid-document, with an unterminated object.
-        assert_eq!(parse_ok(&first, r#"{"meta": {"source": "#), 0);
+        assert_eq!(parse_ok(&mut first, r#"{"meta": {"source": "#), 0);
 
         // `second` must see a clean parser: a whole document decodes normally.
         assert_eq!(
-            parse_ok(&second, r#"{"meta": {"source": "foo"}}"#),
+            parse_ok(&mut second, r#"{"meta": {"source": "foo"}}"#),
             1,
             "a clone inherited another parser's half-open document"
         );
@@ -2030,10 +2036,11 @@ op = "explode"
     /// half-open object, which would forge an event out of two senders' data.
     #[test]
     fn a_clone_cannot_complete_another_clones_document() {
-        let victim = test_deserializer();
-        let attacker = victim.clone();
+        let factory = test_factory();
+        let mut victim = factory.build();
+        let mut attacker = factory.build();
 
-        assert_eq!(parse_ok(&victim, r#"{"meta": {"source": "#), 0);
+        assert_eq!(parse_ok(&mut victim, r#"{"meta": {"source": "#), 0);
 
         // On a shared parser these bytes would close the victim's half-open object and emit an
         // event stitched from two senders. On its own the fragment is not valid JSON, so an error
@@ -2053,9 +2060,12 @@ op = "explode"
     /// stream would fail forever.
     #[test]
     fn parser_recovers_after_a_malformed_frame() {
-        let deserializer = test_deserializer();
+        let mut deserializer = test_deserializer();
 
-        assert_eq!(parse_ok(&deserializer, r#"{"meta": {"source": "foo"}}"#), 1);
+        assert_eq!(
+            parse_ok(&mut deserializer, r#"{"meta": {"source": "foo"}}"#),
+            1
+        );
 
         assert!(
             deserializer
@@ -2065,7 +2075,7 @@ op = "explode"
         );
 
         assert_eq!(
-            parse_ok(&deserializer, r#"{"meta": {"source": "bar"}}"#),
+            parse_ok(&mut deserializer, r#"{"meta": {"source": "bar"}}"#),
             1,
             "the parser stayed wedged after a malformed frame"
         );
@@ -2075,9 +2085,9 @@ op = "explode"
     /// mid-object leaves `path` and `value_stack` populated.
     #[test]
     fn abandoned_document_does_not_corrupt_the_next_one() {
-        let deserializer = test_deserializer();
+        let mut deserializer = test_deserializer();
 
-        assert_eq!(parse_ok(&deserializer, r#"{"meta": {"source": "#), 0);
+        assert_eq!(parse_ok(&mut deserializer, r#"{"meta": {"source": "#), 0);
         assert!(deserializer
             .parse(Bytes::from("!!!"), LogNamespace::Vector)
             .is_err());
@@ -2096,11 +2106,11 @@ op = "explode"
     /// parser. Isolation must not be achieved by simply resetting on every call.
     #[test]
     fn a_document_split_across_frames_still_decodes() {
-        let deserializer = test_deserializer();
+        let mut deserializer = test_deserializer();
 
-        assert_eq!(parse_ok(&deserializer, r#"{"meta": {"sou"#), 0);
+        assert_eq!(parse_ok(&mut deserializer, r#"{"meta": {"sou"#), 0);
         assert_eq!(
-            parse_ok(&deserializer, r#"rce": "foo"}}"#),
+            parse_ok(&mut deserializer, r#"rce": "foo"}}"#),
             1,
             "streaming across frames broke"
         );
@@ -2115,7 +2125,7 @@ op = "explode"
                 }),
             PathOperation::Explode.into(),
         );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         chunks
@@ -2203,7 +2213,7 @@ op = "explode"
             PathOperationConfig::new(to_path(first_path), first_op.into()),
             |config, (path, op)| config.with_rule(to_path(path), (*op).into()),
         );
-        let deserializer =
+        let mut deserializer =
             JsonPathDeserializer::new(&config, &JsonPathDeserializerOptions::default());
 
         deserializer

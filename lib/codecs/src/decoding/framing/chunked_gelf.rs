@@ -34,15 +34,59 @@ pub struct ChunkedGelfDecoderConfig {
 }
 
 impl ChunkedGelfDecoderConfig {
-    /// Build the `ChunkedGelfDecoder` from this configuration.
-    pub fn build(&self, compression_limits: CompressionLimits) -> ChunkedGelfDecoder {
-        ChunkedGelfDecoder::new(
+    /// Build a `ChunkedGelfDecoderFactory` from this configuration.
+    pub fn build(&self, compression_limits: CompressionLimits) -> ChunkedGelfDecoderFactory {
+        ChunkedGelfDecoderFactory::new(
             self.chunked_gelf.timeout_secs,
             self.chunked_gelf.pending_messages_limit,
             self.chunked_gelf.max_length,
             self.chunked_gelf.decompression,
             compression_limits,
         )
+    }
+}
+
+/// Builds `ChunkedGelfDecoder`s that share one map of partially received messages, so chunks of
+/// one message reassemble even when different decoders receive them.
+#[derive(Debug, Clone)]
+pub struct ChunkedGelfDecoderFactory {
+    compression_limits: CompressionLimits,
+    decompression_config: ChunkedGelfDecompressionConfig,
+    state: Arc<Mutex<HashMap<u64, MessageState>>>,
+    timeout: Duration,
+    pending_messages_limit: Option<usize>,
+    max_length: Option<usize>,
+}
+
+impl ChunkedGelfDecoderFactory {
+    fn new(
+        timeout_secs: f64,
+        pending_messages_limit: Option<usize>,
+        max_length: Option<usize>,
+        decompression_config: ChunkedGelfDecompressionConfig,
+        compression_limits: CompressionLimits,
+    ) -> Self {
+        Self {
+            compression_limits,
+            decompression_config,
+            state: Arc::new(Mutex::new(HashMap::new())),
+            timeout: Duration::from_secs_f64(timeout_secs),
+            pending_messages_limit,
+            max_length,
+        }
+    }
+
+    /// Builds a `ChunkedGelfDecoder` sharing this factory's partially received messages.
+    pub fn build(&self) -> ChunkedGelfDecoder {
+        ChunkedGelfDecoder {
+            compression_limits: self.compression_limits,
+            bytes_decoder: BytesDecoder::new(),
+            decompression_config: self.decompression_config,
+            state: Arc::clone(&self.state),
+            timeout: self.timeout,
+            pending_messages_limit: self.pending_messages_limit,
+            max_length: self.max_length,
+        }
     }
 }
 
@@ -293,7 +337,7 @@ impl FramingError for ChunkedGelfDecoderError {
 
 /// A codec for handling GELF messages that may be chunked. The implementation is based on [Graylog's GELF documentation](https://go2docs.graylog.org/5-0/getting_in_log_data/gelf.html#GELFviaUDP)
 /// and [Graylog's go-gelf library](https://github.com/Graylog2/go-gelf/blob/v1/gelf/reader.go).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ChunkedGelfDecoder {
     /// Limits to decompress a reassembled message under.
     compression_limits: CompressionLimits,
@@ -319,15 +363,14 @@ impl ChunkedGelfDecoder {
         decompression_config: ChunkedGelfDecompressionConfig,
         compression_limits: CompressionLimits,
     ) -> Self {
-        Self {
-            bytes_decoder: BytesDecoder::new(),
-            decompression_config,
-            compression_limits,
-            state: Arc::new(Mutex::new(HashMap::new())),
-            timeout: Duration::from_secs_f64(timeout_secs),
+        ChunkedGelfDecoderFactory::new(
+            timeout_secs,
             pending_messages_limit,
             max_length,
-        }
+            decompression_config,
+            compression_limits,
+        )
+        .build()
     }
 
     /// Decode a GELF chunk
@@ -1359,5 +1402,58 @@ mod tests {
             .expect("a payload within the cap must decompress");
 
         assert_eq!(decompressed, Bytes::from(payload));
+    }
+
+    fn chunked_gelf_decoding_config() -> crate::actions::DecodingConfig {
+        crate::actions::DecodingConfig::new(
+            crate::decoding::FramingConfig::ChunkedGelf(ChunkedGelfDecoderConfig::default()),
+            crate::decoding::DeserializerConfig::Bytes,
+            vector_core::config::LogNamespace::Legacy,
+            Default::default(),
+        )
+    }
+
+    fn assert_second_decoder_reassembles(
+        mut first: crate::actions::Decoder,
+        mut second: crate::actions::Decoder,
+        (mut chunks, expected_message): ([BytesMut; 2], String),
+    ) {
+        use tokio_util::codec::Decoder as _;
+
+        assert!(first.decode_eof(&mut chunks[0]).unwrap().is_none());
+        let (events, _) = second.decode_eof(&mut chunks[1]).unwrap().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].as_log().get_message(),
+            Some(&vrl::value::Value::from(expected_message))
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn chunked_gelf_stream_decoders_from_one_factory_reassemble_message_split_across_them(
+        two_chunks_message: ([BytesMut; 2], String),
+    ) {
+        let factory = chunked_gelf_decoding_config()
+            .build::<crate::actions::Stream>()
+            .unwrap();
+
+        assert_second_decoder_reassembles(factory.build(), factory.build(), two_chunks_message);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn chunked_gelf_datagram_decoders_for_different_peers_reassemble_message_split_across_them(
+        two_chunks_message: ([BytesMut; 2], String),
+    ) {
+        let factory = chunked_gelf_decoding_config()
+            .build::<crate::actions::Datagram>()
+            .unwrap();
+
+        assert_second_decoder_reassembles(
+            factory.build("10.0.0.1".parse().unwrap()),
+            factory.build("10.0.0.2".parse().unwrap()),
+            two_chunks_message,
+        );
     }
 }

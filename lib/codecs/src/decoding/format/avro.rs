@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::Deserializer;
 use crate::encoding::AvroSerializerOptions;
 use bytes::Buf;
@@ -38,13 +40,13 @@ impl AvroDeserializerConfig {
         }
     }
 
-    /// Build the `AvroDeserializer` from this configuration.
-    pub fn build(&self) -> AvroDeserializer {
+    /// Build an `AvroDeserializerFactory` from this configuration, parsing the schema once.
+    pub fn build(&self) -> AvroDeserializerFactory {
         let schema = apache_avro::Schema::parse_str(&self.avro_options.schema)
             .map_err(|error| format!("Failed building Avro serializer: {}", error))
             .unwrap();
-        AvroDeserializer {
-            schema,
+        AvroDeserializerFactory {
+            schema: Arc::new(schema),
             strip_schema_id_prefix: self.avro_options.strip_schema_id_prefix,
         }
     }
@@ -108,18 +110,35 @@ pub struct AvroDeserializerOptions {
     pub strip_schema_id_prefix: bool,
 }
 
+/// Builds `AvroDeserializer`s that share one parsed schema.
+#[derive(Debug, Clone)]
+pub struct AvroDeserializerFactory {
+    schema: Arc<apache_avro::Schema>,
+    strip_schema_id_prefix: bool,
+}
+
+impl AvroDeserializerFactory {
+    /// Builds an `AvroDeserializer` for the parsed schema.
+    pub fn build(&self) -> AvroDeserializer {
+        AvroDeserializer {
+            schema: Arc::clone(&self.schema),
+            strip_schema_id_prefix: self.strip_schema_id_prefix,
+        }
+    }
+}
+
 /// Serializer that converts bytes to an `Event` using the Apache Avro format.
 #[derive(Debug, Clone)]
 pub struct AvroDeserializer {
-    schema: apache_avro::Schema,
+    schema: Arc<apache_avro::Schema>,
     strip_schema_id_prefix: bool,
 }
 
 impl AvroDeserializer {
     /// Creates a new `AvroDeserializer`.
-    pub const fn new(schema: apache_avro::Schema, strip_schema_id_prefix: bool) -> Self {
+    pub fn new(schema: apache_avro::Schema, strip_schema_id_prefix: bool) -> Self {
         Self {
-            schema,
+            schema: Arc::new(schema),
             strip_schema_id_prefix,
         }
     }
@@ -127,7 +146,7 @@ impl AvroDeserializer {
 
 impl Deserializer for AvroDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -275,7 +294,7 @@ mod tests {
         let record_datum = apache_avro::to_avro_datum(&schema, record_value).unwrap();
         let record_bytes = Bytes::from(record_datum);
 
-        let deserializer = AvroDeserializer::new(schema, false);
+        let mut deserializer = AvroDeserializer::new(schema, false);
         let events = deserializer
             .parse(record_bytes, LogNamespace::Vector)
             .unwrap();
@@ -301,7 +320,7 @@ mod tests {
         bytes.extend([0, 0, 0, 0, 0]); // 0 prefix + 4 byte schema id
         bytes.extend(record_datum);
 
-        let deserializer = AvroDeserializer::new(schema, true);
+        let mut deserializer = AvroDeserializer::new(schema, true);
         let events = deserializer
             .parse(bytes.freeze(), LogNamespace::Vector)
             .unwrap();
@@ -329,7 +348,7 @@ mod tests {
         bytes.extend([0, 0, 0, 0, 0]); // 0 prefix + 4 byte schema id
         bytes.extend(datum);
 
-        let deserializer = AvroDeserializer::new(schema, true);
+        let mut deserializer = AvroDeserializer::new(schema, true);
         let events = deserializer
             .parse(bytes.freeze(), LogNamespace::Vector)
             .unwrap();

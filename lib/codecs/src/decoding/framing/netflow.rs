@@ -57,13 +57,45 @@ pub struct NetflowDecoderConfig {
     pub netflow_decoder_options: NetflowDecoderOptions,
 }
 
+/// 64KB is a common maximum for UDP packets.
+const DEFAULT_MAX_LENGTH: usize = 65536;
+
 impl NetflowDecoderConfig {
-    /// Build the `NetflowDecoderDecoder` from this configuration.
-    pub fn build(&self) -> NetflowDecoder {
-        if let Some(max_length) = self.netflow_decoder_options.max_length {
-            NetflowDecoder::new_with_max_length(max_length)
-        } else {
-            NetflowDecoder::new()
+    /// Build a `NetflowDecoderFactory` from this configuration.
+    pub fn build(&self) -> NetflowDecoderFactory {
+        NetflowDecoderFactory::new(
+            self.netflow_decoder_options
+                .max_length
+                .unwrap_or(DEFAULT_MAX_LENGTH),
+        )
+    }
+}
+
+/// Builds `NetflowDecoder`s that share one template cache, each reading the entry for its own
+/// exporter.
+#[derive(Clone, Debug)]
+pub struct NetflowDecoderFactory {
+    max_length: usize,
+    parsers: Arc<Mutex<IndexMap<ExporterScope, TrackedParser>>>,
+}
+
+impl NetflowDecoderFactory {
+    fn new(max_length: usize) -> Self {
+        Self {
+            max_length,
+            parsers: Arc::new(Mutex::new(IndexMap::new())),
+        }
+    }
+
+    /// Builds a decoder scoped to `peer`'s templates, or to a fresh connection when there is no peer.
+    pub(crate) fn build(&self, peer: Option<IpAddr>) -> NetflowDecoder {
+        NetflowDecoder {
+            max_length: self.max_length,
+            parsers: Arc::clone(&self.parsers),
+            scope: peer.map_or_else(
+                || ExporterScope::Connection(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)),
+                ExporterScope::Datagram,
+            ),
         }
     }
 }
@@ -95,16 +127,16 @@ impl NetflowDecoderOptions {
 }
 
 /// A decoder for handling netflow packets. Will be moved to its own source in future.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NetflowDecoder {
     /// The maximum length of the byte buffer.
     pub max_length: usize,
-    /// One stateful parser per exporter, shared across clones. UDP clones this decoder per
-    /// datagram, so the cache cannot live in the clone: templates arrive in one datagram and the
-    /// data records referencing them in later ones.
+    /// One stateful parser per exporter, shared by every decoder a `NetflowDecoderFactory` builds.
+    /// UDP builds a decoder per datagram, so the cache cannot live in the decoder: templates arrive
+    /// in one datagram and the data records referencing them in later ones.
     parsers: Arc<Mutex<IndexMap<ExporterScope, TrackedParser>>>,
-    /// Which entry of `parsers` this clone uses. Defaults to a fresh connection scope so a caller
-    /// that forgets to set it gets isolation rather than a shared cache.
+    /// Which entry of `parsers` this decoder uses. Defaults to a fresh connection scope so a
+    /// decoder built without a peer gets isolation rather than a shared cache.
     scope: ExporterScope,
 }
 
@@ -120,34 +152,14 @@ impl NetflowDecoder {
     /// Any frames longer than `max_length` bytes will be discarded entirely.
     pub fn new() -> Self {
         // Use a more reasonable default maximum length
-        Self::new_with_max_length(65536) // 64KB is a common maximum for UDP packets
+        Self::new_with_max_length(DEFAULT_MAX_LENGTH)
     }
 
     /// Creates a `NetflowDecoderDecoder` with a maximum frame length limit.
     ///
     /// Any frames longer than `max_length` bytes will be discarded entirely.
     pub fn new_with_max_length(max_length: usize) -> Self {
-        Self {
-            max_length,
-            parsers: Arc::new(Mutex::new(IndexMap::new())),
-            scope: ExporterScope::Connection(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)),
-        }
-    }
-
-    /// Scopes this decoder's templates to a datagram peer.
-    ///
-    /// Call on the per-datagram clone before decoding, so each exporter resolves its data records
-    /// against templates it sent itself.
-    pub fn set_datagram_peer(&mut self, peer: IpAddr) {
-        self.scope = ExporterScope::Datagram(peer);
-    }
-
-    /// Scopes this decoder's templates to a fresh connection.
-    ///
-    /// Call once per accepted connection. Without this every connection built from the same
-    /// configured decoder would inherit one scope and share a template cache.
-    pub fn set_new_connection_scope(&mut self) {
-        self.scope = ExporterScope::Connection(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed));
+        NetflowDecoderFactory::new(max_length).build(None)
     }
 
     /// Returns the maximum frame length when decoding.
@@ -1164,9 +1176,15 @@ mod tests {
 
     const RECORD: [u8; 8] = [10, 0, 0, 9, 10, 0, 0, 8];
 
-    fn decode_from(decoder: &NetflowDecoder, peer: &str, packet: &[u8]) -> String {
-        let mut decoder = decoder.clone();
-        decoder.set_datagram_peer(peer.parse().expect("valid ip"));
+    fn netflow_factory() -> NetflowDecoderFactory {
+        NetflowDecoderConfig {
+            netflow_decoder_options: NetflowDecoderOptions::new(None),
+        }
+        .build()
+    }
+
+    fn decode_from(decoder: &NetflowDecoderFactory, peer: &str, packet: &[u8]) -> String {
+        let mut decoder = decoder.build(Some(peer.parse().expect("valid ip")));
         let mut buf = BytesMut::from(packet);
         decoder
             .decode(&mut buf)
@@ -1180,7 +1198,7 @@ mod tests {
     /// satisfied trivially by never caching anything.
     #[test]
     fn templates_persist_across_datagrams_from_the_same_exporter() {
-        let decoder = NetflowDecoder::new();
+        let decoder = netflow_factory();
 
         decode_from(&decoder, "10.0.0.1", &v9_template(256, &honest_fields()));
         let text = decode_from(&decoder, "10.0.0.1", &v9_data(256, &RECORD));
@@ -1195,7 +1213,7 @@ mod tests {
     /// exporter's records are decoded.
     #[test]
     fn one_exporter_cannot_poison_another_exporters_template() {
-        let decoder = NetflowDecoder::new();
+        let decoder = netflow_factory();
 
         decode_from(&decoder, "10.0.0.1", &v9_template(256, &honest_fields()));
         decode_from(&decoder, "10.0.0.2", &v9_template(256, &poisoned_fields()));
@@ -1211,7 +1229,7 @@ mod tests {
     /// decode against a template another exporter happened to register.
     #[test]
     fn an_exporter_cannot_borrow_another_exporters_template() {
-        let decoder = NetflowDecoder::new();
+        let decoder = netflow_factory();
 
         decode_from(&decoder, "10.0.0.1", &v9_template(256, &honest_fields()));
 
@@ -1225,15 +1243,13 @@ mod tests {
     /// Stream peers are isolated too, and each connection scope is distinct from every other.
     #[test]
     fn each_connection_scope_is_distinct() {
-        let decoder = NetflowDecoder::new();
+        let decoder = netflow_factory();
 
-        let mut first = decoder.clone();
-        first.set_new_connection_scope();
+        let mut first = decoder.build(None);
         let mut buf = BytesMut::from(&v9_template(256, &honest_fields())[..]);
         first.decode(&mut buf).expect("template should decode");
 
-        let mut second = decoder.clone();
-        second.set_new_connection_scope();
+        let mut second = decoder.build(None);
         let mut buf = BytesMut::from(&v9_data(256, &RECORD)[..]);
         let text = second
             .decode(&mut buf)
@@ -1251,7 +1267,7 @@ mod tests {
     /// a ceiling of its own.
     #[test]
     fn exporter_cache_is_bounded() {
-        let decoder = NetflowDecoder::new();
+        let decoder = netflow_factory();
 
         for i in 0..(MAX_TRACKED_EXPORTERS + 50) {
             let peer = format!("10.{}.{}.{}", (i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
@@ -1265,4 +1281,86 @@ mod tests {
         );
     }
 
+    fn decoded_text(mut decoder: crate::actions::Decoder, packet: &[u8]) -> String {
+        let mut buf = BytesMut::from(packet);
+        decoder
+            .decode(&mut buf)
+            .expect("decode should not fail")
+            .map(|(events, _)| {
+                events
+                    .iter()
+                    .filter_map(|event| event.as_log().get_message())
+                    .map(|message| message.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn netflow_decoding_config() -> crate::actions::DecodingConfig {
+        crate::actions::DecodingConfig::new(
+            crate::decoding::FramingConfig::Netflow {
+                netflow_decoder: NetflowDecoderOptions::new(None),
+            },
+            crate::decoding::DeserializerConfig::Bytes,
+            vector_core::config::LogNamespace::Legacy,
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn netflow_datagram_decoders_for_same_peer_share_templates() {
+        let factory = netflow_decoding_config()
+            .build::<crate::actions::Datagram>()
+            .unwrap();
+        let peer = "10.0.0.1".parse().unwrap();
+
+        decoded_text(factory.build(peer), &v9_template(256, &honest_fields()));
+        let text = decoded_text(factory.build(peer), &v9_data(256, &RECORD));
+
+        assert!(text.contains("10.0.0.9"), "got: {text}");
+    }
+
+    #[test]
+    fn netflow_datagram_decoders_for_different_peers_do_not_share_templates() {
+        let factory = netflow_decoding_config()
+            .build::<crate::actions::Datagram>()
+            .unwrap();
+
+        decoded_text(
+            factory.build("10.0.0.1".parse().unwrap()),
+            &v9_template(256, &honest_fields()),
+        );
+        let text = decoded_text(
+            factory.build("10.0.0.2".parse().unwrap()),
+            &v9_data(256, &RECORD),
+        );
+
+        assert!(!text.contains("10.0.0.9"), "got: {text}");
+    }
+
+    #[test]
+    fn netflow_stream_decoders_do_not_share_templates() {
+        let factory = netflow_decoding_config()
+            .build::<crate::actions::Stream>()
+            .unwrap();
+
+        decoded_text(factory.build(), &v9_template(256, &honest_fields()));
+        let text = decoded_text(factory.build(), &v9_data(256, &RECORD));
+
+        assert!(!text.contains("10.0.0.9"), "got: {text}");
+    }
+
+    #[test]
+    fn netflow_stream_decoder_keeps_templates_across_its_own_frames() {
+        let factory = netflow_decoding_config()
+            .build::<crate::actions::Stream>()
+            .unwrap();
+        let mut decoder = factory.build();
+
+        let mut buf = BytesMut::from(&v9_template(256, &honest_fields())[..]);
+        decoder.decode(&mut buf).expect("template should decode");
+        let text = decoded_text(decoder, &v9_data(256, &RECORD));
+
+        assert!(text.contains("10.0.0.9"), "got: {text}");
+    }
 }
