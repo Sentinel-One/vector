@@ -18,7 +18,7 @@ use crate::ipallowlist::IpNetConfig;
 
 /// A predicate over an event, written as a tree of single-key nodes.
 #[configurable_component(no_deser)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum PredicateConfig {
     /// Matches when every child matches.
@@ -156,7 +156,7 @@ impl<'de> Visitor<'de> for NodeVisitor {
 
 /// A field compared against a literal.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValueMatch {
     /// The field to test.
@@ -168,7 +168,7 @@ pub struct ValueMatch {
 
 /// A field compared against a set of literals.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValuesMatch {
     /// The field to test.
@@ -180,7 +180,7 @@ pub struct ValuesMatch {
 
 /// A field compared against a number.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NumberMatch {
     /// The field to test.
@@ -192,7 +192,7 @@ pub struct NumberMatch {
 
 /// A field compared against an inclusive numeric range.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RangeMatch {
     /// The field to test.
@@ -207,7 +207,7 @@ pub struct RangeMatch {
 
 /// A string field compared against a substring.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StringMatch {
     /// The field to test.
@@ -219,7 +219,7 @@ pub struct StringMatch {
 
 /// A string field searched with a regular expression.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegexMatch {
     /// The field to test.
@@ -232,7 +232,7 @@ pub struct RegexMatch {
 
 /// A string field holding an IP address, tested against IP ranges.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CidrMatch {
     /// The field to test.
@@ -244,7 +244,7 @@ pub struct CidrMatch {
 
 /// A field tested for its type.
 #[configurable_component]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TypeMatch {
     /// The field to test.
@@ -276,6 +276,10 @@ pub enum Literal {
     String(String),
 }
 
+// A NaN literal fails `build` (`PredicateError::NaN`), so equality is reflexive for any config
+// that can run.
+impl Eq for Literal {}
+
 /// A numeric literal.
 #[configurable_component]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -287,6 +291,8 @@ pub enum Number {
     /// A float.
     Float(f64),
 }
+
+impl Eq for Number {}
 
 /// The type of a value.
 #[configurable_component]

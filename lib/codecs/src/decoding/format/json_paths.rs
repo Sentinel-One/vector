@@ -1409,6 +1409,7 @@ mod tests {
     #[test]
     fn test_normalized_path_keys_are_equivalent() {
         use crate::decoding::{Deserializer, DeserializerConfig};
+        use vector_common::limits::OperationalLimits;
 
         // Each inner slice is a class of keys that should normalize to the same
         // runtime key, and therefore produce identical output for the same input.
@@ -1425,7 +1426,7 @@ mod tests {
                 );
                 let cfg: DeserializerConfig = toml::from_str(&toml_config)
                     .unwrap_or_else(|e| panic!("toml parse for key {:?}: {}", key, e));
-                let deser = cfg.build().unwrap().build();
+                let deser = cfg.build(OperationalLimits::default()).unwrap().build();
                 let events = match deser {
                     Deserializer::JsonPaths(mut d) => {
                         d.parse(Bytes::from(input), LogNamespace::Vector).unwrap()

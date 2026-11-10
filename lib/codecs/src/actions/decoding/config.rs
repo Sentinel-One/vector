@@ -52,7 +52,7 @@ impl DecodingConfig {
     pub fn build<S: Scope>(&self) -> vector_common::Result<DecoderFactory<S>> {
         Ok(DecoderFactory::new(
             self.framing.build(self.operational_limits),
-            self.decoding.build()?,
+            self.decoding.build(self.operational_limits)?,
             self.log_namespace,
         ))
     }

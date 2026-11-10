@@ -30,6 +30,10 @@ use super::scoped_visit::{
 pub struct DisallowUnevaluatedPropertiesVisitor {
     scope_stack: SchemaScopeStack,
     eligible_to_flatten: HashMap<String, HashSet<SchemaReference>>,
+    /// The references flattened into the schemas on the path being visited. A recursive schema
+    /// (one that refers back to itself) keeps its inner self-reference as a `$ref`; flattening it
+    /// again would never terminate.
+    flattening: Vec<String>,
 }
 
 impl DisallowUnevaluatedPropertiesVisitor {
@@ -37,6 +41,7 @@ impl DisallowUnevaluatedPropertiesVisitor {
         Self {
             scope_stack: SchemaScopeStack::default(),
             eligible_to_flatten: HashMap::new(),
+            flattening: Vec::new(),
         }
     }
 }
@@ -72,11 +77,14 @@ impl Visitor for DisallowUnevaluatedPropertiesVisitor {
         // so based on whichever group of referrers -- the schemas which reference the particular
         // target schema -- is smaller, such that we do the minimum number of flattenings per target
         // schema, to keep the schema as small as we reasonably can.
+        let mut flattened = None;
         if let Some(reference) = schema.reference.as_ref() {
             let current_parent_schema_ref = self.get_current_schema_scope();
 
             if let Some(referrers) = self.eligible_to_flatten.get(reference) {
-                if referrers.contains(current_parent_schema_ref) {
+                if referrers.contains(current_parent_schema_ref)
+                    && !self.flattening.contains(reference)
+                {
                     let current_schema_ref = get_cleaned_schema_reference(reference);
                     let referenced_schema = definitions
                         .get(current_schema_ref)
@@ -95,7 +103,7 @@ impl Visitor for DisallowUnevaluatedPropertiesVisitor {
                             "Flattening referent into referrer."
                         );
 
-                        schema.reference = None;
+                        flattened = schema.reference.take();
                         schema.merge(referenced_schema);
                     }
                 }
@@ -104,7 +112,13 @@ impl Visitor for DisallowUnevaluatedPropertiesVisitor {
 
         // Visit the schema object first so that we recurse the overall schema in a depth-first
         // fashion, marking eligible object schemas as closed.
-        visit_schema_object_scoped(self, definitions, schema);
+        if let Some(reference) = flattened {
+            self.flattening.push(reference);
+            visit_schema_object_scoped(self, definitions, schema);
+            self.flattening.pop();
+        } else {
+            visit_schema_object_scoped(self, definitions, schema);
+        }
 
         // Next, see if this schema has any subschema validation: `allOf`, `oneOf`, or `anyOf`.
         //
@@ -872,6 +886,67 @@ mod tests {
                 "acks": {
                     "type": "object",
                     "properties": { "enabled": { "type": "boolean" } },
+                    "unevaluatedProperties": false
+                }
+            },
+            "unevaluatedProperties": false
+        }));
+
+        assert_schemas_eq(expected_schema, actual_schema);
+    }
+
+    #[test]
+    fn recursive_schema_flattened_once_keeps_inner_self_reference() {
+        let mut actual_schema = as_schema(json!({
+            "type": "object",
+            "properties": {
+                "acks": { "$ref": "#/definitions/acks" },
+                "custom_acks": { "$ref": "#/definitions/custom_acks" }
+            },
+            "definitions": {
+                "custom_acks": {
+                    "allOf": [{ "type": "object", "properties": { "ack_count": { "type": "number" } } },
+                              { "$ref": "#/definitions/acks" }]
+                },
+                "acks": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "nested": { "$ref": "#/definitions/acks" }
+                    }
+                }
+            }
+        }));
+
+        let mut visitor = DisallowUnevaluatedPropertiesVisitor::default();
+        visitor.visit_root_schema(&mut actual_schema);
+
+        let expected_schema = as_schema(json!({
+            "type": "object",
+            "properties": {
+                "acks": { "$ref": "#/definitions/acks" },
+                "custom_acks": { "$ref": "#/definitions/custom_acks" }
+            },
+            "definitions": {
+                "custom_acks": {
+                    "allOf": [
+                        { "type": "object", "properties": { "ack_count": { "type": "number" } } },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "enabled": { "type": "boolean" },
+                                "nested": { "$ref": "#/definitions/acks" }
+                            }
+                        }
+                    ],
+                    "unevaluatedProperties": false
+                },
+                "acks": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "nested": { "$ref": "#/definitions/acks" }
+                    },
                     "unevaluatedProperties": false
                 }
             },
