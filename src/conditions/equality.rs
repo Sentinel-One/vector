@@ -251,7 +251,7 @@ impl Equality {
     }
 
     /// Every clause's constant is fast-path indexable.
-    pub(crate) fn is_indexable(&self) -> bool {
+    pub fn is_indexable(&self) -> bool {
         self.eqs.iter().all(|(_, c)| c.is_indexable())
     }
 
