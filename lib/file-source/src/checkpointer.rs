@@ -547,6 +547,7 @@ mod test {
             strategy: FingerprintStrategy::DevInode,
             max_line_length: 1000,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let mut buf = Vec::new();
@@ -588,6 +589,7 @@ mod test {
             },
             max_line_length: 102400,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let mut buf = Vec::new();
@@ -629,6 +631,7 @@ mod test {
             },
             max_line_length: 102400,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let mut buf = Vec::new();
@@ -744,6 +747,7 @@ mod test {
             },
             max_line_length: 1024,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let log_path = data_dir.path().join("test.log");

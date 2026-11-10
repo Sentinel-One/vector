@@ -10,7 +10,7 @@ use flate2::bufread::GzDecoder;
 use serde::{Deserialize, Serialize};
 use vector_common::constants::GZIP_MAGIC;
 
-use crate::{metadata_ext::PortableFileExt, FileSourceInternalEvents};
+use crate::{metadata_ext::PortableFileExt, FileSourceInternalEvents, SymlinkPolicy};
 
 const FINGERPRINT_CRC: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_ECMA_182);
 const LEGACY_FINGERPRINT_CRC: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_XZ);
@@ -20,6 +20,7 @@ pub struct Fingerprinter {
     pub strategy: FingerprintStrategy,
     pub max_line_length: usize,
     pub ignore_not_found: bool,
+    pub symlink_policy: SymlinkPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +171,7 @@ impl Fingerprinter {
 
         match self.strategy {
             FingerprintStrategy::DevInode => {
-                let file_handle = File::open(path)?;
+                let file_handle = self.symlink_policy.open(path)?;
                 let dev = file_handle.portable_dev()?;
                 let ino = file_handle.portable_ino()?;
                 Ok(DevInode(dev, ino))
@@ -185,7 +186,7 @@ impl Fingerprinter {
                 lines,
             } => {
                 buffer.resize(self.max_line_length, 0u8);
-                let mut fp = fs::File::open(path)?;
+                let mut fp = self.symlink_policy.open(path)?;
                 let mut reader = UncompressedReaderImpl::reader(&mut fp)?;
 
                 skip_first_n_bytes(&mut reader, ignored_header_bytes)?;
@@ -243,7 +244,7 @@ impl Fingerprinter {
                 lines: _,
             } => {
                 buffer.resize(bytes, 0u8);
-                let mut fp = fs::File::open(path)?;
+                let mut fp = self.symlink_policy.open(path)?;
                 fp.seek(io::SeekFrom::Start(ignored_header_bytes as u64))?;
                 fp.read_exact(&mut buffer[..bytes])?;
                 let fingerprint = FINGERPRINT_CRC.checksum(&buffer[..]);
@@ -271,7 +272,7 @@ impl Fingerprinter {
                 lines,
             } => {
                 buffer.resize(self.max_line_length, 0u8);
-                let mut fp = fs::File::open(path)?;
+                let mut fp = self.symlink_policy.open(path)?;
                 fp.seek(SeekFrom::Start(ignored_header_bytes as u64))?;
                 fingerprinter_read_until_and_zerofill_buf(fp, b'\n', lines, buffer)?;
                 let fingerprint = LEGACY_FINGERPRINT_CRC.checksum(&buffer[..]);
@@ -298,7 +299,7 @@ impl Fingerprinter {
                 lines,
             } => {
                 buffer.resize(self.max_line_length, 0u8);
-                let mut fp = fs::File::open(path)?;
+                let mut fp = self.symlink_policy.open(path)?;
                 fp.seek(SeekFrom::Start(ignored_header_bytes as u64))?;
                 fingerprinter_read_until_and_zerofill_buf(fp, b'\n', lines, buffer)?;
                 let fingerprint = FINGERPRINT_CRC.checksum(&buffer[..]);
@@ -415,6 +416,7 @@ mod test {
             },
             max_line_length: 1024,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let target_dir = tempdir().unwrap();
@@ -460,6 +462,7 @@ mod test {
             },
             max_line_length,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let target_dir = tempdir().unwrap();
@@ -569,6 +572,7 @@ mod test {
             },
             max_line_length,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let target_dir = tempdir().unwrap();
@@ -649,6 +653,7 @@ mod test {
             },
             max_line_length,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let target_dir = tempdir().unwrap();
@@ -699,6 +704,7 @@ mod test {
             strategy: FingerprintStrategy::DevInode,
             max_line_length: 42,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let target_dir = tempdir().unwrap();
@@ -741,6 +747,7 @@ mod test {
             },
             max_line_length: 1024,
             ignore_not_found: false,
+            symlink_policy: crate::SymlinkPolicy::Follow,
         };
 
         let mut buf = Vec::new();

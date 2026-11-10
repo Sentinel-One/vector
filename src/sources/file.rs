@@ -14,7 +14,7 @@ use vector_lib::file_source::{
     calculate_ignore_before,
     paths_provider::glob::{Glob, MatchOptions},
     Checkpointer, FileFingerprint, FileServer, FingerprintStrategy, Fingerprinter, Line, ReadFrom,
-    ReadFromConfig,
+    ReadFromConfig, SymlinkPolicy,
 };
 use vector_lib::finalizer::OrderedFinalizer;
 use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path, OwnedValuePath};
@@ -170,6 +170,16 @@ pub struct FileConfig {
     /// This may be useful when used with source directories containing dangling symlinks.
     #[serde(default)]
     pub ignore_not_found: bool,
+
+    /// How symbolic links are handled.
+    ///
+    /// `follow` reads through symlinks. `deny` skips symlinks and refuses to open files through
+    /// them. `within_root` follows a symlink only if its real path stays under the literal
+    /// (non-wildcard) directory prefix of the matching `include` pattern.
+    ///
+    /// `exclude` patterns are matched against the symlink path, not its target.
+    #[serde(default)]
+    pub symlink_policy: SymlinkPolicy,
 
     /// String value used to identify the start of a multi-line message.
     #[configurable(deprecated = "This option has been deprecated, use `multiline` instead.")]
@@ -387,6 +397,7 @@ impl Default for FileConfig {
             max_line_bytes: default_max_line_bytes(),
             fingerprint: FingerprintConfig::default(),
             ignore_not_found: false,
+            symlink_policy: SymlinkPolicy::default(),
             host_key: None,
             offset_key: None,
             data_dir: None,
@@ -535,6 +546,7 @@ pub fn file_source(
         &config.include,
         &exclude_patterns,
         MatchOptions::default(),
+        config.symlink_policy,
         emitter.clone(),
     )
     .expect("invalid glob patterns");
@@ -563,12 +575,14 @@ pub fn file_source(
             strategy: config.fingerprint.clone().into(),
             max_line_length: config.max_line_bytes,
             ignore_not_found: config.ignore_not_found,
+            symlink_policy: config.symlink_policy,
         },
         oldest_first: config.oldest_first,
         remove_after: config.remove_after_secs.map(Duration::from_secs),
         emitter,
         handle: tokio::runtime::Handle::current(),
         rotate_wait: config.rotate_wait,
+        symlink_policy: config.symlink_policy,
     };
 
     let event_metadata = EventMetadata {
@@ -1459,6 +1473,65 @@ mod tests {
         }
 
         assert_eq!(is, [n as usize; 1]);
+    }
+
+    // Returns the lines read from logs/{real,in,out}.log with the given policy.
+    // in.log links inside the root, out.log links to a secret outside it.
+    #[cfg(unix)]
+    async fn run_symlink_policy(policy: SymlinkPolicy) -> Vec<String> {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(outside.path().join("secret"), "secret\n").unwrap();
+        std::fs::write(logs.join("real.log"), "real\n").unwrap();
+        std::fs::write(logs.join("target.txt"), "inroot\n").unwrap();
+        std::os::unix::fs::symlink(logs.join("target.txt"), logs.join("in.log")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), logs.join("out.log")).unwrap();
+
+        let config = file::FileConfig {
+            include: vec![logs.join("*.log")],
+            symlink_policy: policy,
+            ..test_default_file_config(&dir)
+        };
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+            sleep_500_millis().await;
+        })
+        .await;
+        let mut lines: Vec<_> = received
+            .iter()
+            .map(|e| {
+                e.as_log()[log_schema().message_key().unwrap().to_string()]
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_policy_follow() {
+        assert_eq!(
+            run_symlink_policy(SymlinkPolicy::Follow).await,
+            ["inroot", "real", "secret"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_policy_deny() {
+        assert_eq!(run_symlink_policy(SymlinkPolicy::Deny).await, ["real"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_policy_within_root() {
+        assert_eq!(
+            run_symlink_policy(SymlinkPolicy::WithinRoot).await,
+            ["inroot", "real"]
+        );
     }
 
     #[tokio::test]

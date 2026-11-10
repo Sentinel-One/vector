@@ -25,7 +25,7 @@ use vector_lib::codecs::{BytesDeserializer, BytesDeserializerConfig};
 use vector_lib::configurable::configurable_component;
 use vector_lib::file_source::{
     calculate_ignore_before, Checkpointer, FileServer, FileServerShutdown, FingerprintStrategy,
-    Fingerprinter, Line, ReadFrom, ReadFromConfig,
+    Fingerprinter, Line, ReadFrom, ReadFromConfig, SymlinkPolicy,
 };
 use vector_lib::lookup::{lookup_v2::OptionalTargetPath, owned_value_path, path, OwnedTargetPath};
 use vector_lib::{config::LegacyKey, config::LogNamespace, EstimatedJsonEncodedSizeOf};
@@ -819,6 +819,7 @@ impl Source {
                 },
                 max_line_length: max_line_bytes,
                 ignore_not_found: true,
+                symlink_policy: SymlinkPolicy::Follow,
             },
             oldest_first,
             // We do not remove the log files, `kubelet` is responsible for it.
@@ -830,6 +831,7 @@ impl Source {
             // A handle to the current tokio runtime
             handle: tokio::runtime::Handle::current(),
             rotate_wait,
+            symlink_policy: SymlinkPolicy::Follow,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);

@@ -13,6 +13,7 @@ use vector_common::constants::GZIP_MAGIC;
 
 use crate::{
     buffer::read_until_with_max_size, metadata_ext::PortableFileExt, FilePosition, ReadFrom,
+    SymlinkPolicy,
 };
 #[cfg(test)]
 mod tests;
@@ -64,8 +65,9 @@ impl FileWatcher {
         ignore_before: Option<DateTime<Utc>>,
         max_line_bytes: usize,
         line_delimiter: Bytes,
+        symlink_policy: SymlinkPolicy,
     ) -> Result<FileWatcher, io::Error> {
-        let f = fs::File::open(&path)?;
+        let f = symlink_policy.open(&path)?;
         let (devno, ino) = (f.portable_dev()?, f.portable_ino()?);
         let metadata = f.metadata()?;
         let mut reader = io::BufReader::new(f);
@@ -156,10 +158,10 @@ impl FileWatcher {
         })
     }
 
-    pub fn update_path(&mut self, path: PathBuf) -> io::Result<()> {
-        let file_handle = File::open(&path)?;
+    pub fn update_path(&mut self, path: PathBuf, symlink_policy: SymlinkPolicy) -> io::Result<()> {
+        let file_handle = symlink_policy.open(&path)?;
         if (file_handle.portable_dev()?, file_handle.portable_ino()?) != (self.devno, self.inode) {
-            let mut reader = io::BufReader::new(fs::File::open(&path)?);
+            let mut reader = io::BufReader::new(symlink_policy.open(&path)?);
             let gzipped = is_gzipped(&mut reader)?;
             let new_reader: Box<dyn BufRead> = if gzipped {
                 if self.file_position != 0 {

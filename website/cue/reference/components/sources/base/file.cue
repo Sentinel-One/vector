@@ -379,4 +379,24 @@ base: components: sources: file: configuration: {
 			unit:    "seconds"
 		}
 	}
+	symlink_policy: {
+		description: """
+			How symbolic links are handled.
+
+			`follow` reads through symlinks. `deny` skips symlinks and refuses to open files through
+			them. `within_root` follows a symlink only if its real path stays under the literal
+			(non-wildcard) directory prefix of the matching `include` pattern.
+
+			`exclude` patterns are matched against the symlink path, not its target.
+			"""
+		required: false
+		type: string: {
+			default: "follow"
+			enum: {
+				deny:        "Skip symbolic links and never open a file through one."
+				follow:      "Follow symbolic links."
+				within_root: "Follow symbolic links only if the real path stays inside the literal directory prefix of the include pattern that matched."
+			}
+		}
+	}
 }

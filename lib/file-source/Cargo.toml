@@ -6,6 +6,9 @@ edition = "2021"
 publish = false
 license = "MIT"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 libc = "0.2"
 winapi = { version = "0.3", features = ["winioctl"] }

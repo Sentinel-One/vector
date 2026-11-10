@@ -22,7 +22,7 @@ use crate::{
     file_watcher::FileWatcher,
     fingerprinter::{FileFingerprint, Fingerprinter},
     paths_provider::PathsProvider,
-    FileSourceInternalEvents, ReadFrom,
+    FileSourceInternalEvents, ReadFrom, SymlinkPolicy,
 };
 
 /// `FileServer` is a Source which cooperatively schedules reads over files,
@@ -53,6 +53,7 @@ where
     pub emitter: E,
     pub handle: tokio::runtime::Handle,
     pub rotate_wait: Duration,
+    pub symlink_policy: SymlinkPolicy,
 }
 
 /// `FileServer` as Source
@@ -198,7 +199,8 @@ where
                                     path = ?path,
                                     old_path = ?watcher.path
                                 );
-                                watcher.update_path(path).ok(); // ok if this fails: might fix next cycle
+                                // ok if this fails: might fix next cycle
+                                watcher.update_path(path, self.symlink_policy).ok();
                             } else {
                                 info!(
                                     message = "More than one file has the same fingerprint.",
@@ -216,7 +218,8 @@ where
                                             new_modified_time = ?new_modified_time,
                                             old_modified_time = ?old_modified_time,
                                         );
-                                        watcher.update_path(path).ok(); // ok if this fails: might fix next cycle
+                                        // ok if this fails: might fix next cycle
+                                        watcher.update_path(path, self.symlink_policy).ok();
                                     }
                                 }
                             }
@@ -408,6 +411,7 @@ where
             self.ignore_before,
             self.max_line_bytes,
             self.line_delimiter.clone(),
+            self.symlink_policy,
         ) {
             Ok(mut watcher) => {
                 if let ReadFrom::Checkpoint(file_position) = read_from {
