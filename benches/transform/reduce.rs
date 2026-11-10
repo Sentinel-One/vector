@@ -6,7 +6,7 @@ use criterion::{
     SamplingMode, Throughput,
 };
 use indexmap::IndexMap;
-use vector::transforms::reduce::{Reduce, ReduceConfig};
+use vector::transforms::reduce::{config::ReduceConfig, transform::Reduce};
 use vector_lib::transform::Transform;
 
 use crate::common::{consume, FixedLogStream};
@@ -50,6 +50,7 @@ fn reduce(c: &mut Criterion) {
                 ends_when: None,
                 starts_when: None,
                 max_events: None,
+                ..Default::default()
             },
         },
     ] {
