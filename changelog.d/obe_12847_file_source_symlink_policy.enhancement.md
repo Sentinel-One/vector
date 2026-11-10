@@ -1,0 +1,1 @@
+The `file` source has a new `symlink_policy` option (`follow`, `deny`, `within_root`) to control whether symbolic links matched by `include` are followed. The default, `follow`, keeps the existing behavior. `exclude` patterns match the symlink path, not its target.

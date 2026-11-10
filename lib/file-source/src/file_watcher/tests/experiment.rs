@@ -36,6 +36,7 @@ fn experiment(actions: Vec<FileWatcherAction>) {
         None,
         100_000,
         Bytes::from("\n"),
+        crate::SymlinkPolicy::Follow,
     )
     .expect("must be able to create");
 
