@@ -10,6 +10,11 @@ use crate::internal_events::codecs::DecoderDeserializeError;
 use bytes::{Bytes, BytesMut};
 pub use error::StreamDecodingError;
 pub use format::{
+    ActionConfig, AppendConfig, AssembledDeserializer, AssembledDeserializerConfig,
+    AssembledDeserializerFactory, AssemblerConfig, EmitConfig, FlushConfig, FlushMetadata,
+    ForeachConfig, IfConfig, JsonValue, MergeConfig, ResetConfig,
+};
+pub use format::{
     BoxedDeserializer, BytesDeserializer, BytesDeserializerConfig, CsvDeserializer,
     CsvDeserializerConfig, CsvDeserializerOptions, GelfDeserializer, GelfDeserializerConfig,
     GelfDeserializerOptions, InfluxdbDeserializer, InfluxdbDeserializerConfig, JsonDeserializer,
@@ -57,13 +62,28 @@ pub enum Error {
     FramingError(BoxedFramingError),
     /// The error occurred while parsing structured events from a byte frame.
     ParsingError(vector_common::Error),
+    /// Parsing failed in a way the deserializer was configured not to resume from.
+    FatalParsingError(vector_common::Error),
 }
+
+/// Wraps a deserializer error that should end the stream rather than only fail its frame.
+#[derive(Debug)]
+pub struct NonResumable(pub vector_common::Error);
+
+impl std::fmt::Display for NonResumable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for NonResumable {}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FramingError(error) => write!(formatter, "FramingError({})", error),
             Self::ParsingError(error) => write!(formatter, "ParsingError({})", error),
+            Self::FatalParsingError(error) => write!(formatter, "FatalParsingError({})", error),
         }
     }
 }
@@ -81,6 +101,7 @@ impl StreamDecodingError for Error {
         match self {
             Self::FramingError(error) => error.can_continue(),
             Self::ParsingError(_) => true,
+            Self::FatalParsingError(_) => false,
         }
     }
 }
@@ -415,6 +436,10 @@ pub enum DeserializerConfig {
     /// compressed with snappy. It automatically extracts S3 metadata from the header
     /// and enriches each log event.
     Strata(StrataDeserializerConfig),
+
+    /// Decodes with an inner codec, then rewrites, re-arranges and fans out its events with a
+    /// program of actions that can carry values from one event to the next.
+    Assembled(AssembledDeserializerConfig),
 }
 
 impl From<BytesDeserializerConfig> for DeserializerConfig {
@@ -474,8 +499,12 @@ impl From<StrataDeserializerConfig> for DeserializerConfig {
 
 impl DeserializerConfig {
     /// Build the `DeserializerFactory` from this configuration, doing all fallible and expensive
-    /// preparation (compiling VRL, loading descriptors, parsing schemas) once.
-    pub fn build(&self) -> vector_common::Result<DeserializerFactory> {
+    /// preparation (compiling VRL, loading descriptors, parsing schemas) once. `limits` bound
+    /// deserializers that buffer state across frames.
+    pub fn build(
+        &self,
+        limits: OperationalLimits,
+    ) -> vector_common::Result<DeserializerFactory> {
         Ok(match self {
             DeserializerConfig::Avro { avro } => DeserializerFactory::Avro(
                 AvroDeserializerConfig {
@@ -498,6 +527,9 @@ impl DeserializerConfig {
             DeserializerConfig::JsonPaths(config) => DeserializerFactory::JsonPaths(config.build()),
             DeserializerConfig::Vrl(config) => DeserializerFactory::Vrl(config.build()?),
             DeserializerConfig::Strata(config) => DeserializerFactory::Strata(config.clone()),
+            DeserializerConfig::Assembled(config) => {
+                DeserializerFactory::Assembled(config.build(limits)?)
+            }
         })
     }
 
@@ -522,6 +554,7 @@ impl DeserializerConfig {
                 FramingConfig::CharacterDelimited(CharacterDelimitedDecoderConfig::new(0))
             }
             DeserializerConfig::Strata(_) => FramingConfig::StrataSnappy(Default::default()),
+            DeserializerConfig::Assembled(config) => config.deserializer.default_stream_framing(),
         }
     }
 
@@ -530,6 +563,7 @@ impl DeserializerConfig {
         match self {
             DeserializerConfig::Gelf(_) => FramingConfig::ChunkedGelf(Default::default()),
             DeserializerConfig::Strata(_) => FramingConfig::Bytes(BytesDecoderConfig::new()),
+            DeserializerConfig::Assembled(config) => config.deserializer.default_message_based_framing(),
             _ => FramingConfig::Bytes(BytesDecoderConfig::new()),
         }
     }
@@ -554,6 +588,7 @@ impl DeserializerConfig {
             DeserializerConfig::Vrl(config) => config.output_type(),
             DeserializerConfig::Influxdb(config) => config.output_type(),
             DeserializerConfig::Strata(config) => config.output_type(),
+            DeserializerConfig::Assembled(config) => config.output_type(),
         }
     }
 
@@ -577,12 +612,14 @@ impl DeserializerConfig {
             DeserializerConfig::Influxdb(config) => config.schema_definition(log_namespace),
             DeserializerConfig::Vrl(config) => config.schema_definition(log_namespace),
             DeserializerConfig::Strata(config) => config.schema_definition(log_namespace),
+            DeserializerConfig::Assembled(config) => config.schema_definition(log_namespace),
         }
     }
 
     /// Get the HTTP content type.
-    pub const fn content_type(&self, framer: &FramingConfig) -> &'static str {
+    pub fn content_type(&self, framer: &FramingConfig) -> &'static str {
         match (&self, framer) {
+            (DeserializerConfig::Assembled(config), framer) => config.deserializer.content_type(framer),
             (
                 DeserializerConfig::Json(_) | DeserializerConfig::NativeJson(_),
                 FramingConfig::NewlineDelimited(_),
@@ -652,6 +689,8 @@ pub enum DeserializerFactory {
     Vrl(VrlDeserializerFactory),
     /// Builds a `StrataDeserializer`.
     Strata(StrataDeserializerConfig),
+    /// Builds an `AssembledDeserializer`.
+    Assembled(AssembledDeserializerFactory),
 }
 
 impl DeserializerFactory {
@@ -672,6 +711,7 @@ impl DeserializerFactory {
             DeserializerFactory::Influxdb(config) => Deserializer::Influxdb(config.build()),
             DeserializerFactory::Vrl(factory) => Deserializer::Vrl(factory.build()),
             DeserializerFactory::Strata(config) => Deserializer::Strata(config.build()),
+            DeserializerFactory::Assembled(factory) => Deserializer::Assembled(factory.build()),
         }
     }
 }
@@ -707,6 +747,8 @@ pub enum Deserializer {
     Vrl(VrlDeserializer),
     /// Uses a `StrataDeserializer` for deserialization.
     Strata(StrataDeserializer),
+    /// Uses an `AssembledDeserializer` for deserialization.
+    Assembled(AssembledDeserializer),
 }
 
 impl Deserializer {
@@ -720,10 +762,25 @@ impl Deserializer {
         let byte_size = frame.len();
         format::Deserializer::parse(self, frame, log_namespace)
             .map(|events| (events, byte_size))
-            .map_err(|error| {
-                emit!(DecoderDeserializeError { error: &error });
-                Error::ParsingError(error)
-            })
+            .map_err(Self::parsing_error)
+    }
+
+    /// Ends the unit of input, returning any events the deserializer still held for it, and
+    /// emitting a `DecoderDeserializeError` if that fails.
+    pub fn flush_unit(
+        &mut self,
+        log_namespace: LogNamespace,
+    ) -> Result<SmallVec<[Event; 1]>, Error> {
+        format::Deserializer::flush(self, log_namespace).map_err(Self::parsing_error)
+    }
+
+    fn parsing_error(error: vector_common::Error) -> Error {
+        emit!(DecoderDeserializeError { error: &error });
+        if error.is::<NonResumable>() {
+            Error::FatalParsingError(error)
+        } else {
+            Error::ParsingError(error)
+        }
     }
 }
 
@@ -749,6 +806,18 @@ impl format::Deserializer for Deserializer {
             Deserializer::Influxdb(deserializer) => deserializer.parse(bytes, log_namespace),
             Deserializer::Vrl(deserializer) => deserializer.parse(bytes, log_namespace),
             Deserializer::Strata(deserializer) => deserializer.parse(bytes, log_namespace),
+            Deserializer::Assembled(deserializer) => deserializer.parse(bytes, log_namespace),
+        }
+    }
+
+    fn flush(
+        &mut self,
+        log_namespace: LogNamespace,
+    ) -> vector_common::Result<SmallVec<[Event; 1]>> {
+        match self {
+            Deserializer::Assembled(deserializer) => deserializer.flush(log_namespace),
+            Deserializer::Boxed(deserializer) => deserializer.flush(log_namespace),
+            _ => Ok(SmallVec::new()),
         }
     }
 }

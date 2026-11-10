@@ -71,6 +71,8 @@ futures-util.workspace = true
 hex = "0.4"
 itertools.workspace = true
 assert_matches = { version = "1.5" }
+metrics-util = { workspace = true, features = ["debugging"] }
+serde_yaml.workspace = true
 
 [features]
 syslog = ["dep:syslog_loose"]

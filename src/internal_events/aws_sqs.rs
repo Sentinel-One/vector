@@ -41,6 +41,48 @@ mod s3 {
         }
     }
 
+    /// A non-resumable decoding error stopped an object part-way; nothing after it was ingested,
+    /// yet the object still counts as processed, so it is not retried.
+    #[derive(Debug)]
+    pub struct SqsS3ObjectDecodingAborted<'a> {
+        pub bucket: &'a str,
+        pub key: &'a str,
+        pub region: &'a str,
+        pub content_length: Option<i64>,
+        pub content_type: Option<&'a str>,
+        pub content_encoding: Option<&'a str>,
+        pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+        pub bytes_read: u64,
+        pub error: &'a str,
+    }
+
+    impl InternalEvent for SqsS3ObjectDecodingAborted<'_> {
+        fn emit(self) {
+            error!(
+                message = "Stopped decoding S3 object at a non-resumable error; the rest of the object was not ingested.",
+                bucket = %self.bucket,
+                key = %self.key,
+                region = %self.region,
+                content_length = ?self.content_length,
+                content_type = ?self.content_type,
+                content_encoding = ?self.content_encoding,
+                last_modified = ?self.last_modified,
+                bytes_read = self.bytes_read,
+                error = %self.error,
+                error_code = "object_decoding_aborted",
+                error_type = error_type::PARSER_FAILED,
+                stage = error_stage::PROCESSING,
+            );
+            counter!(
+                "component_errors_total",
+                "error_code" => "object_decoding_aborted",
+                "error_type" => error_type::PARSER_FAILED,
+                "stage" => error_stage::PROCESSING,
+            )
+            .increment(1);
+        }
+    }
+
     #[derive(Debug)]
     pub struct SqsMessageDeleteSucceeded {
         pub message_ids: Vec<DeleteMessageBatchResultEntry>,

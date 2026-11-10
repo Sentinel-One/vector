@@ -88,9 +88,17 @@ impl tokio_util::codec::Decoder for Decoder {
         self.handle_framing_result(frame)
     }
 
+    /// Flushes the deserializer once the framer has no frames left, so state carried across a
+    /// unit's frames ends with the unit (for a datagram source, each datagram). Whatever the flush
+    /// returns is one last item, of zero framed bytes.
     fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let frame = self.framer.decode_eof(buf);
-        self.handle_framing_result(frame)
+        match self.framer.decode_eof(buf) {
+            Ok(None) => self
+                .deserializer
+                .flush_unit(self.log_namespace)
+                .map(|events| (!events.is_empty()).then_some((events, 0))),
+            frame => self.handle_framing_result(frame),
+        }
     }
 }
 
