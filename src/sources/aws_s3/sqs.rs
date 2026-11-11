@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::{future::ready, num::NonZeroUsize, panic, sync::Arc, sync::LazyLock};
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -676,6 +676,7 @@ impl IngestorProcess {
         // the offset of the object that has been read, but this would only be relevant in
         // the case that the same vector instance processes the same message.
         let mut read_error = None;
+        let read_failed = AtomicBool::new(false);
         let bytes_read = AtomicU64::new(0);
         let bytes_received = self.bytes_received.clone();
         let events_received = self.events_received.clone();
@@ -692,6 +693,7 @@ impl IngestorProcess {
                         bytes_read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     })
                     .map_err(|err| {
+                        read_failed.store(true, Ordering::Relaxed);
                         read_error = Some(err);
                     })
                     .ok()
@@ -712,7 +714,9 @@ impl IngestorProcess {
         };
 
         // `None` marks the end of the object, where the deserializer is flushed so events it still
-        // holds are emitted and enriched like the rest. A non-resumable error ends the object.
+        // holds are emitted and enriched like the rest. A non-resumable error ends the object. A
+        // read error skips the flush: the object is retried, and flushing its truncated state
+        // would emit wrong records that the retry then emits again.
         let fatal = OnceLock::<String>::new();
         let mut stream = lines
             .map(Some)
@@ -723,6 +727,7 @@ impl IngestorProcess {
                     Some(line) => deserializer
                         .parse_frame(line, decoder_log_namespace)
                         .map(|(events, _events_size)| events),
+                    None if read_failed.load(Ordering::Relaxed) => Ok(SmallVec::new()),
                     None => deserializer.flush_unit(decoder_log_namespace),
                 };
                 let events = match parsed {

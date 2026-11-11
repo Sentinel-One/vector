@@ -905,6 +905,25 @@ fn flush_does_not_run_for_a_unit_with_nothing_decoded() {
 }
 
 #[test]
+fn flush_does_not_run_for_an_empty_unit_under_bytes_framing() {
+    let mut decoder = decoder(indoc! {"
+        framing: { method: bytes }
+        decoding:
+          codec: assembled
+          deserializer: { codec: json }
+          assembler:
+            process: []
+            flush:
+              actions:
+                - reset: { to: .done, value: true }
+    "});
+    assert_eq!(
+        values(&run(&mut decoder, &[])),
+        Vec::<serde_json::Value>::new()
+    );
+}
+
+#[test]
 fn flush_emits_what_registers_still_hold_and_then_clears_them() {
     let mut decoder = ndjson(indoc! {r#"
         process:
