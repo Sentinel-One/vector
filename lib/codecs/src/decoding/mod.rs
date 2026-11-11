@@ -202,6 +202,15 @@ impl From<StrataSnappyDecoderConfig> for FramingConfig {
 }
 
 impl FramingConfig {
+    /// Whether frames can end anywhere in the input, rather than at a boundary the input
+    /// defines (a line, a delimiter, a length prefix, the end of a message).
+    pub const fn emits_partial_frames(&self) -> bool {
+        match self {
+            FramingConfig::Bytes(config) => config.bytes.emits_partial_frames(),
+            _ => false,
+        }
+    }
+
     /// Build the `FramerFactory` from this configuration.
     ///
     /// `limits` is only consumed by framers that decompress (currently `chunked_gelf`) or buffer

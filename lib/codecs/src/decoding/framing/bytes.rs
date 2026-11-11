@@ -31,6 +31,13 @@ const fn default_min_chunk_bytes() -> u64 {
     i64::MAX as u64
 }
 
+impl BytesDecoderOptions {
+    /// Whether `min_chunk_bytes` is set, so frames are cut wherever enough bytes have arrived.
+    pub const fn emits_partial_frames(&self) -> bool {
+        self.min_chunk_bytes != default_min_chunk_bytes()
+    }
+}
+
 impl Default for BytesDecoderOptions {
     fn default() -> Self {
         Self {
@@ -133,6 +140,14 @@ mod tests {
             "some bytes"
         );
         assert_eq!(decoder.decode(&mut input).unwrap(), None);
+    }
+
+    #[test]
+    fn only_a_set_min_chunk_bytes_emits_partial_frames() {
+        assert!(!BytesDecoderOptions::default().emits_partial_frames());
+        assert!(BytesDecoderConfig::new_with_min_chunk_bytes(4096)
+            .bytes
+            .emits_partial_frames());
     }
 
     #[test]

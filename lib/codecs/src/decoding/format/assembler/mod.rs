@@ -243,7 +243,9 @@ impl super::Deserializer for AssembledDeserializer {
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
-        self.decoded = true;
+        // Framers emit an empty frame at the end of input (`bytes` always does), which must not
+        // make an empty unit look decoded and run `flush`.
+        self.decoded |= !bytes.is_empty();
         let events = self
             .inner
             .parse(bytes, log_namespace)

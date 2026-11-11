@@ -124,6 +124,9 @@ impl_generate_config_from_default!(AwsS3Config);
 impl SourceConfig for AwsS3Config {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
+        if self.multiline.is_some() && self.framing.emits_partial_frames() {
+            error!(message = "Multiline aggregation over `bytes` framing with `min_chunk_bytes` set joins arbitrary byte chunks, not lines, so events are split and merged at arbitrary points. Remove `multiline`, or use line-based framing.");
+        }
 
         let multiline_config: Option<line_agg::Config> = self
             .multiline
