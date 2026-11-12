@@ -233,6 +233,11 @@ impl PathRules {
         !self.concrete.is_empty() || self.default.is_some()
     }
 
+    /// A wildcard rule with deeper rules skips containers so the deeper rules see their contents.
+    fn descends(&self) -> bool {
+        self.is_wildcard && self.has_children()
+    }
+
     fn lookup(&self, path: &[String]) -> Option<&PathRules> {
         let mut node = self;
         for segment in path {
@@ -647,12 +652,16 @@ impl PathRules {
             && matches!(state.value_stack.last(), Some(ValueBuilder::Array(_)));
 
         let is_container = matches!(value, Value::Object(_) | Value::Array(_));
+        let in_array = matches!(state.value_stack.last(), Some(ValueBuilder::Array(_)));
 
         let emitted: Option<Value> = if inside_exploded_array {
             Some(value.clone())
         } else {
             match self.lookup(&state.path) {
-                Some(node) if node.is_wildcard && node.has_children() && is_container => None,
+                Some(node) if node.descends() && is_container => None,
+                // Array elements share the array's path, so they match its rule too; the array is
+                // emitted whole at its end.
+                Some(node) if in_array && !node.descends() => None,
                 Some(node) => match node.op {
                     PathOperation::Identity => Some(value.clone()),
                     PathOperation::Bytes => Some(value_to_bytes(&value)),
@@ -1980,6 +1989,193 @@ op = "explode"
     }
 
     #[test]
+    fn identity_on_an_array_emits_only_the_whole_array() {
+        let input = r#"{"owner": "1", "tags": ["A", "B"], "rows": [{"id": 1}, [2, 3]], "logEvents": [{"id": "1"}]}"#;
+        let expected = vec![
+            ("owner".to_string(), Value::from("1")),
+            (
+                "tags".to_string(),
+                Value::Array(vec![Value::from("A"), Value::from("B")]),
+            ),
+            (
+                "rows".to_string(),
+                Value::Array(vec![
+                    Value::Object([("id".into(), Value::from(1))].into_iter().collect()),
+                    Value::Array(vec![Value::from(2), Value::from(3)]),
+                ]),
+            ),
+            (
+                "logEvents".to_string(),
+                Value::Object([("id".into(), Value::from("1"))].into_iter().collect()),
+            ),
+        ];
+        let concrete = wildcard_config(&[
+            ("owner", PathOperation::Identity, "*"),
+            ("tags", PathOperation::Identity, "*"),
+            ("rows", PathOperation::Identity, "*"),
+            ("logEvents", PathOperation::Explode, "*"),
+        ]);
+        let wildcard = wildcard_config(&[
+            ("*", PathOperation::Identity, "*"),
+            ("logEvents", PathOperation::Explode, "*"),
+        ]);
+
+        assert_eq!(parse_all(&concrete, input), expected);
+        assert_eq!(parse_all(&wildcard, input), expected);
+    }
+
+    #[test]
+    fn bytes_on_an_array_emits_only_the_whole_array() {
+        let config = wildcard_config(&[("tags", PathOperation::Bytes, "*")]);
+        assert_eq!(
+            parse_all(&config, r#"{"tags": ["A", "B"]}"#),
+            vec![("tags".to_string(), Value::from(r#"["A", "B"]"#))]
+        );
+    }
+
+    const DESCENT_INPUT: &str =
+        r#"{"record": {"a": 1, "meta": {"k": "v"}, "tags": ["A", {"x": 2}, [3]]}}"#;
+
+    fn descent_config(op: PathOperation) -> PathOperationConfig {
+        wildcard_config(&[
+            ("record.*", op, "*"),
+            ("record.*.*", PathOperation::Identity, "*"),
+        ])
+    }
+
+    #[test]
+    fn descending_wildcard_still_emits_scalar_array_elements() {
+        assert_eq!(
+            parse_all(&descent_config(PathOperation::Identity), DESCENT_INPUT),
+            vec![
+                ("record.a".to_string(), Value::from(1)),
+                ("record.meta.k".to_string(), Value::from("v")),
+                ("record.tags".to_string(), Value::from("A")),
+                ("record.tags.x".to_string(), Value::from(2)),
+                ("record.tags".to_string(), Value::from(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn descending_wildcard_explode_emits_whole_elements_and_deeper_matches_inside_them() {
+        assert_eq!(
+            parse_all(&descent_config(PathOperation::Explode), DESCENT_INPUT),
+            vec![
+                ("record.meta.k".to_string(), Value::from("v")),
+                ("record.tags".to_string(), Value::from("A")),
+                ("record.tags.x".to_string(), Value::from(2)),
+                (
+                    "record.tags".to_string(),
+                    Value::Object([("x".into(), Value::from(2))].into_iter().collect()),
+                ),
+                (
+                    "record.tags".to_string(),
+                    Value::Array(vec![Value::from(3)]),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn descending_wildcard_sees_through_lists_of_lists_and_explode_splits_only_the_outer_one() {
+        let input = r#"{"record": {"grid": [["A", {"x": 1}], [["B"], 2]]}}"#;
+        let x = || ("record.grid.x".to_string(), Value::from(1));
+        let grid = |value: Value| ("record.grid".to_string(), value);
+
+        assert_eq!(
+            parse_all(&descent_config(PathOperation::Identity), input),
+            vec![
+                grid(Value::from("A")),
+                x(),
+                grid(Value::from("B")),
+                grid(Value::from(2)),
+            ]
+        );
+        assert_eq!(
+            parse_all(&descent_config(PathOperation::Explode), input),
+            vec![
+                x(),
+                grid(Value::Array(vec![
+                    Value::from("A"),
+                    Value::Object([("x".into(), Value::from(1))].into_iter().collect()),
+                ])),
+                grid(Value::Array(vec![
+                    Value::Array(vec![Value::from("B")]),
+                    Value::from(2),
+                ])),
+            ]
+        );
+        assert_eq!(
+            parse_all(&descent_config(PathOperation::Drop), input),
+            vec![x()]
+        );
+    }
+
+    #[test]
+    fn concrete_and_wildcard_paths_reach_through_arrays_at_every_level_and_nesting_depth() {
+        // `{"<field>": [[..[{..}, {..}]..]], "d": 0}` with the array nested `depth` deep.
+        fn object(field: &str, depth: usize, members: &[String]) -> String {
+            format!(
+                r#"{{"{field}":{}{}{},"d":0}}"#,
+                "[".repeat(depth),
+                members.join(","),
+                "]".repeat(depth)
+            )
+        }
+        let configs = [
+            wildcard_config(&[("a.b.c.v", PathOperation::Identity, "*")]),
+            wildcard_config(&[
+                ("a.*.c.*", PathOperation::Identity, "*"),
+                ("a.*.c.d", PathOperation::Drop, "*"),
+            ]),
+            wildcard_config(&[("*.*.*.v", PathOperation::Identity, "*")]),
+        ];
+        let expected: Vec<_> = (1..=4)
+            .map(|v| ("a.b.c.v".to_string(), Value::from(v)))
+            .collect();
+
+        (1..=3).for_each(|a_depth| {
+            (1..=3).for_each(|b_depth| {
+                (1..=3).for_each(|c_depth| {
+                    let leaf = |v: i64| format!(r#"{{"v":{v},"d":0}}"#);
+                    let c = |vs: &[i64]| {
+                        object(
+                            "c",
+                            c_depth,
+                            &vs.iter().map(|&v| leaf(v)).collect::<Vec<_>>(),
+                        )
+                    };
+                    let b = |cs: Vec<String>| object("b", b_depth, &cs);
+                    let doc = object(
+                        "a",
+                        a_depth,
+                        &[b(vec![c(&[1, 2]), c(&[3])]), b(vec![c(&[4])])],
+                    );
+                    configs.iter().for_each(|config| {
+                        assert_eq!(
+                            parse_all(config, &doc),
+                            expected,
+                            "config: {config:?}, doc: {doc}"
+                        );
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn descending_wildcard_drop_emits_only_deeper_matches() {
+        assert_eq!(
+            parse_all(&descent_config(PathOperation::Drop), DESCENT_INPUT),
+            vec![
+                ("record.meta.k".to_string(), Value::from("v")),
+                ("record.tags.x".to_string(), Value::from(2)),
+            ]
+        );
+    }
+
+    #[test]
     fn test_top_level_array_emits_nothing_and_does_not_underflow_path() {
         let config = wildcard_config(&[(".", PathOperation::Identity, "*")]);
         let events = parse_all(&config, r#"[1, 2, 3]"#);
@@ -2256,17 +2452,9 @@ op = "explode"
                 |_| vec![ev("r.id", r#""1""#), ev("r.id", r#""2""#)],
             ),
             (
-                "identity on an array field emits each scalar element, then the whole array",
+                "identity on an array field emits only the whole array",
                 &[("r.tags", PathOperation::Identity)],
-                |_| {
-                    vec![
-                        ev("r.tags", r#""a""#),
-                        ev("r.tags", r#""b""#),
-                        ev("r.tags", r#"["a","b"]"#),
-                        ev("r.tags", r#""c""#),
-                        ev("r.tags", r#"["c"]"#),
-                    ]
-                },
+                |_| vec![ev("r.tags", r#"["a","b"]"#), ev("r.tags", r#"["c"]"#)],
             ),
             (
                 "explode on an array field",
@@ -2285,15 +2473,7 @@ op = "explode"
                     ("r.id", PathOperation::Drop),
                     ("r.tags", PathOperation::Identity),
                 ],
-                |_| {
-                    vec![
-                        ev("r.tags", r#""a""#),
-                        ev("r.tags", r#""b""#),
-                        ev("r.tags", r#"["a","b"]"#),
-                        ev("r.tags", r#""c""#),
-                        ev("r.tags", r#"["c"]"#),
-                    ]
-                },
+                |_| vec![ev("r.tags", r#"["a","b"]"#), ev("r.tags", r#"["c"]"#)],
             ),
             (
                 "identity and explode on sibling fields keep document order",
