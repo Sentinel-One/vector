@@ -245,6 +245,229 @@ impl PathRules {
         }
         Some(node)
     }
+
+    fn parse_frame(
+        &self,
+        streaming_state: &mut StreamingParserState,
+        bytes_slice: &[u8],
+        log_namespace: LogNamespace,
+    ) -> vector_common::Result<SmallVec<[Event; 1]>> {
+        let mut byte_offset = 0usize;
+        let total_len = bytes_slice.len();
+        while byte_offset < total_len {
+            if streaming_state.parser.feeder.is_full() {
+                self.drain_parser_events(streaming_state)?;
+                if streaming_state.parser.feeder.is_full() {
+                    return Err("JSON feeder is full and cannot accept more bytes".into());
+                }
+            }
+
+            let pushed = streaming_state
+                .parser
+                .feeder
+                .push_bytes(&bytes_slice[byte_offset..]);
+            if pushed == 0 {
+                return Err("JSON feeder could not accept bytes (0 bytes pushed)".into());
+            }
+            byte_offset += pushed;
+        }
+
+        self.drain_parser_events(streaming_state)?;
+
+        let mut result = SmallVec::new();
+        let events_to_emit = std::mem::take(&mut streaming_state.state.events);
+
+        for (expr, data) in events_to_emit {
+            let mut map = vrl::value::ObjectMap::new();
+            map.insert("expr".into(), Value::from(expr));
+            map.insert("data".into(), data);
+
+            let log = LogEvent::from_map(map, vector_core::event::EventMetadata::default());
+            let _ = log_namespace;
+
+            result.push(Event::Log(log));
+        }
+
+        Ok(result)
+    }
+
+    /// Process events from the parser until NeedMoreInput or None
+    fn drain_parser_events(
+        &self,
+        streaming_state: &mut StreamingParserState,
+    ) -> Result<(), String> {
+        loop {
+            match streaming_state
+                .parser
+                .next_event()
+                .map_err(|e| format!("JSON parsing error: {:?}", e))?
+            {
+                Some(JsonEvent::NeedMoreInput) => break,
+                Some(event) => {
+                    self.process_event_with_streaming_state(streaming_state, event)?;
+                }
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn process_event_with_streaming_state(
+        &self,
+        streaming_state: &mut StreamingParserState,
+        event: JsonEvent,
+    ) -> Result<(), String> {
+        self.process_event(&mut streaming_state.state, event, &streaming_state.parser)
+    }
+
+    fn process_event(
+        &self,
+        state: &mut ParserState,
+        event: JsonEvent,
+        parser: &JsonParser<PushJsonFeeder>,
+    ) -> Result<(), String> {
+        match event {
+            JsonEvent::StartObject => {
+                state
+                    .value_stack
+                    .push(ValueBuilder::Object(BTreeMap::new()));
+            }
+            JsonEvent::EndObject => {
+                if let Some(ValueBuilder::Object(map)) = state.value_stack.pop() {
+                    let value =
+                        Value::Object(map.into_iter().map(|(k, v)| (k.into(), v)).collect());
+                    self.handle_value_and_pop_if_in_object(state, value)?;
+                }
+            }
+            JsonEvent::StartArray => {
+                let should_explode = self
+                    .lookup(&state.path)
+                    .map(|node| node.op == PathOperation::Explode)
+                    .unwrap_or(false);
+
+                state.value_stack.push(ValueBuilder::Array(Vec::new()));
+
+                if should_explode && state.explode_stack_len.is_none() {
+                    state.explode_stack_len = Some(state.value_stack.len());
+                }
+            }
+            JsonEvent::EndArray => {
+                let is_exploded = state.explode_stack_len == Some(state.value_stack.len());
+
+                if let Some(ValueBuilder::Array(arr)) = state.value_stack.pop() {
+                    if is_exploded {
+                        state.explode_stack_len = None;
+                    } else {
+                        self.handle_value(state, Value::Array(arr))?;
+                    }
+                }
+
+                // Only an array that is an object field value has a `FieldName` segment to pop.
+                if matches!(state.value_stack.last(), Some(ValueBuilder::Object(_))) {
+                    state.pop_path();
+                }
+            }
+            JsonEvent::FieldName => {
+                let field_name = parser
+                    .current_str()
+                    .map_err(|e| format!("Error reading field name: {:?}", e))?
+                    .to_string();
+                state.push_path(field_name);
+            }
+            JsonEvent::ValueString => {
+                let s = parser
+                    .current_str()
+                    .map_err(|e| format!("Error reading string: {:?}", e))?
+                    .to_string();
+                let value = Value::from(s);
+                self.handle_value_and_pop_if_in_object(state, value)?;
+            }
+            JsonEvent::ValueInt => {
+                let i: i64 = parser
+                    .current_int()
+                    .map_err(|e| format!("Error reading int: {:?}", e))?;
+                let value = Value::from(i);
+                self.handle_value_and_pop_if_in_object(state, value)?;
+            }
+            JsonEvent::ValueFloat => {
+                let f: f64 = parser
+                    .current_float()
+                    .map_err(|e| format!("Error reading float: {:?}", e))?;
+                let value = Value::from(f);
+                self.handle_value_and_pop_if_in_object(state, value)?;
+            }
+            JsonEvent::ValueTrue => {
+                self.handle_value_and_pop_if_in_object(state, Value::from(true))?;
+            }
+            JsonEvent::ValueFalse => {
+                self.handle_value_and_pop_if_in_object(state, Value::from(false))?;
+            }
+            JsonEvent::ValueNull => {
+                self.handle_value_and_pop_if_in_object(state, Value::Null)?;
+            }
+            JsonEvent::NeedMoreInput => {}
+        }
+        Ok(())
+    }
+
+    fn handle_value(&self, state: &mut ParserState, value: Value) -> Result<(), String> {
+        let inside_exploded_array = state.explode_stack_len == Some(state.value_stack.len())
+            && matches!(state.value_stack.last(), Some(ValueBuilder::Array(_)));
+
+        let is_container = matches!(value, Value::Object(_) | Value::Array(_));
+        let in_array = matches!(state.value_stack.last(), Some(ValueBuilder::Array(_)));
+
+        let emitted: Option<Value> = if inside_exploded_array {
+            Some(value.clone())
+        } else {
+            match self.lookup(&state.path) {
+                Some(node) if node.descends() && is_container => None,
+                // Array elements share the array's path, so they match its rule too; the array is
+                // emitted whole at its end.
+                Some(node) if in_array && !node.descends() => None,
+                Some(node) => match node.op {
+                    PathOperation::Identity => Some(value.clone()),
+                    PathOperation::Bytes => Some(value_to_bytes(&value)),
+                    PathOperation::Explode | PathOperation::Drop => None,
+                },
+                None => None,
+            }
+        };
+
+        if let Some(data) = emitted {
+            let expr = state.current_path();
+            state.events.push((expr, data));
+        }
+
+        if !inside_exploded_array {
+            if let Some(parent) = state.value_stack.last_mut() {
+                match parent {
+                    ValueBuilder::Object(map) => {
+                        if let Some(key) = state.path.last() {
+                            map.insert(key.clone(), value);
+                        }
+                    }
+                    ValueBuilder::Array(arr) => {
+                        arr.push(value);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_value_and_pop_if_in_object(
+        &self,
+        state: &mut ParserState,
+        value: Value,
+    ) -> Result<(), String> {
+        self.handle_value(state, value)?;
+        if matches!(state.value_stack.last(), Some(ValueBuilder::Object(_))) {
+            state.pop_path();
+        }
+        Ok(())
+    }
 }
 
 /// Config used to build a `JsonPathDeserializer`.
@@ -477,233 +700,6 @@ impl Deserializer for JsonPathDeserializer {
             self.parser_state = Self::new_parser_state(self.feeder_capacity);
         }
         result
-    }
-}
-
-impl PathRules {
-    fn parse_frame(
-        &self,
-        streaming_state: &mut StreamingParserState,
-        bytes_slice: &[u8],
-        log_namespace: LogNamespace,
-    ) -> vector_common::Result<SmallVec<[Event; 1]>> {
-        let mut byte_offset = 0usize;
-        let total_len = bytes_slice.len();
-        while byte_offset < total_len {
-            if streaming_state.parser.feeder.is_full() {
-                self.drain_parser_events(streaming_state)?;
-                if streaming_state.parser.feeder.is_full() {
-                    return Err("JSON feeder is full and cannot accept more bytes".into());
-                }
-            }
-
-            let pushed = streaming_state
-                .parser
-                .feeder
-                .push_bytes(&bytes_slice[byte_offset..]);
-            if pushed == 0 {
-                return Err("JSON feeder could not accept bytes (0 bytes pushed)".into());
-            }
-            byte_offset += pushed;
-        }
-
-        self.drain_parser_events(streaming_state)?;
-
-        let mut result = SmallVec::new();
-        let events_to_emit = std::mem::take(&mut streaming_state.state.events);
-
-        for (expr, data) in events_to_emit {
-            let mut map = vrl::value::ObjectMap::new();
-            map.insert("expr".into(), Value::from(expr));
-            map.insert("data".into(), data);
-
-            let log = LogEvent::from_map(map, vector_core::event::EventMetadata::default());
-            let _ = log_namespace;
-
-            result.push(Event::Log(log));
-        }
-
-        Ok(result)
-    }
-}
-
-impl PathRules {
-    /// Process events from the parser until NeedMoreInput or None
-    fn drain_parser_events(
-        &self,
-        streaming_state: &mut StreamingParserState,
-    ) -> Result<(), String> {
-        loop {
-            match streaming_state
-                .parser
-                .next_event()
-                .map_err(|e| format!("JSON parsing error: {:?}", e))?
-            {
-                Some(JsonEvent::NeedMoreInput) => break,
-                Some(event) => {
-                    self.process_event_with_streaming_state(streaming_state, event)?;
-                }
-                None => break,
-            }
-        }
-        Ok(())
-    }
-
-    fn process_event_with_streaming_state(
-        &self,
-        streaming_state: &mut StreamingParserState,
-        event: JsonEvent,
-    ) -> Result<(), String> {
-        self.process_event(&mut streaming_state.state, event, &streaming_state.parser)
-    }
-
-    fn process_event(
-        &self,
-        state: &mut ParserState,
-        event: JsonEvent,
-        parser: &JsonParser<PushJsonFeeder>,
-    ) -> Result<(), String> {
-        match event {
-            JsonEvent::StartObject => {
-                state
-                    .value_stack
-                    .push(ValueBuilder::Object(BTreeMap::new()));
-            }
-            JsonEvent::EndObject => {
-                if let Some(ValueBuilder::Object(map)) = state.value_stack.pop() {
-                    let value =
-                        Value::Object(map.into_iter().map(|(k, v)| (k.into(), v)).collect());
-                    self.handle_value_and_pop_if_in_object(state, value)?;
-                }
-            }
-            JsonEvent::StartArray => {
-                let should_explode = self
-                    .lookup(&state.path)
-                    .map(|node| node.op == PathOperation::Explode)
-                    .unwrap_or(false);
-
-                state.value_stack.push(ValueBuilder::Array(Vec::new()));
-
-                if should_explode && state.explode_stack_len.is_none() {
-                    state.explode_stack_len = Some(state.value_stack.len());
-                }
-            }
-            JsonEvent::EndArray => {
-                let is_exploded = state.explode_stack_len == Some(state.value_stack.len());
-
-                if let Some(ValueBuilder::Array(arr)) = state.value_stack.pop() {
-                    if is_exploded {
-                        state.explode_stack_len = None;
-                    } else {
-                        self.handle_value(state, Value::Array(arr))?;
-                    }
-                }
-
-                // Only an array that is an object field value has a `FieldName` segment to pop.
-                if matches!(state.value_stack.last(), Some(ValueBuilder::Object(_))) {
-                    state.pop_path();
-                }
-            }
-            JsonEvent::FieldName => {
-                let field_name = parser
-                    .current_str()
-                    .map_err(|e| format!("Error reading field name: {:?}", e))?
-                    .to_string();
-                state.push_path(field_name);
-            }
-            JsonEvent::ValueString => {
-                let s = parser
-                    .current_str()
-                    .map_err(|e| format!("Error reading string: {:?}", e))?
-                    .to_string();
-                let value = Value::from(s);
-                self.handle_value_and_pop_if_in_object(state, value)?;
-            }
-            JsonEvent::ValueInt => {
-                let i: i64 = parser
-                    .current_int()
-                    .map_err(|e| format!("Error reading int: {:?}", e))?;
-                let value = Value::from(i);
-                self.handle_value_and_pop_if_in_object(state, value)?;
-            }
-            JsonEvent::ValueFloat => {
-                let f: f64 = parser
-                    .current_float()
-                    .map_err(|e| format!("Error reading float: {:?}", e))?;
-                let value = Value::from(f);
-                self.handle_value_and_pop_if_in_object(state, value)?;
-            }
-            JsonEvent::ValueTrue => {
-                self.handle_value_and_pop_if_in_object(state, Value::from(true))?;
-            }
-            JsonEvent::ValueFalse => {
-                self.handle_value_and_pop_if_in_object(state, Value::from(false))?;
-            }
-            JsonEvent::ValueNull => {
-                self.handle_value_and_pop_if_in_object(state, Value::Null)?;
-            }
-            JsonEvent::NeedMoreInput => {}
-        }
-        Ok(())
-    }
-
-    fn handle_value(&self, state: &mut ParserState, value: Value) -> Result<(), String> {
-        let inside_exploded_array = state.explode_stack_len == Some(state.value_stack.len())
-            && matches!(state.value_stack.last(), Some(ValueBuilder::Array(_)));
-
-        let is_container = matches!(value, Value::Object(_) | Value::Array(_));
-        let in_array = matches!(state.value_stack.last(), Some(ValueBuilder::Array(_)));
-
-        let emitted: Option<Value> = if inside_exploded_array {
-            Some(value.clone())
-        } else {
-            match self.lookup(&state.path) {
-                Some(node) if node.descends() && is_container => None,
-                // Array elements share the array's path, so they match its rule too; the array is
-                // emitted whole at its end.
-                Some(node) if in_array && !node.descends() => None,
-                Some(node) => match node.op {
-                    PathOperation::Identity => Some(value.clone()),
-                    PathOperation::Bytes => Some(value_to_bytes(&value)),
-                    PathOperation::Explode | PathOperation::Drop => None,
-                },
-                None => None,
-            }
-        };
-
-        if let Some(data) = emitted {
-            let expr = state.current_path();
-            state.events.push((expr, data));
-        }
-
-        if !inside_exploded_array {
-            if let Some(parent) = state.value_stack.last_mut() {
-                match parent {
-                    ValueBuilder::Object(map) => {
-                        if let Some(key) = state.path.last() {
-                            map.insert(key.clone(), value);
-                        }
-                    }
-                    ValueBuilder::Array(arr) => {
-                        arr.push(value);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_value_and_pop_if_in_object(
-        &self,
-        state: &mut ParserState,
-        value: Value,
-    ) -> Result<(), String> {
-        self.handle_value(state, value)?;
-        if matches!(state.value_stack.last(), Some(ValueBuilder::Object(_))) {
-            state.pop_path();
-        }
-        Ok(())
     }
 }
 
