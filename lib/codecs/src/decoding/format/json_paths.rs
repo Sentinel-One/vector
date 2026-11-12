@@ -5,7 +5,7 @@ use bytes::Bytes;
 use derivative::Derivative;
 use lookup::OwnedValuePath;
 use smallvec::{smallvec, SmallVec};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use vector_config::configurable_component;
 use vector_core::{
@@ -22,11 +22,12 @@ use super::{default_lossy, Deserializer};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PathOperation {
-    /// Emit the value as-is when encountered
+    /// Emit the value whole: an object or array is one event, not one per member.
     Identity,
-    /// Emit each array element as a separate event
+    /// Emit each element of the array whole, as its own event. A value that isn't an array emits
+    /// nothing.
     Explode,
-    /// Emit the value as bytes
+    /// Like `identity`, but a value that isn't a string is emitted as its text.
     Bytes,
     /// Suppress the value: emit nothing.
     Drop,
@@ -75,8 +76,20 @@ pub struct PathOperationConfig {
     /// same value (e.g. `.meta` and `meta`) are rejected at load time.
     ///
     /// A key segment equal to the rule's wildcard (default `*`) matches any
-    /// single key. Rules are resolved specific-first: a concrete segment
-    /// shadows the wildcard branch at that level.
+    /// single key. Rules are resolved specific-first: at each segment a
+    /// concrete key is tried before the wildcard, and a path that the
+    /// concrete rules lead to but don't settle falls back to the wildcard
+    /// rules beside them, so the rule whose first concrete segment is
+    /// leftmost wins. Less specific rules don't apply beneath a written rule.
+    ///
+    /// Each match emits an event `{expr, data}`: the matched path and its
+    /// value. Array elements add no path segment, so they're matched at the
+    /// array's path, and `a.b` also reaches `b` in objects inside the array
+    /// `a`, at any nesting. A wildcard rule with deeper rules below it never
+    /// emits objects or arrays: it descends into them for the deeper rules,
+    /// and emits the scalars it reaches directly, one event per element for
+    /// scalars in arrays. Deeper rules still match inside a value that is
+    /// emitted or exploded whole, so its contents can be emitted again.
     #[serde(deserialize_with = "deserialize_paths")]
     pub paths: BTreeMap<String, PathRule>,
 }
@@ -171,43 +184,44 @@ where
         .collect())
 }
 
+/// The rules as written. A node without an `op` only leads to deeper rules.
 #[derive(Debug)]
-struct PathRules {
-    concrete: BTreeMap<String, PathRules>,
-    default: Option<Box<PathRules>>,
-    op: PathOperation,
+struct RuleTrie {
+    concrete: BTreeMap<String, RuleTrie>,
+    default: Option<Box<RuleTrie>>,
+    op: Option<PathOperation>,
     is_wildcard: bool,
 }
 
-impl PathRules {
+impl RuleTrie {
     fn node(is_wildcard: bool) -> Self {
         Self {
             concrete: BTreeMap::new(),
             default: None,
-            op: PathOperation::Drop,
+            op: None,
             is_wildcard,
         }
     }
 
-    fn insert(self, segments: &[Segment<'_>], op: PathOperation) -> PathRules {
-        let PathRules {
+    fn insert(self, segments: &[Segment<'_>], op: PathOperation) -> RuleTrie {
+        let RuleTrie {
             mut concrete,
             default,
             op: current,
             is_wildcard,
         } = self;
         match segments.split_first() {
-            None => PathRules {
+            None => RuleTrie {
                 concrete,
                 default,
-                op,
+                op: Some(op),
                 is_wildcard,
             },
             Some((Segment::Wildcard, rest)) => {
                 let child = default
                     .map(|node| *node)
-                    .unwrap_or_else(|| PathRules::node(true));
-                PathRules {
+                    .unwrap_or_else(|| RuleTrie::node(true));
+                RuleTrie {
                     concrete,
                     default: Some(Box::new(child.insert(rest, op))),
                     op: current,
@@ -217,9 +231,9 @@ impl PathRules {
             Some((Segment::Concrete(name), rest)) => {
                 let child = concrete
                     .remove(*name)
-                    .unwrap_or_else(|| PathRules::node(false));
+                    .unwrap_or_else(|| RuleTrie::node(false));
                 concrete.insert((*name).to_string(), child.insert(rest, op));
-                PathRules {
+                RuleTrie {
                     concrete,
                     default,
                     op: current,
@@ -233,9 +247,56 @@ impl PathRules {
         !self.concrete.is_empty() || self.default.is_some()
     }
 
+    /// The nodes a child segment `key` (or any other segment, for `None`) reaches from `nodes`, in
+    /// the same precedence order: each node's concrete child before its wildcard child.
+    fn children<'a>(nodes: &[&'a RuleTrie], key: Option<&str>) -> Vec<&'a RuleTrie> {
+        nodes
+            .iter()
+            .flat_map(|node| {
+                key.and_then(|key| node.concrete.get(key))
+                    .into_iter()
+                    .chain(node.default.as_deref())
+            })
+            .collect()
+    }
+}
+
+/// The rule each path resolves to. A path that a concrete rule leads to but doesn't settle falls
+/// back to the wildcard rules beside it, so the rule whose first concrete segment is leftmost wins.
+#[derive(Debug)]
+struct PathRules {
+    concrete: BTreeMap<String, PathRules>,
+    default: Option<Box<PathRules>>,
+    op: PathOperation,
     /// A wildcard rule with deeper rules skips containers so the deeper rules see their contents.
-    fn descends(&self) -> bool {
-        self.is_wildcard && self.has_children()
+    descends: bool,
+}
+
+impl PathRules {
+    fn resolve(candidates: &[&RuleTrie]) -> Self {
+        let written = candidates.iter().position(|node| node.op.is_some());
+        // A written rule is final for its subtree, so less specific rules don't reach below it.
+        let visible = &candidates[..written.map_or(candidates.len(), |index| index + 1)];
+        let keys: BTreeSet<&str> = visible
+            .iter()
+            .flat_map(|node| node.concrete.keys().map(String::as_str))
+            .collect();
+        let defaults = RuleTrie::children(visible, None);
+        let source = written.map(|index| candidates[index]);
+        Self {
+            concrete: keys
+                .into_iter()
+                .map(|key| {
+                    let children = RuleTrie::children(visible, Some(key));
+                    (key.to_string(), Self::resolve(&children))
+                })
+                .collect(),
+            default: (!defaults.is_empty()).then(|| Box::new(Self::resolve(&defaults))),
+            op: source
+                .and_then(|node| node.op)
+                .unwrap_or(PathOperation::Drop),
+            descends: source.is_some_and(|node| node.is_wildcard && node.has_children()),
+        }
     }
 
     fn lookup(&self, path: &[String]) -> Option<&PathRules> {
@@ -421,10 +482,10 @@ impl PathRules {
             Some(value.clone())
         } else {
             match self.lookup(&state.path) {
-                Some(node) if node.descends() && is_container => None,
+                Some(node) if node.descends && is_container => None,
                 // Array elements share the array's path, so they match its rule too; the array is
                 // emitted whole at its end.
-                Some(node) if in_array && !node.descends() => None,
+                Some(node) if in_array && !node.descends => None,
                 Some(node) => match node.op {
                     PathOperation::Identity => Some(value.clone()),
                     PathOperation::Bytes => Some(value_to_bytes(&value)),
@@ -569,15 +630,15 @@ pub struct JsonPathDeserializerFactory {
 impl JsonPathDeserializerFactory {
     /// Creates a new `JsonPathDeserializerFactory`.
     pub fn new(config: &PathOperationConfig, options: &JsonPathDeserializerOptions) -> Self {
-        let rules = config
+        let trie = config
             .paths
             .iter()
-            .fold(PathRules::node(false), |rules, (key, rule)| {
-                rules.insert(&canonical_segments(key, &rule.wildcard), rule.op)
+            .fold(RuleTrie::node(false), |trie, (key, rule)| {
+                trie.insert(&canonical_segments(key, &rule.wildcard), rule.op)
             });
 
         Self {
-            rules: Arc::new(rules),
+            rules: Arc::new(PathRules::resolve(&[&trie])),
             lossy: options.lossy,
             feeder_capacity: options.feeder_capacity,
         }
@@ -2158,6 +2219,320 @@ op = "explode"
                 });
             });
         });
+    }
+
+    fn object(entries: &[(&str, Value)]) -> Value {
+        Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).into(), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn ev(expr: &str, data: Value) -> (String, Value) {
+        (expr.to_string(), data)
+    }
+
+    #[test]
+    fn concrete_rule_falls_back_to_the_wildcard_beside_it_for_unmatched_deeper_segments() {
+        let config = wildcard_config(&[
+            ("a.*.c.*", PathOperation::Identity, "*"),
+            ("a.b.c.d", PathOperation::Drop, "*"),
+        ]);
+        assert_eq!(
+            parse_all(
+                &config,
+                r#"{"a": {"b": {"c": {"v": 1, "d": 0}}, "x": {"c": {"v": 2, "d": 0}}}}"#
+            ),
+            vec![
+                ev("a.b.c.v", Value::from(1)),
+                ev("a.x.c.v", Value::from(2)),
+                ev("a.x.c.d", Value::from(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn concrete_rule_falls_back_to_the_wildcard_through_arrays() {
+        let config = wildcard_config(&[
+            ("a.*.c.*", PathOperation::Identity, "*"),
+            ("a.b.c.d", PathOperation::Drop, "*"),
+        ]);
+        assert_eq!(
+            parse_all(
+                &config,
+                r#"{"a": [{"b": [[{"c": [{"v": 1, "d": 0}]}]]}, {"x": {"c": {"v": 2, "d": 0}}}]}"#
+            ),
+            vec![
+                ev("a.b.c.v", Value::from(1)),
+                ev("a.x.c.v", Value::from(2)),
+                ev("a.x.c.d", Value::from(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn leftmost_concrete_segment_takes_precedence_over_a_later_one() {
+        let config = wildcard_config(&[
+            ("a.b.*", PathOperation::Drop, "*"),
+            ("a.*.c", PathOperation::Identity, "*"),
+            ("a.*.c.z", PathOperation::Identity, "*"),
+        ]);
+        assert_eq!(
+            parse_all(
+                &config,
+                r#"{"a": {"b": {"c": {"z": 1}, "e": 2}, "x": {"c": {"z": 3}}}}"#
+            ),
+            vec![
+                ev("a.x.c.z", Value::from(3)),
+                ev("a.x.c", object(&[("z", Value::from(3))])),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_rule_whose_first_concrete_segment_is_leftmost_wins() {
+        let scalar = r#"{"a": {"b": {"c": 1}}}"#;
+        let array = r#"{"a": {"b": {"c": [1, 2]}}}"#;
+        let identity = || vec![ev("a.b.c", Value::from(1))];
+        let bytes = || vec![ev("a.b.c", Value::from("1"))];
+        let whole = || {
+            vec![ev(
+                "a.b.c",
+                Value::Array(vec![Value::from(1), Value::from(2)]),
+            )]
+        };
+        let elements = || vec![ev("a.b.c", Value::from(1)), ev("a.b.c", Value::from(2))];
+        type Case = (
+            &'static str,
+            &'static [(&'static str, PathOperation)],
+            &'static str,
+            Vec<(String, Value)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "a fully concrete rule beats every wildcard",
+                &[
+                    ("a.b.c", PathOperation::Identity),
+                    ("a.b.*", PathOperation::Bytes),
+                    ("a.*.c", PathOperation::Drop),
+                ],
+                scalar,
+                identity(),
+            ),
+            (
+                "concrete up to the 2nd segment beats concrete up to the 1st",
+                &[
+                    ("a.b.*", PathOperation::Identity),
+                    ("a.*.c", PathOperation::Bytes),
+                ],
+                scalar,
+                identity(),
+            ),
+            (
+                "concrete at the 1st segment beats a wildcard there",
+                &[
+                    ("a.*.c", PathOperation::Identity),
+                    ("*.b.c", PathOperation::Bytes),
+                ],
+                scalar,
+                identity(),
+            ),
+            (
+                "a concrete 1st segment beats more concrete segments after a wildcard",
+                &[
+                    ("a.*.*", PathOperation::Bytes),
+                    ("*.b.c", PathOperation::Identity),
+                ],
+                scalar,
+                bytes(),
+            ),
+            (
+                "a filler concrete segment falls back to the nearest wildcard first",
+                &[
+                    ("a.b.q", PathOperation::Drop),
+                    ("a.*.c", PathOperation::Identity),
+                    ("*.b.c", PathOperation::Bytes),
+                ],
+                scalar,
+                identity(),
+            ),
+            (
+                "a filler concrete segment falls back as far as the root wildcard",
+                &[
+                    ("a.b.q", PathOperation::Drop),
+                    ("*.b.c", PathOperation::Bytes),
+                ],
+                scalar,
+                bytes(),
+            ),
+            (
+                "a written drop wins like any other rule",
+                &[
+                    ("a.b.c", PathOperation::Drop),
+                    ("a.*.c", PathOperation::Identity),
+                ],
+                scalar,
+                vec![],
+            ),
+            (
+                "concrete identity beats wildcard explode",
+                &[
+                    ("a.b.c", PathOperation::Identity),
+                    ("a.b.*", PathOperation::Explode),
+                ],
+                array,
+                whole(),
+            ),
+            (
+                "concrete explode beats wildcard identity",
+                &[
+                    ("a.b.c", PathOperation::Explode),
+                    ("a.b.*", PathOperation::Identity),
+                ],
+                array,
+                elements(),
+            ),
+            (
+                "concrete drop beats wildcard explode",
+                &[
+                    ("a.b.c", PathOperation::Drop),
+                    ("a.b.*", PathOperation::Explode),
+                ],
+                array,
+                vec![],
+            ),
+            (
+                "earlier concrete explode beats later concrete identity",
+                &[
+                    ("a.*.*", PathOperation::Explode),
+                    ("*.b.c", PathOperation::Identity),
+                ],
+                array,
+                elements(),
+            ),
+            (
+                "filler falls back to the nearest wildcard explode",
+                &[
+                    ("a.b.q", PathOperation::Drop),
+                    ("a.*.c", PathOperation::Explode),
+                    ("*.b.c", PathOperation::Identity),
+                ],
+                array,
+                elements(),
+            ),
+            (
+                "winning explode on a scalar emits nothing",
+                &[
+                    ("a.b.c", PathOperation::Explode),
+                    ("a.b.*", PathOperation::Identity),
+                ],
+                scalar,
+                vec![],
+            ),
+        ];
+
+        cases
+            .into_iter()
+            .for_each(|(name, rules, input, expected)| {
+                let entries: Vec<_> = rules.iter().map(|(path, op)| (*path, *op, "*")).collect();
+                assert_eq!(
+                    parse_all(&wildcard_config(&entries), input),
+                    expected,
+                    "case: {name}"
+                );
+            });
+    }
+
+    #[test]
+    fn filler_concrete_node_inherits_a_descending_wildcard() {
+        let config = wildcard_config(&[
+            ("records.*", PathOperation::Identity, "*"),
+            ("records.*.*", PathOperation::Identity, "*"),
+            ("records.properties.flows", PathOperation::Explode, "*"),
+        ]);
+        assert_eq!(
+            parse_all(
+                &config,
+                r#"{"records": {"time": "T", "properties": {"Version": 1, "flows": ["f1", "f2"]}}}"#
+            ),
+            vec![
+                ev("records.time", Value::from("T")),
+                ev("records.properties.Version", Value::from(1)),
+                ev("records.properties.flows", Value::from("f1")),
+                ev("records.properties.flows", Value::from("f2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn filler_concrete_node_inherits_a_leaf_wildcard_and_is_emitted_whole() {
+        let config = wildcard_config(&[
+            ("a.*", PathOperation::Identity, "*"),
+            ("a.b.d", PathOperation::Drop, "*"),
+        ]);
+        assert_eq!(
+            parse_all(&config, r#"{"a": {"b": {"d": 1, "x": 2}, "c": 3}}"#),
+            vec![
+                ev(
+                    "a.b",
+                    object(&[("d", Value::from(1)), ("x", Value::from(2))])
+                ),
+                ev("a.c", Value::from(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn filler_concrete_node_inherits_a_wildcard_explode() {
+        let config = wildcard_config(&[
+            ("a.*", PathOperation::Explode, "*"),
+            ("a.b.d", PathOperation::Identity, "*"),
+        ]);
+        assert_eq!(
+            parse_all(&config, r#"{"a": {"b": [1, 2], "c": [3]}}"#),
+            vec![
+                ev("a.b", Value::from(1)),
+                ev("a.b", Value::from(2)),
+                ev("a.c", Value::from(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn written_concrete_rule_is_final_for_its_subtree() {
+        let config = wildcard_config(&[
+            ("records.*", PathOperation::Identity, "*"),
+            ("records.*.*", PathOperation::Identity, "*"),
+            ("records.properties", PathOperation::Identity, "*"),
+        ]);
+        assert_eq!(
+            parse_all(
+                &config,
+                r#"{"records": {"time": "T", "properties": {"Version": 1}, "other": {"Version": 3}}}"#
+            ),
+            vec![
+                ev("records.time", Value::from("T")),
+                ev("records.properties", object(&[("Version", Value::from(1))])),
+                ev("records.other.Version", Value::from(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn written_wildcard_rule_under_a_concrete_segment_is_final_for_its_subtree() {
+        let config = wildcard_config(&[
+            ("a.*", PathOperation::Identity, "*"),
+            ("*.b.c", PathOperation::Identity, "*"),
+        ]);
+        assert_eq!(
+            parse_all(&config, r#"{"a": {"b": {"c": 1}}, "z": {"b": {"c": 2}}}"#),
+            vec![
+                ev("a.b", object(&[("c", Value::from(1))])),
+                ev("z.b.c", Value::from(2)),
+            ]
+        );
     }
 
     #[test]
