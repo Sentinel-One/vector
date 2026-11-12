@@ -3,6 +3,7 @@
 
 #![deny(missing_docs)]
 
+mod assembler;
 mod avro;
 mod bytes;
 mod csv;
@@ -19,6 +20,11 @@ mod syslog;
 mod vrl;
 
 use ::bytes::Bytes;
+pub use assembler::{
+    ActionConfig, AppendConfig, AssembledDeserializer, AssembledDeserializerConfig,
+    AssembledDeserializerFactory, AssemblerConfig, EmitConfig, FlushConfig, FlushMetadata,
+    ForeachConfig, IfConfig, JsonValue, MergeConfig, ResetConfig,
+};
 pub use avro::{
     AvroDeserializer, AvroDeserializerConfig, AvroDeserializerFactory, AvroDeserializerOptions,
 };
@@ -64,6 +70,15 @@ pub trait Deserializer: Send {
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>>;
+
+    /// Ends the current unit of input (a stream, an object, a datagram): returns any events still
+    /// held for it, and discards state carried across its frames.
+    fn flush(
+        &mut self,
+        _log_namespace: LogNamespace,
+    ) -> vector_common::Result<SmallVec<[Event; 1]>> {
+        Ok(SmallVec::new())
+    }
 }
 
 /// A `Box` containing a `Deserializer`.
