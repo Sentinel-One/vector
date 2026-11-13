@@ -23,6 +23,9 @@ pub struct HecMetricsSink<S> {
     pub index: Option<Template>,
     pub host_key: Option<OwnedValuePath>,
     pub default_namespace: Option<String>,
+    /// Labels of `component_sent_bytes_total`, so the driver can register it at start.
+    pub protocol: String,
+    pub endpoint: String,
 }
 
 impl<S> HecMetricsSink<S>
@@ -68,6 +71,9 @@ where
                 }
             })
             .into_driver(self.service)
+            .protocol(self.protocol)
+            // Holds the bytes series from the start; `emit!(EndpointBytesSent)` counts into it (same name + labels).
+            .endpoint(self.endpoint)
             .run()
             .await
     }

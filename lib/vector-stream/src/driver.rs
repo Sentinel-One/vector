@@ -43,6 +43,7 @@ pub struct Driver<St, Svc> {
     input: St,
     service: Svc,
     protocol: Option<SharedString>,
+    endpoint: Option<SharedString>,
 }
 
 impl<St, Svc> Driver<St, Svc> {
@@ -51,6 +52,7 @@ impl<St, Svc> Driver<St, Svc> {
             input,
             service,
             protocol: None,
+            endpoint: None,
         }
     }
 
@@ -61,6 +63,14 @@ impl<St, Svc> Driver<St, Svc> {
     #[must_use]
     pub fn protocol(mut self, protocol: impl Into<SharedString>) -> Self {
         self.protocol = Some(protocol.into());
+        self
+    }
+
+    /// Set the endpoint this driver sends to, added as the `endpoint` label of the `BytesSent`
+    /// event. Only used together with [`Driver::protocol`].
+    #[must_use]
+    pub fn endpoint(mut self, endpoint: impl Into<SharedString>) -> Self {
+        self.endpoint = Some(endpoint.into());
         self
     }
 }
@@ -91,13 +101,17 @@ where
             input,
             mut service,
             protocol,
+            endpoint,
         } = self;
 
         let batched_input = input.ready_chunks(1024);
         pin!(batched_input);
 
-        let bytes_sent = protocol.map(|protocol| register(BytesSent { protocol }));
+        let bytes_sent = protocol.map(|protocol| register(BytesSent { protocol, endpoint }));
         let events_sent = RegisteredEventCache::new(());
+        // Register the untagged `component_sent_events_total` / `..._event_bytes_total` series at 0
+        // and hold the handle for the life of the driver, so they exist before the first delivery.
+        let _events_sent_at_zero = register(TaggedEventsSent::new_unspecified());
 
         loop {
             // Core behavior of the loop:

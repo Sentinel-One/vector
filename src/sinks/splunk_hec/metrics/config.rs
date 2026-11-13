@@ -15,6 +15,7 @@ use crate::{
         splunk_hec::common::{
             acknowledgements::HecClientAcknowledgementsConfig,
             build_healthcheck, build_http_batch_service, config_host_key, create_client,
+            bytes_sent_labels,
             service::{HecRejectionContext, HecService, HttpRequestBuilder, Token},
             EndpointTarget, SplunkHecDefaultBatchSettings,
         },
@@ -232,6 +233,8 @@ impl HecMetricsSinkConfig {
 
         let batch_settings = self.batch.into_batcher_settings()?;
 
+        let (protocol, endpoint) =
+            bytes_sent_labels(&self.endpoint, EndpointTarget::Event, self.path.clone());
         let sink = HecMetricsSink {
             service,
             batch_settings,
@@ -241,6 +244,8 @@ impl HecMetricsSinkConfig {
             index: self.index.clone(),
             host_key: self.host_key.path.clone(),
             default_namespace: self.default_namespace.clone(),
+            protocol,
+            endpoint,
         };
 
         Ok(VectorSink::from_event_streamsink(sink))

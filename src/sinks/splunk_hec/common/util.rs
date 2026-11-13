@@ -84,6 +84,19 @@ pub fn build_http_batch_service(
     })
 }
 
+/// The `protocol` and `endpoint` labels of `component_sent_bytes_total` for a sink, built the same
+/// way a request builds them: the endpoint plus the resolved path, without credentials or query.
+pub fn bytes_sent_labels(
+    endpoint: &str,
+    endpoint_target: EndpointTarget,
+    path: Option<String>,
+) -> (String, String) {
+    build_uri(endpoint, &resolve_path(endpoint_target, path), None).map_or_else(
+        |_| ("http".to_owned(), endpoint.to_owned()),
+        crate::sinks::util::uri::protocol_endpoint,
+    )
+}
+
 fn resolve_path(
     endpoint_target: EndpointTarget,
     path: Option<String>,
