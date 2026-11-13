@@ -39,6 +39,9 @@ pub struct HecLogsSink<S> {
     pub auto_extract_timestamp: bool,
     pub timestamp_configuration: Option<TimestampConfiguration>,
     pub batch_headers: Vec<(HeaderName, ConfigValuePath)>,
+    /// Labels of `component_sent_bytes_total`, so the driver can register it at start.
+    pub protocol: String,
+    pub endpoint: String,
 }
 
 pub struct HecLogData<'a> {
@@ -105,6 +108,9 @@ where
                 }
             })
             .into_driver(self.service)
+            .protocol(self.protocol)
+            // Holds the bytes series from the start; `emit!(EndpointBytesSent)` counts into it (same name + labels).
+            .endpoint(self.endpoint)
             .run()
             .await
     }
