@@ -76,6 +76,8 @@ async fn start_test(
 
 #[tokio::test]
 async fn smoke() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let (expected, rx) = start_test(StatusCode::OK, BatchStatus::Delivered).await;
 
     let output = rx.take(expected.len()).collect::<Vec<_>>().await;
@@ -109,6 +111,8 @@ async fn handles_failure() {
 
 #[tokio::test]
 async fn api_key_in_metadata() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let (mut config, cx) = load_sink::<DatadogEventsConfig>(indoc! {r#"
             default_api_key = "atoken"
         "#})
@@ -159,6 +163,8 @@ async fn api_key_in_metadata() {
 
 #[tokio::test]
 async fn filter_out_fields() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let (expected, rx) = start_test(StatusCode::OK, BatchStatus::Delivered).await;
 
     let output = rx.take(expected.len()).collect::<Vec<_>>().await;

@@ -110,6 +110,12 @@ pub fn init_global() -> Result<()> {
 /// Initialize the thread-local metrics sub-system. This function will loop until a recorder is
 /// actually set.
 pub fn init_test() {
+    // `VectorRecorder::new_test()` clears the thread-local registry. Skip it when the metrics
+    // system is already set up, so a counter created earlier in the same test (e.g. one a sink
+    // creates when it is built) is not wiped by a later `init_test` call.
+    if CONTROLLER.get().is_some() {
+        return;
+    }
     if init(VectorRecorder::new_test()).is_err() {
         // The only error case returned by `init` is `AlreadyInitialized`. A race condition is
         // possible here: if metrics are being initialized by two (or more) test threads

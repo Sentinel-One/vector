@@ -42,6 +42,8 @@ fn generate_config() {
 
 #[tokio::test]
 async fn component_spec_compliance() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let mock_endpoint = spawn_blackhole_http_server(always_200_response).await;
 
     let config = StackdriverConfig::generate_config().to_string();
