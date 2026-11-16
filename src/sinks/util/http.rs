@@ -15,6 +15,7 @@ use headers::HeaderName;
 use http::{header, HeaderValue, Request, Response, StatusCode};
 use hyper::{body, Body};
 use indexmap::IndexMap;
+use metrics::{counter, Counter};
 use pin_project::pin_project;
 use snafu::{ResultExt, Snafu};
 use tower::{Service, ServiceBuilder};
@@ -26,13 +27,13 @@ use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 use super::{
     retries::{RetryAction, RetryLogic},
     sink::{self, Response as _},
-    uri, Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
+    Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
     TowerRequestSettings,
 };
 use crate::{
     event::Event,
     http::{HttpClient, HttpError},
-    internal_events::{EndpointBytesSent, SinkRequestBuildError},
+    internal_events::SinkRequestBuildError,
     sinks::prelude::*,
 };
 
@@ -355,6 +356,10 @@ where
 pub struct HttpBatchService<F, B = Bytes> {
     inner: HttpClient<Body>,
     request_builder: Arc<dyn Fn(B) -> F + Send + Sync>,
+    /// `component_sent_bytes_total`, created once when the service is built (inside the sink's
+    /// span, so it carries the component tags) and held for the life of the service. This keeps
+    /// the series present from the start and keeps it from expiring while the sink is idle.
+    bytes_sent: Counter,
 }
 
 impl<F, B> HttpBatchService<F, B> {
@@ -365,6 +370,7 @@ impl<F, B> HttpBatchService<F, B> {
         HttpBatchService {
             inner,
             request_builder: Arc::new(Box::new(request_builder)),
+            bytes_sent: counter!("component_sent_bytes_total"),
         }
     }
 }
@@ -385,6 +391,7 @@ where
     fn call(&mut self, body: B) -> Self::Future {
         let request_builder = Arc::clone(&self.request_builder);
         let http_client = self.inner.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let request = request_builder(body).await.inspect_err(|error| {
@@ -392,7 +399,6 @@ where
             })?;
             let byte_size = request.body().len();
             let request = request.map(Body::from);
-            let (protocol, endpoint) = uri::protocol_endpoint(request.uri().clone());
 
             let mut decompression_service = ServiceBuilder::new()
                 .layer(DecompressionLayer::new())
@@ -404,11 +410,7 @@ where
             let response = decompression_service.call(request).await?;
 
             if response.status().is_success() {
-                emit!(EndpointBytesSent {
-                    byte_size,
-                    protocol: &protocol,
-                    endpoint: &endpoint
-                });
+                bytes_sent.increment(byte_size as u64);
             }
 
             let (parts, body) = response.into_parts();
@@ -426,6 +428,7 @@ impl<F, B> Clone for HttpBatchService<F, B> {
         Self {
             inner: self.inner.clone(),
             request_builder: Arc::clone(&self.request_builder),
+            bytes_sent: self.bytes_sent.clone(),
         }
     }
 }

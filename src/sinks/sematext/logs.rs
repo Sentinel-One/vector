@@ -178,6 +178,8 @@ mod tests {
 
     #[tokio::test]
     async fn smoke() {
+        // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+        crate::test_util::components::init_test();
         let (mut config, cx) = load_sink::<SematextLogsConfig>(indoc! {r#"
             token = "mylogtoken"
         "#})

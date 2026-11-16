@@ -690,6 +690,8 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_v1() {
+        // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+        crate::test_util::components::init_test();
         let rx = smoke_test(
             r#"database = "my-database""#,
             StatusCode::OK,
@@ -714,6 +716,8 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_v2() {
+        // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+        crate::test_util::components::init_test();
         let rx = smoke_test(
             indoc! {r#"
             bucket = "my-bucket"

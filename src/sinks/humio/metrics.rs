@@ -276,6 +276,8 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_json() {
+        // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+        crate::test_util::components::init_test();
         let (mut config, cx) = load_sink::<HumioMetricsConfig>(indoc! {r#"
             token = "atoken"
             batch.max_events = 1
@@ -341,6 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn multi_value_tags() {
+        // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+        crate::test_util::components::init_test();
         let (mut config, cx) = load_sink::<HumioMetricsConfig>(indoc! {r#"
             token = "atoken"
             batch.max_events = 1

@@ -108,9 +108,12 @@ pub static TRANSFORM_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| Componen
 /// The component test specification for sinks that are push-based.
 pub static SINK_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| {
     ComponentTests {
-        events: &["BytesSent", "EventsSent"], // EventsReceived is emitted in the topology
-        tagged_counters: &["component_sent_bytes_total"],
+        // EventsReceived is emitted in the topology. The bytes counter is held by the sink's
+        // service and has no `BytesSent` event or `protocol`/`endpoint` tags.
+        events: &["EventsSent"],
+        tagged_counters: &[],
         untagged_counters: &[
+            "component_sent_bytes_total",
             "component_sent_events_total",
             "component_sent_event_bytes_total",
         ],

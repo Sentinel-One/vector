@@ -205,6 +205,8 @@ async fn http_headers_auth_conflict() {
 
 #[tokio::test]
 async fn http_happy_path_post() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     run_sink(
         r#"
         [auth]
@@ -226,6 +228,8 @@ async fn http_happy_path_post() {
 
 #[tokio::test]
 async fn http_happy_path_put() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     run_sink(
         r#"
         method = "put"
@@ -248,6 +252,8 @@ async fn http_happy_path_put() {
 
 #[tokio::test]
 async fn http_passes_custom_headers() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     run_sink(
         r#"
         [request.headers]

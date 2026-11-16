@@ -22,6 +22,8 @@ fn generate_config() {
 
 #[tokio::test]
 async fn component_spec_compliance() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let mock_endpoint = spawn_blackhole_http_server(always_200_response).await;
 
     let config = StackdriverConfig::generate_config().to_string();
@@ -47,6 +49,8 @@ async fn component_spec_compliance() {
 
 #[tokio::test]
 async fn sends_metric() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let in_addr = next_addr();
     let config = StackdriverConfig {
         endpoint: format!("http://{in_addr}"),
@@ -104,6 +108,8 @@ async fn sends_metric() {
 
 #[tokio::test]
 async fn sends_multiple_metrics() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let in_addr = next_addr();
     let mut batch = BatchConfig::default();
     batch.max_events = Some(5);
@@ -191,6 +197,8 @@ async fn sends_multiple_metrics() {
 
 #[tokio::test]
 async fn does_not_aggregate_metrics() {
+    // The sink creates `component_sent_bytes_total` when it is built, so the metrics recorder must exist first.
+    crate::test_util::components::init_test();
     let in_addr = next_addr();
     let mut batch = BatchConfig::default();
     batch.max_events = Some(5);
