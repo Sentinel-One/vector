@@ -1,5 +1,12 @@
+use std::time::Duration;
+
+use serde_with::serde_as;
 use vector_lib::configurable::configurable_component;
 use vector_lib::sensitive_string::SensitiveString;
+
+const fn default_reload_interval() -> Duration {
+    Duration::from_secs(2)
+}
 
 /// Source of an auth bearer token sent with outgoing requests.
 ///
@@ -13,11 +20,12 @@ use vector_lib::sensitive_string::SensitiveString;
 /// token.value = "${MY_AUTH_TOKEN}"
 /// ```
 ///
-/// File path (re-read on every request for Kubernetes secret rotation):
+/// File path (re-read at most every `reload_interval` for Kubernetes secret rotation):
 /// ```toml
 /// token.type = "file"
 /// token.path = "/var/run/secrets/vector/token"
 /// ```
+#[serde_as]
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
@@ -33,11 +41,19 @@ pub enum AuthTokenConfig {
 
     /// Path to a file containing the bearer token.
     ///
-    /// The file is re-read on **every request** so that a rotated Kubernetes secret
-    /// volume mount is picked up automatically without restarting the agent.
+    /// The file is re-read when a request needs the token and `reload_interval` has
+    /// passed since the last read, so that a rotated Kubernetes secret volume mount is
+    /// picked up automatically without restarting the agent or touching the
+    /// filesystem on every request.
     File {
         /// Path to the token file.
         path: String,
+
+        /// Minimum time between reads of the token file.
+        #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
+        #[serde(default = "default_reload_interval", alias = "reload_interval_secs")]
+        #[configurable(metadata(docs::human_name = "Reload Interval"))]
+        reload_interval: Duration,
     },
 }
 
@@ -56,8 +72,45 @@ pub struct AuthState {
 pub enum AuthToken {
     /// Fully-formatted `"Bearer <value>"` ready to insert into gRPC metadata.
     Static(tonic::metadata::MetadataValue<tonic::metadata::Ascii>),
-    /// Path to a file re-read on every request (K8s secret rotation).
-    File(String),
+    /// Token file re-read at most every `reload_interval` (K8s secret rotation).
+    File(FileToken),
+}
+
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
+#[derive(Debug)]
+pub struct FileToken {
+    path: String,
+    reload_interval: Duration,
+    /// The last read and when it happened. Failed reads are kept too, so a missing
+    /// file costs one filesystem call per interval rather than one per request.
+    last_read: std::sync::Mutex<Option<(std::time::Instant, TokenRead)>>,
+}
+
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
+type TokenRead = Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, String>;
+
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
+impl FileToken {
+    fn bearer_token(&self) -> TokenRead {
+        let mut last_read = self.last_read.lock().expect("token cache lock poisoned");
+        match &*last_read {
+            Some((at, read)) if at.elapsed() < self.reload_interval => read.clone(),
+            Some(_) | None => {
+                let read = self.read();
+                *last_read = Some((std::time::Instant::now(), read.clone()));
+                read
+            }
+        }
+    }
+
+    fn read(&self) -> TokenRead {
+        let raw = std::fs::read_to_string(&self.path)
+            .map_err(|err| format!("failed to read token file '{}': {err}", self.path))?;
+        let token = raw.trim();
+        format!("Bearer {token}")
+            .parse::<tonic::metadata::MetadataValue<_>>()
+            .map_err(|err| format!("token file contains invalid characters: {err}"))
+    }
 }
 
 #[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
@@ -77,7 +130,14 @@ impl AuthState {
                     .map_err(|_| "auth token (inline) contains characters invalid for gRPC metadata")?;
                 AuthToken::Static(header)
             }
-            AuthTokenConfig::File { path } => AuthToken::File(path),
+            AuthTokenConfig::File {
+                path,
+                reload_interval,
+            } => AuthToken::File(FileToken {
+                path,
+                reload_interval,
+                last_read: std::sync::Mutex::new(None),
+            }),
         };
 
         Ok(Self { token })
@@ -86,8 +146,9 @@ impl AuthState {
     /// Returns the current bearer token as a gRPC `MetadataValue`.
     ///
     /// For [`AuthToken::Static`] this is a cheap clone of the pre-built value.
-    /// For [`AuthToken::File`] the token file is re-read on every call so that
-    /// a rotated Kubernetes secret is picked up without restarting the agent.
+    /// For [`AuthToken::File`] the token file is re-read once `reload_interval` has
+    /// passed since the last read, so that a rotated Kubernetes secret is picked up
+    /// without restarting the agent.
     ///
     /// Returns an error message string on failure; the caller is responsible for
     /// converting it to the appropriate error type.
@@ -96,14 +157,7 @@ impl AuthState {
     ) -> Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, String> {
         match &self.token {
             AuthToken::Static(value) => Ok(value.clone()),
-            AuthToken::File(path) => {
-                let raw = std::fs::read_to_string(path)
-                    .map_err(|err| format!("failed to read token file '{}': {err}", path))?;
-                let token = raw.trim();
-                format!("Bearer {token}")
-                    .parse::<tonic::metadata::MetadataValue<_>>()
-                    .map_err(|err| format!("token file contains invalid characters: {err}"))
-            }
+            AuthToken::File(file) => file.bearer_token(),
         }
     }
 }
@@ -133,6 +187,7 @@ mod tests {
     fn from_config_file_stores_path() {
         let state = AuthState::from_config(AuthTokenConfig::File {
             path: "/some/path/token".into(),
+            reload_interval: Duration::ZERO,
         })
         .expect("valid file config should build");
 
@@ -174,6 +229,7 @@ mod tests {
 
         let state = AuthState::from_config(AuthTokenConfig::File {
             path: f.path().to_str().unwrap().into(),
+            reload_interval: Duration::ZERO,
         })
         .unwrap();
 
@@ -190,6 +246,7 @@ mod tests {
 
         let state = AuthState::from_config(AuthTokenConfig::File {
             path: f.path().to_str().unwrap().into(),
+            reload_interval: Duration::ZERO,
         })
         .unwrap();
 
@@ -206,6 +263,7 @@ mod tests {
 
         let state = AuthState::from_config(AuthTokenConfig::File {
             path: f.path().to_str().unwrap().into(),
+            reload_interval: Duration::ZERO,
         })
         .unwrap();
 
@@ -227,7 +285,11 @@ mod tests {
     #[test]
     fn bearer_token_file_not_found_returns_error_with_path() {
         let path = "/nonexistent/path/to/token";
-        let state = AuthState::from_config(AuthTokenConfig::File { path: path.into() }).unwrap();
+        let state = AuthState::from_config(AuthTokenConfig::File {
+            path: path.into(),
+            reload_interval: Duration::ZERO,
+        })
+        .unwrap();
 
         let err = state.bearer_token().unwrap_err();
         assert!(err.contains(path), "error should contain path: {err}");
@@ -257,7 +319,7 @@ extra = "nope""#;
 path = "/var/run/secrets/token""#;
         let cfg: AuthTokenConfig = toml::from_str(toml).unwrap();
         assert!(
-            matches!(cfg, AuthTokenConfig::File { path } if path == "/var/run/secrets/token")
+            matches!(cfg, AuthTokenConfig::File { path, .. } if path == "/var/run/secrets/token")
         );
     }
 
@@ -271,5 +333,94 @@ path = "/var/run/secrets/token""#;
     fn auth_token_config_unknown_type_fails() {
         let toml = r#"type = "env""#;
         assert!(toml::from_str::<AuthTokenConfig>(toml).is_err());
+    }
+
+    fn file_state(path: &std::path::Path, reload_interval: Duration) -> AuthState {
+        AuthState::from_config(AuthTokenConfig::File {
+            path: path.to_str().unwrap().into(),
+            reload_interval,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_file_token_served_from_cache_within_reload_interval() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "first-token").unwrap();
+        let state = file_state(f.path(), Duration::from_secs(60));
+        assert_eq!(
+            state.bearer_token().unwrap().to_str().unwrap(),
+            "Bearer first-token"
+        );
+
+        std::fs::write(f.path(), "second-token").unwrap();
+
+        assert_eq!(
+            state.bearer_token().unwrap().to_str().unwrap(),
+            "Bearer first-token"
+        );
+    }
+
+    #[test]
+    fn test_file_token_reread_once_reload_interval_has_passed() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "first-token").unwrap();
+        let state = file_state(f.path(), Duration::from_millis(50));
+        state.bearer_token().unwrap();
+
+        std::fs::write(f.path(), "second-token").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(
+            state.bearer_token().unwrap().to_str().unwrap(),
+            "Bearer second-token"
+        );
+    }
+
+    #[test]
+    fn test_file_token_read_failure_cached_within_reload_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let state = file_state(&path, Duration::from_secs(60));
+        let first = state.bearer_token();
+        assert!(
+            matches!(&first, Err(err) if err.contains("failed to read token file")),
+            "{first:?}"
+        );
+
+        std::fs::write(&path, "late-token").unwrap();
+
+        let second = state.bearer_token();
+        assert!(
+            matches!(&second, Err(err) if err.contains("failed to read token file")),
+            "{second:?}"
+        );
+    }
+
+    #[test]
+    fn test_file_token_reload_interval_defaults_to_two_seconds() {
+        let cfg: AuthTokenConfig = toml::from_str(
+            r#"type = "file"
+path = "/var/run/secrets/token""#,
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg,
+            AuthTokenConfig::File { reload_interval, .. } if reload_interval == Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn test_file_token_reload_interval_secs_alias_accepts_fractional_seconds() {
+        let cfg: AuthTokenConfig = toml::from_str(
+            r#"type = "file"
+path = "/var/run/secrets/token"
+reload_interval_secs = 0.5"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg,
+            AuthTokenConfig::File { reload_interval, .. } if reload_interval == Duration::from_millis(500)
+        ));
     }
 }
