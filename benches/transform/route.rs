@@ -54,6 +54,7 @@ fn route(c: &mut Criterion) {
         "bm", "bn", "bo", "bp", "bq", "br", "sb", "tb", "ub", "vb", "wb", "xb", "yb", "zb", "aba",
         "bba", "bbca", "dba", "bea", "fba", "gba", "hba", "iba", "jba", "bka", "bal", "bma", "bna",
         "boa", "bpa", "bqa", "bra", "bsa", "bta", "bua", "bva", "bwa", "xba", "aby", "zba",
+        "_unmatched",
     ] {
         outputs.push(TransformOutput {
             port: Some(String::from(name)),

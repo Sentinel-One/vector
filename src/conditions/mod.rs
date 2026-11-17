@@ -8,11 +8,13 @@ pub(crate) mod is_log;
 pub(crate) mod is_metric;
 pub(crate) mod is_trace;
 pub mod equality;
+pub mod predicate;
 mod vrl;
 
 pub use self::datadog_search::{DatadogSearchConfig, DatadogSearchRunner};
 pub use self::vrl::VrlConfig;
 pub use self::equality::{EqConjConfig, Constant, Equality};
+pub use self::predicate::{Predicate, PredicateConfig};
 use self::{
     is_log::{check_is_log, check_is_log_with_context},
     is_metric::{check_is_metric, check_is_metric_with_context},
@@ -50,6 +52,9 @@ pub enum Condition {
 
     /// Matches an event using an equality check on chosen path.
     Equality(Equality),
+
+    /// Matches an event with a declarative predicate.
+    Predicate(Predicate),
 }
 
 impl Condition {
@@ -67,6 +72,7 @@ impl Condition {
             Condition::AlwaysPass => (true, e),
             Condition::AlwaysFail => (false, e),
             Condition::Equality(x) => x.check(e),
+            Condition::Predicate(x) => x.check(e),
         }
     }
 
@@ -84,6 +90,7 @@ impl Condition {
             Condition::AlwaysPass => (Ok(()), e),
             Condition::AlwaysFail => (Ok(()), e),
             Condition::Equality(x) => x.check_with_context(e),
+            Condition::Predicate(x) => x.check_with_context(e),
         }
     }
 }
@@ -129,6 +136,10 @@ pub enum ConditionConfig {
 
     /// Matches when a chosen event-attribute is equal to another
     Equality(EqConjConfig),
+
+    /// Matches an event with a declarative predicate: a tree of operators such as `all`, `any`,
+    /// `not`, `eq`, `gt`, `contains`, `matches` and `cidr`.
+    Predicate(PredicateConfig),
 }
 
 impl ConditionConfig {
@@ -145,6 +156,7 @@ impl ConditionConfig {
             ConditionConfig::AlwaysPass => Ok(Condition::AlwaysPass),
             ConditionConfig::AlwaysFail => Ok(Condition::AlwaysFail),
             ConditionConfig::Equality(x) => x.build(enrichment_tables),
+            ConditionConfig::Predicate(x) => x.build(enrichment_tables),
         }
     }
 }

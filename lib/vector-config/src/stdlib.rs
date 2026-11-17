@@ -208,6 +208,35 @@ impl_configurable_numeric!(NonZeroI32 => |v: NonZeroI32| v.get().into());
 impl_configurable_numeric!(NonZeroI64 => |v: NonZeroI64| v.get().into());
 impl_configurable_numeric!(NonZeroUsize => |v: NonZeroUsize| v.get().into());
 
+// Boxes are transparent: a `Box<T>` has exactly `T`'s schema, which lets a recursive config type
+// hold a single child of its own type.
+impl<T> Configurable for Box<T>
+where
+    T: Configurable + ToValue + 'static,
+{
+    fn is_optional() -> bool {
+        T::is_optional()
+    }
+
+    fn metadata() -> Metadata {
+        T::metadata()
+    }
+
+    fn validate_metadata(metadata: &Metadata) -> Result<(), GenerateError> {
+        T::validate_metadata(metadata)
+    }
+
+    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
+        crate::schema::get_or_generate_schema(&T::as_configurable_ref(), gen, None)
+    }
+}
+
+impl<T: ToValue> ToValue for Box<T> {
+    fn to_value(&self) -> Value {
+        T::to_value(self)
+    }
+}
+
 // Arrays and maps.
 impl<T> Configurable for Vec<T>
 where

@@ -149,4 +149,75 @@ mod test {
         })
         .await;
     }
+
+    #[tokio::test]
+    async fn filter_with_predicate_condition_forwards_only_matching_events() {
+        let transform_config = crate::config::format::deserialize::<FilterConfig>(
+            indoc::indoc! {r#"
+                condition:
+                  type: predicate
+                  when:
+                    all:
+                      - eq: { path: .operationName, value: NSGFlowEvents }
+                      - not: { exists: .debug }
+                      - cidr: { path: .src_ip, ranges: ["10.0.0.0/8"] }
+                      - any:
+                          - gt: { path: .bytes, value: 1000 }
+                          - starts_with: { path: .rule, value: Deny }
+            "#},
+            crate::config::Format::Yaml,
+        )
+        .unwrap();
+
+        let event = |json: serde_json::Value| {
+            Event::from_json_value(json, vector_lib::config::LogNamespace::Legacy).unwrap()
+        };
+        let big_flow = event(serde_json::json!({
+            "operationName": "NSGFlowEvents", "src_ip": "10.1.2.3", "bytes": "4096", "rule": "AllowWeb"
+        }));
+        let denied = event(serde_json::json!({
+            "operationName": "NSGFlowEvents", "src_ip": "10.9.9.9", "bytes": 10, "rule": "DenyAll"
+        }));
+        let rejected = [
+            serde_json::json!({"operationName": "NSGFlowEvents", "src_ip": "10.1.2.3", "bytes": 10, "rule": "AllowWeb"}),
+            serde_json::json!({"operationName": "NSGFlowEvents", "src_ip": "8.8.8.8", "bytes": 4096, "rule": "AllowWeb"}),
+            serde_json::json!({"operationName": "NSGFlowEvents", "src_ip": "10.1.2.3", "bytes": 4096, "debug": true}),
+            serde_json::json!({"operationName": "Other", "src_ip": "10.1.2.3", "bytes": 4096}),
+        ]
+        .map(event);
+
+        assert_transform_compliance(async {
+            let (tx, rx) = mpsc::channel(8);
+            let (topology, mut out) =
+                create_topology(ReceiverStream::new(rx), transform_config).await;
+            for e in rejected.into_iter().chain([big_flow, denied]) {
+                tx.send(e).await.unwrap();
+            }
+            let mut passed = Vec::new();
+            for _ in 0..2 {
+                passed.push(out.recv().await.unwrap().as_log().get("rule").cloned());
+            }
+            assert_eq!(
+                passed,
+                vec![Some("AllowWeb".into()), Some("DenyAll".into())]
+            );
+
+            drop(tx);
+            topology.stop().await;
+            assert_eq!(out.recv().await, None);
+        })
+        .await;
+    }
+
+    #[test]
+    fn filter_with_predicate_condition_rejects_unknown_operator() {
+        let config = |op: &str| {
+            crate::config::format::deserialize::<FilterConfig>(
+                &format!("condition: {{ type: predicate, when: {{ {op}: {{ path: .a, value: 1 }} }} }}"),
+                crate::config::Format::Yaml,
+            )
+        };
+        assert!(config("eq").is_ok());
+        assert!(config("equals").is_err());
+    }
 }

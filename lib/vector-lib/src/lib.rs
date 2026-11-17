@@ -21,8 +21,8 @@ pub use vector_core::test_util;
 pub use vector_core::{assert_downcast_matches, inet_test_util, log_event};
 pub use vector_core::{
     buckets, default_data_dir, emit, event, fanout, http, ipallowlist, metric_tags, metrics,
-    partition, quantiles, register, samples, schema, sender, serde, sink, source, tcp, tls,
-    transform, EstimatedJsonEncodedSizeOf,
+    partition, predicate, quantiles, register, samples, schema, sender, serde, sink, source, tcp,
+    tls, transform, EstimatedJsonEncodedSizeOf,
 };
 pub use vector_lookup as lookup;
 pub use vector_stream as stream;

@@ -5,7 +5,11 @@ use criterion::{
     criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId, Criterion,
     SamplingMode, Throughput,
 };
-use vector::transforms::dedupe::{CacheConfig, Dedupe, DedupeConfig, FieldMatchConfig};
+use vector::transforms::dedupe::{
+    common::{fill_default_fields_match, CacheConfig, FieldMatchConfig},
+    config::DedupeConfig,
+    transform::Dedupe,
+};
 use vector_lib::transform::Transform;
 
 use crate::common::{consume, FixedLogStream};
@@ -91,8 +95,11 @@ fn dedupe(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("transform", param), &param, |b, param| {
             b.iter_batched(
                 || {
-                    let dedupe =
-                        Transform::event_task(Dedupe::new(param.dedupe_config.clone())).into_task();
+                    let dedupe = Transform::event_task(Dedupe::new(
+                        param.dedupe_config.cache.num_events,
+                        fill_default_fields_match(param.dedupe_config.fields.as_ref()),
+                    ))
+                    .into_task();
                     (Box::new(dedupe), Box::pin(param.input.clone()))
                 },
                 |(dedupe, input)| {

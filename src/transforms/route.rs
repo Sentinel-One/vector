@@ -556,6 +556,103 @@ mod test {
         assert!(out[UNMATCHED_ROUTE].is_empty());
     }
 
+    fn yaml_route(yaml: &str) -> RouteConfig {
+        crate::config::format::deserialize(yaml, crate::config::Format::Yaml).unwrap()
+    }
+
+    #[test]
+    fn route_predicate_sends_event_to_every_matching_route() {
+        let config = yaml_route(indoc! {r#"
+            route:
+              internal:
+                type: predicate
+                when:
+                  cidr: { path: .src_ip, ranges: ["10.0.0.0/8", "192.168.0.0/16"] }
+              large:
+                type: predicate
+                when:
+                  between: { path: .bytes, min: 1000, max: 1000000 }
+              errors:
+                type: predicate
+                when:
+                  any:
+                    - matches: { path: .message, regex: '(?i)error' }
+                    - gte: { path: .status, value: 500 }
+        "#});
+        let names = ["internal", "large", "errors", UNMATCHED_ROUTE];
+
+        let event = log_event(serde_json::json!({"src_ip": "10.0.0.7", "bytes": 5000, "status": 200, "message": "ok"}));
+        let out = run(config.clone(), event.clone(), &names);
+        assert_eq!(out["internal"], vec![event.clone()]);
+        assert_eq!(out["large"], vec![event]);
+        assert!(out["errors"].is_empty());
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+
+        let event = log_event(serde_json::json!({"src_ip": "8.8.8.8", "bytes": 10, "status": "503"}));
+        let out = run(config.clone(), event.clone(), &names);
+        assert_eq!(out["errors"], vec![event]);
+        assert!(out["internal"].is_empty() && out["large"].is_empty());
+
+        let event = log_event(serde_json::json!({"src_ip": "8.8.8.8", "bytes": 10, "message": "fine"}));
+        let out = run(config, event.clone(), &names);
+        assert_eq!(out[UNMATCHED_ROUTE], vec![event]);
+    }
+
+    #[test]
+    fn route_mixes_indexed_equality_with_predicate_routes() {
+        let config = yaml_route(indoc! {r#"
+            route:
+              by_eq:
+                type: equality
+                conjunct: [{ property: .kind, value: flow }]
+              by_predicate:
+                type: predicate
+                when:
+                  all:
+                    - eq: { path: .kind, value: flow }
+                    - not: { in: { path: .proto, values: [ICMP] } }
+        "#});
+        let names = ["by_eq", "by_predicate", UNMATCHED_ROUTE];
+
+        let tcp = log_event(serde_json::json!({"kind": "flow", "proto": "TCP"}));
+        let out = run(config.clone(), tcp.clone(), &names);
+        assert_eq!(out["by_eq"], vec![tcp.clone()]);
+        assert_eq!(out["by_predicate"], vec![tcp]);
+
+        let icmp = log_event(serde_json::json!({"kind": "flow", "proto": "ICMP"}));
+        let out = run(config, icmp.clone(), &names);
+        assert_eq!(out["by_eq"], vec![icmp]);
+        assert!(out["by_predicate"].is_empty());
+        assert!(out[UNMATCHED_ROUTE].is_empty());
+    }
+
+    #[test]
+    fn route_predicate_matches_metric_name_and_tags() {
+        let config = yaml_route(indoc! {r#"
+            route:
+              web:
+                type: predicate
+                when:
+                  all:
+                    - starts_with: { path: .name, value: http_ }
+                    - eq: { path: .tags.tier, value: web }
+        "#});
+        let metric = |name: &str, tier: &str| {
+            Event::Metric(
+                Metric::new(name, MetricKind::Incremental, MetricValue::Counter { value: 1.0 })
+                    .with_tags(Some(vector_lib::metric_tags!("tier" => tier))),
+            )
+        };
+        let names = ["web", UNMATCHED_ROUTE];
+
+        let hit = metric("http_requests", "web");
+        assert_eq!(run(config.clone(), hit.clone(), &names)["web"], vec![hit]);
+        let other_tier = metric("http_requests", "db");
+        assert_eq!(run(config.clone(), other_tier.clone(), &names)[UNMATCHED_ROUTE], vec![other_tier]);
+        let other_name = metric("cpu_seconds", "web");
+        assert_eq!(run(config, other_name.clone(), &names)[UNMATCHED_ROUTE], vec![other_name]);
+    }
+
     #[test]
     fn route_equality_null_for_missing_path() {
         let config = serde_yaml::from_str::<RouteConfig>(indoc! {r#"

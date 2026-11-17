@@ -35,6 +35,7 @@ pub mod inet_test_util;
 pub mod ipallowlist;
 pub mod metrics;
 pub mod partition;
+pub mod predicate;
 pub mod schema;
 pub mod serde;
 pub mod sink;
