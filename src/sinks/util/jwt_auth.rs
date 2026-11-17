@@ -81,9 +81,20 @@ pub enum AuthToken {
 pub struct FileToken {
     path: String,
     reload_interval: Duration,
-    /// The last read and when it happened. Failed reads are kept too, so a missing
-    /// file costs one filesystem call per interval rather than one per request.
-    last_read: std::sync::Mutex<Option<(std::time::Instant, TokenRead)>>,
+    /// The last read and when it happened, locked only to copy it out. Failed reads are
+    /// kept too, so a missing file costs one filesystem call per interval rather than
+    /// one per request.
+    last_read: std::sync::Mutex<Option<LastRead>>,
+    /// Held by the one caller re-reading the file. Others serve `last_read` meanwhile
+    /// instead of waiting.
+    reloading: std::sync::Mutex<()>,
+}
+
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
+#[derive(Clone, Debug)]
+struct LastRead {
+    at: std::time::Instant,
+    read: TokenRead,
 }
 
 #[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
@@ -91,16 +102,68 @@ type TokenRead = Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, 
 
 #[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
 impl FileToken {
-    fn bearer_token(&self) -> TokenRead {
-        let mut last_read = self.last_read.lock().expect("token cache lock poisoned");
-        match &*last_read {
-            Some((at, read)) if at.elapsed() < self.reload_interval => read.clone(),
-            Some(_) | None => {
-                let read = self.read();
-                *last_read = Some((std::time::Instant::now(), read.clone()));
-                read
-            }
+    const fn new(path: String, reload_interval: Duration) -> Self {
+        Self {
+            path,
+            reload_interval,
+            last_read: std::sync::Mutex::new(None),
+            reloading: std::sync::Mutex::new(()),
         }
+    }
+
+    fn last(&self) -> Option<LastRead> {
+        self.last_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn fresh(&self) -> Option<TokenRead> {
+        self.last()
+            .filter(|last| last.at.elapsed() < self.reload_interval)
+            .map(|last| last.read)
+    }
+
+    fn bearer_token(&self) -> TokenRead {
+        match self.fresh() {
+            Some(read) => read,
+            None => match self.reloading.try_lock() {
+                Ok(_reloading) => self.reload(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let _reloading = poisoned.into_inner();
+                    self.reload()
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    match self.last() {
+                        Some(stale) => stale.read,
+                        // Nothing to serve yet: wait for the read in progress.
+                        None => {
+                            let _reloading = self
+                                .reloading
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            self.reload()
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// Called with `reloading` held.
+    fn reload(&self) -> TokenRead {
+        // Another caller may have finished a read while this one waited for the lock.
+        self.fresh().unwrap_or_else(|| {
+            let read = self.read();
+            *self
+                .last_read
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(LastRead {
+                at: std::time::Instant::now(),
+                read: read.clone(),
+            });
+            read
+        })
     }
 
     fn read(&self) -> TokenRead {
@@ -133,11 +196,7 @@ impl AuthState {
             AuthTokenConfig::File {
                 path,
                 reload_interval,
-            } => AuthToken::File(FileToken {
-                path,
-                reload_interval,
-                last_read: std::sync::Mutex::new(None),
-            }),
+            } => AuthToken::File(FileToken::new(path, reload_interval)),
         };
 
         Ok(Self { token })
@@ -422,5 +481,47 @@ reload_interval_secs = 0.5"#,
             cfg,
             AuthTokenConfig::File { reload_interval, .. } if reload_interval == Duration::from_millis(500)
         ));
+    }
+
+    fn file_token(state: &AuthState) -> &FileToken {
+        match &state.token {
+            AuthToken::File(file) => file,
+            AuthToken::Static(_) => panic!("expected a file token"),
+        }
+    }
+
+    #[test]
+    fn test_file_token_stale_token_served_while_another_caller_reloads() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "first-token").unwrap();
+        let state = file_state(f.path(), Duration::from_millis(50));
+        state.bearer_token().unwrap();
+        std::fs::write(f.path(), "second-token").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let reloading = file_token(&state).reloading.lock().unwrap();
+        let during = state.bearer_token();
+        drop(reloading);
+        let after = state.bearer_token();
+
+        assert_eq!(during.unwrap().to_str().unwrap(), "Bearer first-token");
+        assert_eq!(after.unwrap().to_str().unwrap(), "Bearer second-token");
+    }
+
+    #[test]
+    fn test_file_token_first_read_waits_for_reload_in_progress() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "only-token").unwrap();
+        let state = file_state(f.path(), Duration::from_secs(60));
+        let reloading = file_token(&state).reloading.lock().unwrap();
+
+        let read = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| state.bearer_token());
+            std::thread::sleep(Duration::from_millis(50));
+            drop(reloading);
+            reader.join().unwrap()
+        });
+
+        assert_eq!(read.unwrap().to_str().unwrap(), "Bearer only-token");
     }
 }
