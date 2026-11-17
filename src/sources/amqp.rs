@@ -2,7 +2,7 @@
 //! Handles version AMQP 0.9.1 which is used by RabbitMQ.
 use crate::{
     amqp::AmqpConfig,
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream as StreamScope},
     config::{SourceConfig, SourceContext, SourceOutput},
     event::{BatchNotifier, BatchStatus},
     internal_events::{
@@ -130,7 +130,7 @@ impl AmqpSourceConfig {
         &self,
         log_namespace: LogNamespace,
         ops_limits: OperationalLimits,
-    ) -> vector_lib::Result<Decoder> {
+    ) -> vector_lib::Result<DecoderFactory<StreamScope>> {
         DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace, ops_limits)
             .build()
     }
@@ -225,6 +225,7 @@ pub(crate) async fn amqp_source(
     acknowledgements: bool,
 ) -> crate::Result<super::Source> {
     let config = config.clone();
+    let decoder = config.decoder(log_namespace, ops_limits)?;
     let (_conn, channel) = config
         .connection
         .connect()
@@ -233,11 +234,11 @@ pub(crate) async fn amqp_source(
 
     Ok(Box::pin(run_amqp_source(
         config,
+        decoder,
         shutdown,
         out,
         channel,
         log_namespace,
-        ops_limits,
         acknowledgements,
     )))
 }
@@ -320,15 +321,14 @@ fn populate_log_event(
 /// Receives an event from `AMQP` and pushes it along the pipeline.
 async fn receive_event(
     config: &AmqpSourceConfig,
+    decoder: &DecoderFactory<StreamScope>,
     out: &mut SourceSender,
     log_namespace: LogNamespace,
-    ops_limits: OperationalLimits,
     finalizer: Option<&UnorderedFinalizer<FinalizerEntry>>,
     msg: Delivery,
 ) -> Result<(), ()> {
     let payload = Cursor::new(Bytes::copy_from_slice(&msg.data));
-    let decoder = config.decoder(log_namespace, ops_limits).map_err(|_e| ())?;
-    let mut stream = FramedRead::new(payload, decoder);
+    let mut stream = FramedRead::new(payload, decoder.build());
 
     // Extract timestamp from AMQP message
     let timestamp = msg
@@ -430,11 +430,11 @@ async fn finalize_event_stream(
 /// Runs the `AMQP` source involving the main loop pulling data from the server.
 async fn run_amqp_source(
     config: AmqpSourceConfig,
+    decoder: DecoderFactory<StreamScope>,
     shutdown: ShutdownSignal,
     mut out: SourceSender,
     channel: Channel,
     log_namespace: LogNamespace,
-    ops_limits: OperationalLimits,
     acknowledgements: bool,
 ) -> Result<(), ()> {
     let (finalizer, mut ack_stream) =
@@ -470,7 +470,7 @@ async fn run_amqp_source(
                             return Err(());
                         }
                         Ok(msg) => {
-                            receive_event(&config, &mut out, log_namespace, ops_limits, finalizer.as_ref(), msg).await?
+                            receive_event(&config, &decoder, &mut out, log_namespace, finalizer.as_ref(), msg).await?
                         }
                     }
                 } else {
@@ -508,6 +508,7 @@ async fn handle_ack(status: BatchStatus, entry: FinalizerEntry) {
 
 #[cfg(test)]
 pub mod test {
+    use vector_lib::codecs::decoding::format::{VrlDeserializerConfig, VrlDeserializerOptions};
     use vector_lib::lookup::OwnedTargetPath;
     use vector_lib::schema::Definition;
     use vector_lib::tls::TlsConfig;
@@ -518,6 +519,37 @@ pub mod test {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<AmqpSourceConfig>();
+    }
+
+    #[tokio::test]
+    async fn amqp_source_build_fails_on_vrl_decoding_that_does_not_compile() {
+        let config = AmqpSourceConfig {
+            decoding: DeserializerConfig::Vrl(VrlDeserializerConfig {
+                vrl: VrlDeserializerOptions {
+                    source: ". = undefined_function()".to_owned(),
+                    timezone: None,
+                },
+            }),
+            ..Default::default()
+        };
+
+        let result = amqp_source(
+            &config,
+            ShutdownSignal::noop(),
+            SourceSender::new_test().0,
+            LogNamespace::Legacy,
+            OperationalLimits::default(),
+            false,
+        )
+        .await;
+
+        match result {
+            Ok(_) => panic!("amqp source built despite a VRL program that does not compile"),
+            Err(error) => assert!(
+                error.to_string().contains("undefined_function"),
+                "unexpected error: {error}"
+            ),
+        }
     }
 
     pub fn make_config() -> AmqpSourceConfig {

@@ -35,17 +35,17 @@ pub fn statsd_unix(
     out: SourceSender,
     max_frame_length_bytes: usize,
 ) -> crate::Result<Source> {
-    let decoder = Decoder::new(
-        Framer::NewlineDelimited(NewlineDelimitedDecoder::new(
-            max_frame_length_bytes,
-        )),
-        Deserializer::Boxed(Box::new(StatsdDeserializer::unix(config.sanitize))),
-    );
+    let sanitize = config.sanitize;
 
     build_unix_stream_source(
         config.path,
         None,
-        decoder,
+        move || {
+            Decoder::new(
+                Framer::NewlineDelimited(NewlineDelimitedDecoder::new(max_frame_length_bytes)),
+                Deserializer::Boxed(Box::new(StatsdDeserializer::unix(sanitize))),
+            )
+        },
         |_events, _host| {},
         shutdown,
         out,

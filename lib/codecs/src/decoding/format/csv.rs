@@ -130,7 +130,7 @@ impl From<&CsvDeserializerConfig> for CsvDeserializer {
 
 impl Deserializer for CsvDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -219,7 +219,7 @@ mod tests {
         let config = config_with_header();
 
         for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
-            let deserializer = config.build();
+            let mut deserializer = config.build();
             let events = deserializer.parse(input.clone(), namespace).unwrap();
             assert_eq!(events.len(), 2);
 
@@ -240,7 +240,7 @@ mod tests {
         let input = Bytes::from(
             "host,message,severity\nserver01,\"this is a\nmulti-line\nmessage\",warning\nserver02,simple,info",
         );
-        let deserializer = config_with_header().build();
+        let mut deserializer = config_with_header().build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 2);
@@ -265,7 +265,7 @@ line 3","error details:
   reason: internal"
 server02,"ok","all good""#,
         );
-        let deserializer = config_with_header().build();
+        let mut deserializer = config_with_header().build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 2);
@@ -285,7 +285,7 @@ server02,"ok","all good""#,
     #[test]
     fn deserialize_csv_quoted_commas() {
         let input = Bytes::from("name,location\n\"Doe, John\",\"New York, NY\"\nJane,Boston");
-        let deserializer = config_with_header().build();
+        let mut deserializer = config_with_header().build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 2);
@@ -310,7 +310,7 @@ server02,"ok","all good""#,
                 ..Default::default()
             },
         };
-        let deserializer = config.build();
+        let mut deserializer = config.build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 2);
@@ -329,7 +329,7 @@ server02,"ok","all good""#,
                 ..Default::default()
             },
         };
-        let deserializer = config.build();
+        let mut deserializer = config.build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 1);
@@ -354,7 +354,7 @@ server02,"ok","all good""#,
                 headers: Headers::Snoop,
             },
         };
-        let deserializer = config.build();
+        let mut deserializer = config.build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 1);
@@ -366,7 +366,7 @@ server02,"ok","all good""#,
 
     #[test]
     fn deserialize_csv_empty() {
-        let deserializer = CsvDeserializerConfig::default().build();
+        let mut deserializer = CsvDeserializerConfig::default().build();
         let events = deserializer
             .parse(Bytes::from(""), LogNamespace::Vector)
             .unwrap();
@@ -376,7 +376,7 @@ server02,"ok","all good""#,
     #[test]
     fn deserialize_csv_legacy_adds_timestamp() {
         let input = Bytes::from("host\nserver01");
-        let deserializer = config_with_header().build();
+        let mut deserializer = config_with_header().build();
 
         let events = deserializer.parse(input, LogNamespace::Legacy).unwrap();
         assert_eq!(events.len(), 1);
@@ -429,7 +429,7 @@ server02,"ok","all good""#,
     #[test]
     fn deserialize_csv_variable_field_counts() {
         let input = Bytes::from("a,b,c\n1,2,3\n4,5");
-        let deserializer = config_with_header().build();
+        let mut deserializer = config_with_header().build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 2);
@@ -443,7 +443,7 @@ server02,"ok","all good""#,
     #[test]
     fn deserialize_csv_header_only_no_events() {
         let input = Bytes::from("host,message,severity");
-        let deserializer = config_with_header().build();
+        let mut deserializer = config_with_header().build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert!(events.is_empty());
@@ -452,7 +452,7 @@ server02,"ok","all good""#,
     #[test]
     fn deserialize_csv_extra_fields_are_dropped() {
         let input = Bytes::from("a,b\n1,2,3");
-        let deserializer = config_with_header().build();
+        let mut deserializer = config_with_header().build();
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 1);

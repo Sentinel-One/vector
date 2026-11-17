@@ -81,7 +81,7 @@ pub struct NativeJsonDeserializer {
 
 impl Deserializer for NativeJsonDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         // LogNamespace is ignored because Vector owns the data format being consumed and as such there
         // is no need to change the fields of the event.
@@ -120,7 +120,7 @@ mod test {
     #[test]
     fn parses_top_level_arrays() {
         let config = NativeJsonDeserializerConfig::default();
-        let deserializer = config.build();
+        let mut deserializer = config.build();
 
         let json1 = json!({"a": "b", "c": "d"});
         let json2 = json!({"foo": "bar", "baz": "quux"});

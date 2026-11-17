@@ -15,7 +15,7 @@ use vector_lib::{
 use vrl::value::Kind;
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream},
     config::{GenerateConfig, SourceConfig, SourceContext, SourceOutput},
     event::Event,
     internal_events::StreamClosedError,
@@ -220,7 +220,7 @@ async fn nats_source(
     // Take ownership of the connection so it doesn't get dropped.
     _connection: async_nats::Client,
     subscriber: async_nats::Subscriber,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     log_namespace: LogNamespace,
     shutdown: ShutdownSignal,
     mut out: SourceSender,
@@ -231,7 +231,7 @@ async fn nats_source(
     let bytes_received = register!(BytesReceived::from(Protocol::TCP));
     while let Some(msg) = stream.next().await {
         bytes_received.emit(ByteSize(msg.payload.len()));
-        let mut stream = FramedRead::new(msg.payload.as_ref(), decoder.clone());
+        let mut stream = FramedRead::new(msg.payload.as_ref(), decoder.build());
         while let Some(next) = stream.next().await {
             match next {
                 Ok((events, _byte_size)) => {

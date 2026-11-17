@@ -16,6 +16,9 @@ pub async fn start_topology(
         .unwrap()
 }
 
+#[cfg(test)]
+pub mod bleed_probe;
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod components;
 

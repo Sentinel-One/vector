@@ -78,7 +78,7 @@ impl BytesDeserializer {
 
 impl Deserializer for BytesDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn deserialize_bytes_legacy_namespace() {
         let input = Bytes::from("foo");
-        let deserializer = BytesDeserializer;
+        let mut deserializer = BytesDeserializer;
 
         let events = deserializer.parse(input, LogNamespace::Legacy).unwrap();
         let mut events = events.into_iter();
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn deserialize_bytes_vector_namespace() {
         let input = Bytes::from("foo");
-        let deserializer = BytesDeserializer;
+        let mut deserializer = BytesDeserializer;
 
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 1);

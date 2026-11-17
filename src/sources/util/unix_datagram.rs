@@ -10,7 +10,7 @@ use vector_lib::internal_event::{ByteSize, BytesReceived, InternalEventHandle as
 use vector_lib::EstimatedJsonEncodedSizeOf;
 
 use crate::{
-    codecs::Decoder,
+    codecs::{DecoderFactory, Stream},
     event::Event,
     internal_events::{
         SocketEventsReceived, SocketMode, SocketReceiveError, StreamClosedError,
@@ -31,7 +31,7 @@ pub fn build_unix_datagram_source(
     listen_path: PathBuf,
     socket_file_mode: Option<u32>,
     max_length: usize,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     handle_events: impl Fn(&mut [Event], Option<Bytes>) + Clone + Send + Sync + 'static,
     shutdown: ShutdownSignal,
     out: SourceSender,
@@ -60,7 +60,7 @@ pub fn build_unix_datagram_source(
 async fn listen(
     socket: UnixDatagram,
     max_length: usize,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     mut shutdown: ShutdownSignal,
     handle_events: impl Fn(&mut [Event], Option<Bytes>) + Clone + Send + Sync + 'static,
     mut out: SourceSender,
@@ -100,9 +100,8 @@ async fn listen(
                 let payload = buf.split_to(byte_size);
 
                 // Unix datagram sockets have no IP-based peer identity to scope Netflow templates
-                // to, so each datagram gets its own fresh scope instead — `clone_for_connection`
-                // is a no-op for every other framer.
-                let mut stream = FramedRead::new(payload.as_ref(), decoder.clone_for_connection());
+                // to, so each datagram is built as a stream unit and gets its own fresh scope.
+                let mut stream = FramedRead::new(payload.as_ref(), decoder.build());
 
                 loop {
                     match stream.next().await {

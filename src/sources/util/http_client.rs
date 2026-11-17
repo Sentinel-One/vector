@@ -123,10 +123,7 @@ pub(crate) fn warn_if_interval_too_low(timeout: Duration, interval: Duration) {
 ///   - The HTTP request is built per the options in provided generic inputs.
 ///   - The HTTP response is decoded/parsed into events by the specific context.
 ///   - The events are then sent to the output stream.
-pub(crate) async fn call<
-    B: HttpClientBuilder<Context = C> + Send + Clone,
-    C: HttpClientContext + Send,
->(
+pub(crate) async fn call<B: HttpClientBuilder<Context = C> + Send, C: HttpClientContext + Send>(
     inputs: GenericHttpClientInputs,
     context_builder: B,
     mut out: SourceSender,
@@ -145,7 +142,6 @@ pub(crate) async fn call<
             let client = client.clone();
             let endpoint = url.to_string();
 
-            let context_builder = context_builder.clone();
             let mut context = context_builder.build(&url);
 
             let mut builder = match http_method {

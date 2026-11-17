@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use vector_common::limits::OperationalLimits;
 use vector_core::config::LogNamespace;
 
-use super::Decoder;
+use super::{DecoderFactory, Scope};
 
 /// Config used to build a `Decoder`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -48,15 +48,13 @@ impl DecodingConfig {
         &self.framing
     }
 
-    /// Builds a `Decoder` from the provided configuration.
-    pub fn build(&self) -> vector_common::Result<Decoder> {
-        // Build the framer.
-        let framer = self.framing.build(self.operational_limits);
-
-        // Build the deserializer.
-        let deserializer = self.decoding.build()?;
-
-        Ok(Decoder::new(framer, deserializer).with_log_namespace(self.log_namespace))
+    /// Builds a `DecoderFactory` from the provided configuration.
+    pub fn build<S: Scope>(&self) -> vector_common::Result<DecoderFactory<S>> {
+        Ok(DecoderFactory::new(
+            self.framing.build(self.operational_limits),
+            self.decoding.build()?,
+            self.log_namespace,
+        ))
     }
 }
 
@@ -70,7 +68,7 @@ mod tests {
     use super::DecodingConfig;
     use crate::decoding::{DeserializerConfig, FramingConfig, NewlineDelimitedDecoderConfig};
 
-    fn newline_decoder_capped_at(max_frame_length_bytes: usize) -> super::Decoder {
+    fn newline_decoder_capped_at(max_frame_length_bytes: usize) -> super::super::Decoder {
         let limits = OperationalLimits {
             framing: FramingLimits::new(max_frame_length_bytes),
             ..Default::default()
@@ -81,8 +79,9 @@ mod tests {
             LogNamespace::Legacy,
             limits,
         )
-        .build()
+        .build::<super::super::Stream>()
         .unwrap()
+        .build()
     }
 
     #[test]

@@ -15,7 +15,7 @@ use vector_lib::finalizer::UnorderedFinalizer;
 use vector_lib::internal_event::{EventsReceived, Registered};
 
 use crate::{
-    codecs::Decoder,
+    codecs::{DecoderFactory, Stream},
     common::sqs::fresh_backoff,
     event::{BatchNotifier, BatchStatus},
     internal_events::{
@@ -35,7 +35,7 @@ type Finalizer = UnorderedFinalizer<Vec<String>>;
 pub struct SqsSource {
     pub client: SqsClient,
     pub queue_url: String,
-    pub decoder: Decoder,
+    pub decoder: DecoderFactory<Stream>,
     pub poll_secs: u32,
     pub visibility_timeout_secs: u32,
     pub delete_message: bool,
@@ -180,7 +180,7 @@ impl SqsSource {
                     // Error is logged by `crate::codecs::Decoder`, no further handling
                     // is needed here.
                     let decoded = util::decode_message(
-                        self.decoder.clone(),
+                        self.decoder.build(),
                         "aws_sqs",
                         body.as_bytes(),
                         timestamp,
@@ -280,8 +280,9 @@ mod tests {
                 LogNamespace::Vector,
                 Default::default(),
             )
-            .build()
-            .unwrap(),
+            .build::<crate::codecs::Stream>()
+            .unwrap()
+            .build(),
             "aws_sqs",
             b"test",
             Some(now),
@@ -334,8 +335,9 @@ mod tests {
                 LogNamespace::Legacy,
                 Default::default(),
             )
-            .build()
-            .unwrap(),
+            .build::<crate::codecs::Stream>()
+            .unwrap()
+            .build(),
             "aws_sqs",
             b"test",
             Some(now),

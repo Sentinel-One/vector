@@ -24,7 +24,7 @@ use vector_lib::{
 use vrl::value::Kind;
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream},
     config::{SourceConfig, SourceContext, SourceOutput},
     internal_events::{DemoLogsEventProcessed,  EventsReceived, StreamClosedError},
     serde::{default_decoding, default_framing_message_based},
@@ -329,7 +329,7 @@ async fn demo_logs_source(
     interval: Duration,
     count: usize,
     format: OutputFormat,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     mut shutdown: ShutdownSignal,
     mut out: SourceSender,
     log_namespace: LogNamespace,
@@ -353,7 +353,7 @@ async fn demo_logs_source(
 
         let line = format.generate_line(n, &gen_ctx);
 
-        let mut stream = FramedRead::new(line.as_bytes(), decoder.clone());
+        let mut stream = FramedRead::new(line.as_bytes(), decoder.build());
         while let Some(next) = stream.next().await {
             match next {
                 Ok((events, _byte_size)) => {

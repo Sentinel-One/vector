@@ -32,10 +32,12 @@ fn roundtrip_avro_fixtures(
 fn roundtrip_avro(data_path: PathBuf, schema_path: PathBuf, reserialize: bool) {
     let schema = load_file(&schema_path);
     let schema = from_utf8(&schema).unwrap().to_string();
-    let deserializer = AvroDeserializerConfig::new(schema.clone(), false).build();
+    let mut deserializer = AvroDeserializerConfig::new(schema.clone(), false)
+        .build()
+        .build();
     let mut serializer = AvroSerializerConfig::new(schema.clone()).build().unwrap();
 
-    let (buf, event) = load_deserialize(&data_path, &deserializer);
+    let (buf, event) = load_deserialize(&data_path, &mut deserializer);
 
     if reserialize {
         // Serialize the parsed event
@@ -64,7 +66,7 @@ fn load_file(path: &Path) -> Bytes {
     Bytes::from(buf)
 }
 
-fn load_deserialize(path: &Path, deserializer: &dyn Deserializer) -> (Bytes, Event) {
+fn load_deserialize(path: &Path, deserializer: &mut dyn Deserializer) -> (Bytes, Event) {
     let buf = load_file(path);
 
     let mut events = deserializer

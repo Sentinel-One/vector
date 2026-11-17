@@ -1,6 +1,6 @@
 use crate::vector_lib::codecs::StreamDecodingError;
 use crate::{
-    codecs::Decoder,
+    codecs::{DecoderFactory, Stream as StreamScope},
     common::{
         backoff::ExponentialBackoff,
         websocket::{is_closed, PingInterval, WebSocketConnector},
@@ -44,7 +44,7 @@ type WebSocketStream = Pin<Box<dyn Stream<Item = Result<Message, TungsteniteErro
 
 pub(crate) struct WebSocketSourceParams {
     pub connector: WebSocketConnector,
-    pub decoder: Decoder,
+    pub decoder: DecoderFactory<StreamScope>,
     pub log_namespace: LogNamespace,
 }
 
@@ -260,7 +260,7 @@ impl WebSocketSource {
             protocol: PROTOCOL,
             kind,
         });
-        let mut stream = FramedRead::new(payload_bytes, self.params.decoder.clone());
+        let mut stream = FramedRead::new(payload_bytes, self.params.decoder.build());
 
         while let Some(result) = stream.next().await {
             match result {

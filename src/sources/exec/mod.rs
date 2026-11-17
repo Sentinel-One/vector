@@ -28,7 +28,7 @@ use vrl::path::OwnedValuePath;
 use vrl::value::Kind;
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{Decoder, DecoderFactory, DecodingConfig, Stream},
     config::{SourceConfig, SourceContext, SourceOutput},
     event::Event,
     internal_events::{
@@ -350,7 +350,7 @@ async fn run_scheduled(
     config: ExecConfig,
     hostname: Option<String>,
     exec_interval_secs: u64,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     shutdown: ShutdownSignal,
     out: SourceSender,
     log_namespace: LogNamespace,
@@ -404,7 +404,7 @@ async fn run_streaming(
     hostname: Option<String>,
     respawn_on_exit: bool,
     respawn_interval_secs: u64,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     mut shutdown: ShutdownSignal,
     out: SourceSender,
     log_namespace: LogNamespace,
@@ -462,7 +462,7 @@ async fn run_streaming(
 async fn run_command(
     config: ExecConfig,
     hostname: Option<String>,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     mut shutdown: ShutdownSignal,
     mut out: SourceSender,
     log_namespace: LogNamespace,
@@ -488,7 +488,7 @@ async fn run_command(
         // Create stderr async reader
         let stderr_reader = BufReader::new(stderr);
 
-        spawn_reader_thread(stderr_reader, decoder.clone(), STDERR, sender.clone());
+        spawn_reader_thread(stderr_reader, decoder.build(), STDERR, sender.clone());
     }
 
     let stdout = child
@@ -501,7 +501,7 @@ async fn run_command(
 
     let pid = child.id();
 
-    spawn_reader_thread(stdout_reader, decoder.clone(), STDOUT, sender);
+    spawn_reader_thread(stdout_reader, decoder.build(), STDOUT, sender);
 
     let bytes_received = register!(BytesReceived::from(Protocol::NONE));
 

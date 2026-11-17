@@ -25,7 +25,7 @@ use vector_lib::{
 };
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{Decoder, DecoderFactory, DecodingConfig, Stream},
     config::{
         log_schema, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
         SourceContext, SourceOutput,
@@ -233,7 +233,7 @@ impl SourceConfig for LogplexConfig {
 #[derive(Clone)]
 struct LogplexSource {
     query_parameters: Vec<HttpConfigParamKind>,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     log_namespace: LogNamespace,
 }
 
@@ -284,7 +284,7 @@ impl LogplexSource {
                     .ok()
             })
             .filter(|s| !s.is_empty())
-            .flat_map(|line| line_to_events(self.decoder.clone(), self.log_namespace, line))
+            .flat_map(|line| line_to_events(self.decoder.build(), self.log_namespace, line))
             .collect()
     }
 }
@@ -453,13 +453,15 @@ mod tests {
             vector_lib::config::LogNamespace::Legacy,
             Default::default(),
         )
-        .build()
+        .build::<crate::codecs::Stream>()
         .unwrap()
+        .build()
     }
     use crate::{
         config::{log_schema, SourceConfig, SourceContext},
         serde::{default_decoding, default_framing_message_based},
         test_util::{
+            bleed_probe,
             components::{assert_source_compliance, HTTP_PUSH_SOURCE_TAGS},
             next_addr, random_string, spawn_collect_n, wait_for_tcp,
         },
@@ -710,6 +712,32 @@ mod tests {
         );
         assert_eq!(*log.get_host().unwrap(), "host".into());
         assert_eq!(*log.get_source_type().unwrap(), "heroku_logs".into());
+    }
+
+    #[test]
+    fn logplex_lines_do_not_share_json_paths_state() {
+        let source = super::LogplexSource {
+            query_parameters: vec![],
+            decoder: crate::codecs::DecodingConfig::new(
+                default_framing_message_based(),
+                bleed_probe::decoding(),
+                LogNamespace::Legacy,
+                Default::default(),
+            )
+            .build()
+            .unwrap(),
+            log_namespace: LogNamespace::Legacy,
+        };
+        let line = |message: &str| {
+            format!("267 <158>1 2020-01-08T22:33:57.353034+00:00 host heroku router - {message}")
+        };
+        let body = format!(
+            "{}\n{}",
+            line(bleed_probe::HALF_OPEN),
+            line(bleed_probe::COMPLETE)
+        );
+
+        bleed_probe::assert_only_complete_document(&source.body_to_events(body.into()));
     }
 
     #[test]

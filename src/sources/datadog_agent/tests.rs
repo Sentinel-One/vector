@@ -21,8 +21,8 @@ use vector_lib::{
 };
 use vector_lib::{
     codecs::{
-        decoding::{BytesDeserializerConfig, Deserializer, DeserializerConfig, Framer},
-        BytesDecoder, BytesDeserializer,
+        decoding::{BytesDeserializerConfig, DeserializerConfig},
+        BytesDecoderConfig,
     },
     config::DataType,
 };
@@ -37,6 +37,7 @@ use vrl::value::{Kind, ObjectMap};
 
 use crate::schema::Definition;
 use crate::{
+    codecs::{DecoderFactory, DecodingConfig, Stream as StreamScope},
     common::datadog::{DatadogMetricType, DatadogPoint, DatadogSeriesMetric},
     components::validation::prelude::*,
     config::{SourceConfig, SourceContext},
@@ -52,6 +53,7 @@ use crate::{
         DatadogAgentConfig, DatadogAgentSource, LogMsg, LOGS, METRICS, TRACES,
     },
     test_util::{
+        bleed_probe,
         components::{assert_source_compliance, HTTP_PUSH_SOURCE_TAGS},
         next_addr, spawn_collect_n, trace_init, wait_for_tcp,
     },
@@ -92,10 +94,7 @@ fn test_decode_log_body() {
     fn inner(msgs: Vec<LogMsg>) -> TestResult {
         let body = Bytes::from(serde_json::to_string(&msgs).unwrap());
         let api_key = None;
-        let decoder = crate::codecs::Decoder::new(
-            Framer::Bytes(BytesDecoder::new()),
-            Deserializer::Bytes(BytesDeserializer),
-        );
+        let decoder = bytes_decoder_factory();
 
         let source = DatadogAgentSource::new(
             true,
@@ -131,6 +130,61 @@ fn test_decode_log_body() {
     QuickCheck::new().quickcheck(inner as fn(Vec<LogMsg>) -> TestResult);
 }
 
+fn bytes_decoder_factory() -> DecoderFactory<StreamScope> {
+    DecodingConfig::new(
+        BytesDecoderConfig::new().into(),
+        DeserializerConfig::Bytes,
+        LogNamespace::Legacy,
+        Default::default(),
+    )
+    .build()
+    .unwrap()
+}
+
+#[test]
+fn decode_log_body_messages_do_not_share_json_paths_state() {
+    let log_msg = |message: &str| LogMsg {
+        message: Bytes::from(message.to_owned()),
+        status: Bytes::from("status"),
+        timestamp: Utc
+            .timestamp_millis_opt(1234)
+            .single()
+            .expect("invalid timestamp"),
+        hostname: Bytes::from("host"),
+        service: Bytes::from("service"),
+        ddsource: Bytes::from("ddsource"),
+        ddtags: Bytes::from("env:staging"),
+    };
+    let body = Bytes::from(
+        serde_json::to_string(&[
+            log_msg(bleed_probe::HALF_OPEN),
+            log_msg(bleed_probe::COMPLETE),
+        ])
+        .unwrap(),
+    );
+    let decoder = DecodingConfig::new(
+        default_framing_message_based(),
+        bleed_probe::decoding(),
+        LogNamespace::Legacy,
+        Default::default(),
+    )
+    .build()
+    .unwrap();
+    let source = DatadogAgentSource::new(
+        true,
+        decoder,
+        "http",
+        Some(test_logs_schema_definition()),
+        LogNamespace::Legacy,
+        false,
+        CompressionLimits::default(),
+    );
+
+    let events = decode_log_body(body, None, &source).unwrap();
+
+    bleed_probe::assert_only_complete_document(&events);
+}
+
 #[test]
 fn test_decode_log_body_parse_ddtags() {
     let log_msgs = [LogMsg {
@@ -148,10 +202,7 @@ fn test_decode_log_body_parse_ddtags() {
 
     let body = Bytes::from(serde_json::to_string(&log_msgs).unwrap());
     let api_key = None;
-    let decoder = crate::codecs::Decoder::new(
-        Framer::Bytes(BytesDecoder::new()),
-        Deserializer::Bytes(BytesDeserializer),
-    );
+    let decoder = bytes_decoder_factory();
 
     let source = DatadogAgentSource::new(
         true,
@@ -185,10 +236,7 @@ fn test_decode_log_body_parse_ddtags() {
 fn test_decode_log_body_empty_object() {
     let body = Bytes::from("{}");
     let api_key = None;
-    let decoder = crate::codecs::Decoder::new(
-        Framer::Bytes(BytesDecoder::new()),
-        Deserializer::Bytes(BytesDeserializer),
-    );
+    let decoder = bytes_decoder_factory();
 
     let source = DatadogAgentSource::new(
         true,
@@ -2683,10 +2731,7 @@ mod decompression_caps {
     const TEST_MAX_DECOMPRESSED_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
     fn test_source() -> DatadogAgentSource {
-        let decoder = crate::codecs::Decoder::new(
-            Framer::Bytes(BytesDecoder::new()),
-            Deserializer::Bytes(BytesDeserializer),
-        );
+        let decoder = bytes_decoder_factory();
         DatadogAgentSource::new(
             true,
             decoder,

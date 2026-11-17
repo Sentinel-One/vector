@@ -23,7 +23,7 @@ use vector_lib::{
 };
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream},
     config::{
         GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig, SourceContext,
         SourceOutput,
@@ -426,7 +426,7 @@ struct SimpleHttpSource {
     query_parameters: Vec<HttpConfigParamKind>,
     path_key: OptionalValuePath,
     host_key: OptionalValuePath,
-    decoder: Decoder,
+    decoder: DecoderFactory<Stream>,
     log_namespace: LogNamespace,
 }
 
@@ -500,7 +500,7 @@ impl HttpSource for SimpleHttpSource {
         _query_parameters: &HashMap<String, String>,
         _request_path: &str,
     ) -> Result<Vec<Event>, ErrorMessage> {
-        let mut decoder = self.decoder.clone();
+        let mut decoder = self.decoder.build();
         let mut events = Vec::new();
         let mut bytes = BytesMut::new();
         bytes.extend_from_slice(&body);
@@ -561,6 +561,7 @@ mod tests {
         config::{log_schema, SourceConfig, SourceContext},
         event::{Event, EventStatus, Value},
         test_util::{
+            bleed_probe,
             components::{self, assert_source_compliance, HTTP_PUSH_SOURCE_TAGS},
             next_addr, spawn_collect_n, wait_for_tcp,
         },
@@ -944,6 +945,37 @@ mod tests {
 
         assert!(events.remove(1).as_log().get_timestamp().is_some());
         assert!(events.remove(0).as_log().get_timestamp().is_some());
+    }
+
+    #[tokio::test]
+    async fn http_requests_do_not_share_json_paths_state() {
+        let (rx, addr) = source(
+            vec![],
+            vec![],
+            "http_path",
+            "remote_ip",
+            "/",
+            "POST",
+            StatusCode::OK,
+            true,
+            EventStatus::Delivered,
+            true,
+            None,
+            Some(bleed_probe::decoding()),
+        )
+        .await;
+
+        let events = bleed_probe::within_deadline(spawn_collect_n(
+            async move {
+                send(addr, bleed_probe::HALF_OPEN).await;
+                assert_eq!(200, send(addr, bleed_probe::COMPLETE).await);
+            },
+            rx,
+            1,
+        ))
+        .await;
+
+        bleed_probe::assert_only_complete_document(&events);
     }
 
     #[tokio::test]

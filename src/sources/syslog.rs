@@ -229,19 +229,19 @@ impl SourceConfig for SyslogConfig {
                 path,
                 socket_file_mode,
             } => {
-                let decoder = Decoder::new(
-                    Framer::OctetCounting(OctetCountingDecoder::new(
-                        self.max_length,
-                    )),
-                    Deserializer::Syslog(
-                        SyslogDeserializerConfig::from_source(SyslogConfig::NAME).build(),
-                    ),
-                );
+                let max_length = self.max_length;
 
                 build_unix_stream_source(
                     path,
                     socket_file_mode,
-                    decoder,
+                    move || {
+                        Decoder::new(
+                            Framer::OctetCounting(OctetCountingDecoder::new(max_length)),
+                            Deserializer::Syslog(
+                                SyslogDeserializerConfig::from_source(SyslogConfig::NAME).build(),
+                            ),
+                        )
+                    },
                     move |events, host| handle_events(events, &host_key, host, log_namespace),
                     cx.shutdown,
                     cx.out,
@@ -479,7 +479,7 @@ mod test {
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> Option<Event> {
-        let parser = SyslogDeserializerConfig::from_source(SyslogConfig::NAME).build();
+        let mut parser = SyslogDeserializerConfig::from_source(SyslogConfig::NAME).build();
         let mut events = parser.parse(bytes, LogNamespace::Legacy).ok()?;
         handle_events(
             &mut events,

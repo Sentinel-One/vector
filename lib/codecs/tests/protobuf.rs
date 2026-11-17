@@ -40,7 +40,8 @@ fn build_serializer_pair(
         },
     }
     .build()
-    .unwrap();
+    .unwrap()
+    .build();
     (serializer, deserializer)
 }
 
@@ -50,7 +51,7 @@ fn roundtrip_coding() {
         read_protobuf_bin_message(&test_data_dir().join("pbs/person_someone.pb"));
     let desc_file = test_data_dir().join("protos/test_protobuf.desc");
     let message_type: String = "test_protobuf.Person".into();
-    let (mut serializer, deserializer) = build_serializer_pair(desc_file, message_type);
+    let (mut serializer, mut deserializer) = build_serializer_pair(desc_file, message_type);
 
     let events_original = deserializer
         .parse(protobuf_message, LogNamespace::Vector)

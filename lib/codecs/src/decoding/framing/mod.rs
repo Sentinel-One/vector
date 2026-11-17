@@ -18,8 +18,10 @@ use ::bytes::Bytes;
 pub use character_delimited::{
     CharacterDelimitedDecoder, CharacterDelimitedDecoderConfig, CharacterDelimitedDecoderOptions,
 };
-pub use chunked_gelf::{ChunkedGelfDecoder, ChunkedGelfDecoderConfig, ChunkedGelfDecoderOptions};
-use dyn_clone::DynClone;
+pub use chunked_gelf::{
+    ChunkedGelfDecoder, ChunkedGelfDecoderConfig, ChunkedGelfDecoderFactory,
+    ChunkedGelfDecoderOptions,
+};
 pub use length_delimited::{LengthDelimitedDecoder, LengthDelimitedDecoderConfig};
 pub use newline_delimited::{
     NewlineDelimitedDecoder, NewlineDelimitedDecoderConfig, NewlineDelimitedDecoderOptions,
@@ -32,7 +34,7 @@ use tokio_util::codec::LinesCodecError;
 pub use self::bytes::{BytesDecoder, BytesDecoderConfig, BytesDecoderOptions};
 
 pub use self::netflow::{
-    NetflowDecoder, NetflowDecoderConfig, NetflowDecoderOptions,
+    NetflowDecoder, NetflowDecoderConfig, NetflowDecoderFactory, NetflowDecoderOptions,
 };
 
 pub use self::strata_snappy::{
@@ -87,22 +89,16 @@ impl StreamDecodingError for BoxedFramingError {
 
 /// Produce byte frames from a byte stream / byte message.
 pub trait Framer:
-    tokio_util::codec::Decoder<Item = Bytes, Error = BoxedFramingError> + DynClone + Debug + Send + Sync
+    tokio_util::codec::Decoder<Item = Bytes, Error = BoxedFramingError> + Debug + Send
 {
 }
 
 /// Default implementation for `Framer`s that implement
 /// `tokio_util::codec::Decoder`.
 impl<Decoder> Framer for Decoder where
-    Decoder: tokio_util::codec::Decoder<Item = Bytes, Error = BoxedFramingError>
-        + Clone
-        + Debug
-        + Send
-        + Sync
+    Decoder: tokio_util::codec::Decoder<Item = Bytes, Error = BoxedFramingError> + Debug + Send
 {
 }
-
-dyn_clone::clone_trait_object!(Framer);
 
 /// A `Box` containing a `Framer`.
 pub type BoxedFramer = Box<dyn Framer>;

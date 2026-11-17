@@ -376,7 +376,7 @@ mod test {
         sinks::util::tcp::TcpSinkConfig,
         sources::util::net::SocketListenAddr,
         test_util::{
-            collect_n, collect_n_limited,
+            bleed_probe, collect_n, collect_n_limited,
             components::{assert_source_compliance, SOCKET_PUSH_SOURCE_TAGS},
             next_addr, random_string, send_lines, send_lines_tls, wait_for_tcp,
         },
@@ -2036,5 +2036,99 @@ mod test {
             );
         })
         .await;
+    }
+
+    async fn collect_with_deadline(
+        rx: impl futures::Stream<Item = Event> + Unpin,
+        n: usize,
+    ) -> Vec<Event> {
+        timeout(Duration::from_secs(10), collect_n(rx, n))
+            .await
+            .expect("no event from the second unit: decoder state is likely shared across units")
+    }
+
+    #[tokio::test]
+    async fn tcp_connections_do_not_share_json_paths_state() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (tx, mut rx) = SourceSender::new_test();
+        let addr = next_addr();
+        let mut config = TcpConfig::from_address(addr.into());
+        config.decoding = bleed_probe::decoding();
+        let server = SocketConfig::from(config)
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        wait_for_tcp(addr).await;
+
+        // Held open to the end: closing it runs `decode_eof`, which would reset a shared parser.
+        let mut half_open = TcpStream::connect(addr).await.unwrap();
+        half_open
+            .write_all(format!("{{\"marker\":1}}\n{}\n", bleed_probe::HALF_OPEN).as_bytes())
+            .await
+            .unwrap();
+        collect_with_deadline(&mut rx, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        send_lines(addr, [bleed_probe::COMPLETE.to_owned()].into_iter())
+            .await
+            .unwrap();
+
+        bleed_probe::assert_only_complete_document(&collect_with_deadline(&mut rx, 1).await);
+        drop(half_open);
+    }
+
+    #[tokio::test]
+    async fn udp_datagrams_do_not_share_json_paths_state() {
+        let (tx, rx) = SourceSender::new_test();
+        let mut config = UdpConfig::from_address(next_addr().into());
+        config.decoding = bleed_probe::decoding();
+        let address = init_udp_with_config(tx, config).await;
+
+        send_lines_udp(
+            address,
+            [bleed_probe::HALF_OPEN, bleed_probe::COMPLETE].map(String::from),
+        );
+
+        bleed_probe::assert_only_complete_document(&collect_with_deadline(rx, 1).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_datagrams_do_not_share_json_paths_state() {
+        let (tx, rx) = SourceSender::new_test();
+        let mut config =
+            UnixConfig::new(tempfile::tempdir().unwrap().into_path().join("unix_test"));
+        config.decoding = bleed_probe::decoding();
+        let path = init_unix_with_config(tx, false, false, config).await;
+
+        send_lines_unix_datagram(path, &[bleed_probe::HALF_OPEN, bleed_probe::COMPLETE]).await;
+
+        bleed_probe::assert_only_complete_document(&collect_with_deadline(rx, 1).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_stream_connections_do_not_share_json_paths_state() {
+        let (tx, mut rx) = SourceSender::new_test();
+        let mut config =
+            UnixConfig::new(tempfile::tempdir().unwrap().into_path().join("unix_test"));
+        config.decoding = bleed_probe::decoding();
+        let path = init_unix_with_config(tx, true, false, config).await;
+
+        // Held open to the end: closing it runs `decode_eof`, which would reset a shared parser.
+        let mut half_open = UnixStream::connect(&path).await.unwrap();
+        half_open
+            .write_all(format!("{{\"marker\":1}}\n{}\n", bleed_probe::HALF_OPEN).as_bytes())
+            .await
+            .unwrap();
+        collect_with_deadline(&mut rx, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        send_lines_unix_stream(path, &[bleed_probe::COMPLETE]).await;
+
+        bleed_probe::assert_only_complete_document(&collect_with_deadline(&mut rx, 1).await);
+        drop(half_open);
     }
 }

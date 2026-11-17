@@ -19,7 +19,7 @@ use vector_lib::{
 use vrl::value::Kind;
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream},
     config::{log_schema, GenerateConfig, SourceConfig, SourceContext, SourceOutput},
     event::Event,
     internal_events::{EventsReceived, StreamClosedError},
@@ -234,7 +234,7 @@ struct InputHandler {
     pub events_received: Registered<EventsReceived>,
     pub key: String,
     pub redis_key: Option<OwnedValuePath>,
-    pub decoder: Decoder,
+    pub decoder: DecoderFactory<Stream>,
     pub log_namespace: LogNamespace,
     pub cx: SourceContext,
 }
@@ -245,7 +245,7 @@ impl InputHandler {
 
         self.bytes_received.emit(ByteSize(line.len()));
 
-        let mut stream = FramedRead::new(line.as_ref(), self.decoder.clone());
+        let mut stream = FramedRead::new(line.as_ref(), self.decoder.build());
         while let Some(next) = stream.next().await {
             match next {
                 Ok((events, _byte_size)) => {

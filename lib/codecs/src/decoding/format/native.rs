@@ -44,7 +44,7 @@ pub struct NativeDeserializer;
 
 impl Deserializer for NativeDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         // LogNamespace is ignored because Vector owns the data format being consumed and as such there
         // is no need to change the fields of the event.

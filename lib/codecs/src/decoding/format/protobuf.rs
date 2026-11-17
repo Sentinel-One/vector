@@ -26,9 +26,11 @@ pub struct ProtobufDeserializerConfig {
 }
 
 impl ProtobufDeserializerConfig {
-    /// Build the `ProtobufDeserializer` from this configuration.
-    pub fn build(&self) -> vector_common::Result<ProtobufDeserializer> {
-        ProtobufDeserializer::try_from(self)
+    /// Build a `ProtobufDeserializerFactory` from this configuration, loading the descriptor once.
+    pub fn build(&self) -> vector_common::Result<ProtobufDeserializerFactory> {
+        vrl::protobuf::get_message_descriptor(&self.protobuf.desc_file, &self.protobuf.message_type)
+            .map(|message_descriptor| ProtobufDeserializerFactory { message_descriptor })
+            .map_err(Into::into)
     }
 
     /// Return the type of event build by this deserializer.
@@ -73,6 +75,19 @@ pub struct ProtobufDeserializerOptions {
     pub message_type: String,
 }
 
+/// Builds `ProtobufDeserializer`s that share one loaded message descriptor.
+#[derive(Debug, Clone)]
+pub struct ProtobufDeserializerFactory {
+    message_descriptor: MessageDescriptor,
+}
+
+impl ProtobufDeserializerFactory {
+    /// Builds a `ProtobufDeserializer` for the loaded message descriptor.
+    pub fn build(&self) -> ProtobufDeserializer {
+        ProtobufDeserializer::new(self.message_descriptor.clone())
+    }
+}
+
 /// Deserializer that builds `Event`s from a byte frame containing protobuf.
 #[derive(Debug, Clone)]
 pub struct ProtobufDeserializer {
@@ -88,7 +103,7 @@ impl ProtobufDeserializer {
 
 impl Deserializer for ProtobufDeserializer {
     fn parse(
-        &self,
+        &mut self,
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
@@ -119,11 +134,7 @@ impl Deserializer for ProtobufDeserializer {
 impl TryFrom<&ProtobufDeserializerConfig> for ProtobufDeserializer {
     type Error = vector_common::Error;
     fn try_from(config: &ProtobufDeserializerConfig) -> vector_common::Result<Self> {
-        let message_descriptor = vrl::protobuf::get_message_descriptor(
-            &config.protobuf.desc_file,
-            &config.protobuf.message_type,
-        )?;
-        Ok(Self::new(message_descriptor))
+        config.build().map(|factory| factory.build())
     }
 }
 
@@ -150,7 +161,7 @@ mod tests {
         let input = Bytes::from(protobuf_bin_message);
         let message_descriptor =
             vrl::protobuf::get_message_descriptor(&protobuf_desc_path, message_type).unwrap();
-        let deserializer = ProtobufDeserializer::new(message_descriptor);
+        let mut deserializer = ProtobufDeserializer::new(message_descriptor);
 
         for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
             let events = deserializer.parse(input.clone(), namespace).unwrap();
@@ -250,7 +261,7 @@ mod tests {
             "test_protobuf.Person",
         )
         .unwrap();
-        let deserializer = ProtobufDeserializer::new(message_descriptor);
+        let mut deserializer = ProtobufDeserializer::new(message_descriptor);
 
         for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
             assert!(deserializer.parse(input.clone(), namespace).is_err());

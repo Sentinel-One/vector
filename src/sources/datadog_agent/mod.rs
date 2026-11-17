@@ -53,7 +53,7 @@ use warp::{filters::BoxedFilter, reject::Rejection, reply::Response, Filter, Rep
 use crate::http::{build_http_trace_layer, KeepaliveConfig, MaxConnectionAgeLayer};
 use crate::sources::util::handle_accept_error;
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    codecs::{DecoderFactory, DecodingConfig, Stream},
     config::{
         log_schema, DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
         SourceContext, SourceOutput,
@@ -360,7 +360,7 @@ pub(crate) struct DatadogAgentSource {
     pub(crate) log_schema_host_key: OwnedTargetPath,
     pub(crate) log_schema_source_type_key: OwnedTargetPath,
     pub(crate) log_namespace: LogNamespace,
-    pub(crate) decoder: Decoder,
+    pub(crate) decoder: DecoderFactory<Stream>,
     protocol: &'static str,
     logs_schema_definition: Option<Arc<schema::Definition>>,
     events_received: Registered<EventsReceived>,
@@ -397,7 +397,7 @@ impl ApiKeyExtractor {
 impl DatadogAgentSource {
     pub(crate) fn new(
         store_api_key: bool,
-        decoder: Decoder,
+        decoder: DecoderFactory<Stream>,
         protocol: &'static str,
         logs_schema_definition: Option<schema::Definition>,
         log_namespace: LogNamespace,
