@@ -45,13 +45,13 @@ pub enum AuthTokenConfig {
 ///
 /// For inline tokens the `Authorization` header value is pre-formatted into a
 /// `MetadataValue` so the hot request path pays no allocation or parse cost.
-#[cfg(feature = "sinks-vector")]
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
 #[derive(Debug)]
 pub struct AuthState {
     token: AuthToken,
 }
 
-#[cfg(feature = "sinks-vector")]
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
 #[derive(Debug)]
 pub enum AuthToken {
     /// Fully-formatted `"Bearer <value>"` ready to insert into gRPC metadata.
@@ -60,7 +60,7 @@ pub enum AuthToken {
     File(String),
 }
 
-#[cfg(feature = "sinks-vector")]
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
 impl AuthState {
     /// Builds an `AuthState` from an [`AuthTokenConfig`].
     ///

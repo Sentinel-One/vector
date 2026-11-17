@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package observo.beam.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Carries raw client traffic captured by the `bsp` source to control-agent.
+service Beam {
+  // One per BSP instance. It lives as long as the instance.
+  rpc Control(stream ControlRequest) returns (stream ControlResponse);
+  // One per session. Ending the stream normally means the session closed;
+  // cancelling it (RST_STREAM) means the session was reset or aborted.
+  rpc Session(stream SessionRequest) returns (stream SessionResponse);
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_UPDATE = 1;
+  MODE_NEW = 2;
+}
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_TCP = 1;
+  TRANSPORT_UDP = 2;
+  TRANSPORT_UNIX_STREAM = 3;
+  TRANSPORT_UNIX_DATAGRAM = 4;
+}
+
+message ControlRequest {
+  oneof msg {
+    Hello hello = 1;
+    Status status = 2;
+  }
+}
+
+// Informational. Control-agent decides whether any of it ends the test.
+message Status {
+  bool budget_exhausted = 1;  // limits.max_bytes spent
+}
+
+message Hello {
+  string run_id = 1;
+  string instance_id = 2;     // UUID, new on every BSP build
+  Mode mode = 3;
+  Transport transport = 4;
+  string component_id = 5;    // BSP component key, for diagnostics
+  string host = 6;            // pod / host name of the replica
+}
+
+message ControlResponse {
+  oneof msg {
+    Ready ready = 1;
+    Stop stop = 2;
+  }
+}
+
+message Ready {}
+
+// Scope depends on the stream it arrives on:
+//   Control stream: ends the run for this instance, and stays in effect until
+//     BSP is rebuilt (config reload). Update mode: capture ends, proxying continues.
+//     New mode: all sessions closed, listener dropped.
+//   Session stream: ends only that session. Update mode: capture of the session
+//     ends, proxying continues. New mode: the client connection is closed.
+message Stop {
+  string reason = 1;
+}
+
+message SessionRequest {
+  oneof msg {
+    Open open = 1;            // always the first message
+    Data data = 2;
+    HalfClose half_close = 3;
+    Gap gap = 4;
+  }
+  // reserved for capturing the upstream source's replies in update mode
+  reserved 5;
+}
+
+message Open {
+  string run_id = 1;
+  string instance_id = 2;
+  uint64 session_seq = 3;     // unique within instance_id
+  Transport transport = 4;
+  string client_addr = 5;     // "1.2.3.4:51234"; for Unix sockets, the client path or empty
+  string local_addr = 6;      // public listen address the client connected to
+  google.protobuf.Timestamp opened_at = 7;
+}
+
+message Data {
+  // Stream transports: byte offset of payload[0] in the client->server stream.
+  // Datagram transports: index of this datagram within the session.
+  uint64 offset = 1;
+  google.protobuf.Timestamp received_at = 2;  // arrival time of payload[0]
+  bytes payload = 3;          // <= max_chunk_bytes; exactly one datagram for datagram transports
+}
+
+message HalfClose {}
+
+// Bytes (stream) or datagrams [offset, offset + length) were not captured.
+message Gap {
+  uint64 offset = 1;
+  uint64 length = 2;
+}
+
+message SessionResponse {
+  oneof msg {
+    Reply reply = 1;          // new mode only; ignored in update mode
+    HalfClose half_close = 2; // new mode: shut down the client's write side
+    Stop stop = 3;            // ends this session only (see Stop)
+  }
+}
+
+message Reply {
+  bytes payload = 1;          // one datagram for datagram transports
+}

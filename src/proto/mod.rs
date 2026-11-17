@@ -4,6 +4,13 @@ use crate::event::proto as event;
 #[cfg(any(feature = "sources-vector", feature = "sinks-vector"))]
 pub mod vector;
 
+#[cfg(feature = "sources-bsp")]
+pub mod beam {
+    #![allow(clippy::clone_on_ref_ptr)]
+    #![allow(warnings, clippy::pedantic, clippy::nursery)]
+    tonic::include_proto!("observo.beam.v1");
+}
+
 #[cfg(feature = "sinks-datadog_metrics")]
 pub mod fds {
     use std::sync::OnceLock;
