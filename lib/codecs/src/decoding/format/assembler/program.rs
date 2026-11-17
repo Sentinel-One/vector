@@ -194,6 +194,8 @@ enum Action {
     },
     If {
         when: Predicate,
+        /// The paths `when` reads, compiled so a bad `%` path fails the build.
+        reads: Vec<Slot>,
         then: Vec<Action>,
         otherwise: Vec<Action>,
     },
@@ -237,8 +239,6 @@ impl Action {
                 let clash = body
                     .iter()
                     .flat_map(Action::slots)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
                     .find(|s| target.overlaps(s));
                 match clash {
                     Some(path) => Err(BuildError::ForeachOverlap {
@@ -248,42 +248,49 @@ impl Action {
                     None => Ok(Action::Foreach { target, body }),
                 }
             }
-            ActionConfig::If(c) => Ok(Action::If {
-                when: c
+            ActionConfig::If(c) => {
+                let when = c
                     .when
                     .build()
-                    .map_err(|source| BuildError::Predicate { source })?,
-                then: Action::compile_list(&c.then)?,
-                otherwise: Action::compile_list(&c.else_)?,
-            }),
+                    .map_err(|source| BuildError::Predicate { source })?;
+                Ok(Action::If {
+                    reads: when
+                        .target_queries()
+                        .iter()
+                        .map(Slot::compile)
+                        .collect::<Result<_, _>>()?,
+                    when,
+                    then: Action::compile_list(&c.then)?,
+                    otherwise: Action::compile_list(&c.else_)?,
+                })
+            }
             ActionConfig::Stop => Ok(Action::Stop),
         }
     }
 
     /// Every path this action and the actions nested in it read or write, `foreach` targets
     /// included.
-    fn slots(&self) -> Vec<Result<Slot, BuildError>> {
+    fn slots(&self) -> Vec<Slot> {
         match self {
             Action::Merge { from, to, key, .. } => [Some(from), Some(to), key.as_ref()]
                 .into_iter()
                 .flatten()
                 .cloned()
-                .map(Ok)
                 .collect(),
-            Action::Append { from, to, .. } => vec![Ok(from.clone()), Ok(to.clone())],
-            Action::Emit { from, .. } => vec![Ok(from.clone())],
-            Action::Reset { to, .. } => vec![Ok(to.clone())],
-            Action::Foreach { target, body } => std::iter::once(Ok(target.clone()))
+            Action::Append { from, to, .. } => vec![from.clone(), to.clone()],
+            Action::Emit { from, .. } => vec![from.clone()],
+            Action::Reset { to, .. } => vec![to.clone()],
+            Action::Foreach { target, body } => std::iter::once(target.clone())
                 .chain(body.iter().flat_map(Action::slots))
                 .collect(),
             Action::If {
-                when,
+                reads,
                 then,
                 otherwise,
-            } => when
-                .target_queries()
+                ..
+            } => reads
                 .iter()
-                .map(Slot::compile)
+                .cloned()
                 .chain(then.iter().chain(otherwise).flat_map(Action::slots))
                 .collect(),
             Action::Stop => vec![],
@@ -299,6 +306,7 @@ impl Action {
                 when,
                 then,
                 otherwise,
+                ..
             } => when
                 .target_queries()
                 .into_iter()
@@ -308,7 +316,6 @@ impl Action {
             other => other
                 .slots()
                 .into_iter()
-                .flatten()
                 .filter_map(|s| s.vrl_path())
                 .collect(),
         }
@@ -661,6 +668,7 @@ impl View<'_> {
                 when,
                 then,
                 otherwise,
+                ..
             } => {
                 let branch = if when.eval(&*self) { then } else { otherwise };
                 self.run(branch)

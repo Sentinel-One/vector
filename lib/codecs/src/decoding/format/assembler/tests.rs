@@ -256,6 +256,55 @@ fn percent_path_starting_with_an_index_fails_to_build() {
 }
 
 #[test]
+fn predicate_percent_path_starting_with_an_index_fails_to_build_wherever_the_if_is() {
+    let cases = [
+        (
+            "top-level process",
+            indoc! {r#"
+                process:
+                  - if: { when: { exists: "%[0]" }, then: [stop] }
+            "#},
+        ),
+        (
+            "nested in another if",
+            indoc! {r#"
+                process:
+                  - if:
+                      when: { exists: .a }
+                      then:
+                        - if: { when: { exists: "%[0]" }, then: [stop] }
+            "#},
+        ),
+        (
+            "inside a foreach body",
+            indoc! {r#"
+                process:
+                  - foreach:
+                      target: .items
+                      do:
+                        - if: { when: { exists: "%[0]" }, then: [stop] }
+            "#},
+        ),
+        (
+            "flush",
+            indoc! {r#"
+                process: []
+                flush:
+                  actions:
+                    - if: { when: { eq: { path: "%[0]", value: 1 } }, then: [stop] }
+            "#},
+        ),
+    ];
+    cases.into_iter().for_each(|(name, assembler)| {
+        let error = build_error(&ndjson_yaml(assembler));
+        assert!(
+            error.contains("`%[0]`: a `%` path must start with a register name or `meta`"),
+            "{name}: {error}"
+        );
+    });
+}
+
+#[test]
 fn foreach_body_touching_its_register_target_fails_to_build() {
     let error = build_error(&ndjson_yaml(indoc! {r#"
         process:
