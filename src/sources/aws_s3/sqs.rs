@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::{future::ready, num::NonZeroUsize, panic, sync::Arc, sync::LazyLock};
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::Client as S3Client;
@@ -24,6 +25,7 @@ use tokio::{pin, select};
 use tokio_util::codec::FramedRead;
 use tracing::Instrument;
 use vector_lib::codecs::decoding::FramingError;
+use vector_lib::codecs::StreamDecodingError;
 use vector_lib::configurable::configurable_component;
 use vector_lib::internal_event::{
     ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
@@ -40,7 +42,7 @@ use crate::{
         EventsReceived, SqsMessageDeleteBatchError, SqsMessageDeletePartialError,
         SqsMessageDeleteSucceeded, SqsMessageProcessingError, SqsMessageProcessingSucceeded,
         SqsMessageReceiveError, SqsMessageReceiveSucceeded, SqsS3EventRecordInvalidEventIgnored,
-        StreamClosedError,
+        SqsS3ObjectDecodingAborted, StreamClosedError,
     },
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
@@ -649,6 +651,9 @@ impl IngestorProcess {
         });
 
         let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(self.acknowledgements);
+        let content_length = object.content_length;
+        let content_type = object.content_type.clone();
+        let content_encoding = object.content_encoding.clone();
         let object_reader = super::s3_object_decoder(
             self.state.compression,
             &s3_event.s3.object.key,
@@ -671,6 +676,8 @@ impl IngestorProcess {
         // the offset of the object that has been read, but this would only be relevant in
         // the case that the same vector instance processes the same message.
         let mut read_error = None;
+        let read_failed = AtomicBool::new(false);
+        let bytes_read = AtomicU64::new(0);
         let bytes_received = self.bytes_received.clone();
         let events_received = self.events_received.clone();
         let Decoder {
@@ -683,8 +690,10 @@ impl IngestorProcess {
                 .map(|res| {
                     res.inspect(|bytes| {
                         bytes_received.emit(ByteSize(bytes.len()));
+                        bytes_read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     })
                     .map_err(|err| {
+                        read_failed.store(true, Ordering::Relaxed);
                         read_error = Some(err);
                     })
                     .ok()
@@ -704,35 +713,55 @@ impl IngestorProcess {
             None => lines,
         };
 
-        let mut stream = lines.flat_map(|line| {
-            let events = match deserializer.parse_frame(line, decoder_log_namespace) {
-                Ok((events, _events_size)) => events,
-                Err(_error) => {
-                    // Error is handled by `Deserializer::parse_frame`, no further handling
-                    // is needed here.
-                    SmallVec::new()
-                }
-            };
-
-            let events = events
-                .into_iter()
-                .map(|mut event: Event| {
-                    event = event.with_batch_notifier_option(&batch);
-                    if let Some(log_event) = event.maybe_as_log_mut() {
-                        handle_single_log(
-                            log_event,
-                            log_namespace,
-                            &s3_event,
-                            &metadata,
-                            timestamp,
-                        );
+        // `None` marks the end of the object, where the deserializer is flushed so events it still
+        // holds are emitted and enriched like the rest. A non-resumable error ends the object. A
+        // read error skips the flush: the object is retried, and flushing its truncated state
+        // would emit wrong records that the retry then emits again.
+        let fatal = OnceLock::<String>::new();
+        let mut stream = lines
+            .map(Some)
+            .chain(futures::stream::once(ready(None)))
+            .take_while(|_| ready(fatal.get().is_none()))
+            .flat_map(|line| {
+                let parsed = match line {
+                    Some(line) => deserializer
+                        .parse_frame(line, decoder_log_namespace)
+                        .map(|(events, _events_size)| events),
+                    None if read_failed.load(Ordering::Relaxed) => Ok(SmallVec::new()),
+                    None => deserializer.flush_unit(decoder_log_namespace),
+                };
+                let events = match parsed {
+                    Ok(events) => events,
+                    Err(error) => {
+                        // Error is handled by `Deserializer::parse_frame`, no further handling
+                        // is needed here.
+                        if !error.can_continue() {
+                            _ = fatal.set(error.to_string());
+                        }
+                        SmallVec::new()
                     }
-                    events_received.emit(CountByteSize(1, event.estimated_json_encoded_size_of()));
-                    event
-                })
-                .collect::<Vec<Event>>();
-            futures::stream::iter(events)
-        });
+                };
+
+                let events = events
+                    .into_iter()
+                    .map(|mut event: Event| {
+                        event = event.with_batch_notifier_option(&batch);
+                        if let Some(log_event) = event.maybe_as_log_mut() {
+                            handle_single_log(
+                                log_event,
+                                log_namespace,
+                                &s3_event,
+                                &metadata,
+                                timestamp,
+                            );
+                        }
+                        events_received
+                            .emit(CountByteSize(1, event.estimated_json_encoded_size_of()));
+                        event
+                    })
+                    .collect::<Vec<Event>>();
+                futures::stream::iter(events)
+            });
 
         let send_error = match self.out.send_event_stream(&mut stream).await {
             Ok(_) => None,
@@ -746,6 +775,20 @@ impl IngestorProcess {
         // Up above, `lines` captures `read_error`, and eventually is captured by `stream`,
         // so we explicitly drop it so that we can again utilize `read_error` below.
         drop(stream);
+
+        if let Some(error) = fatal.get() {
+            emit!(SqsS3ObjectDecodingAborted {
+                bucket: &s3_event.s3.bucket.name,
+                key: &s3_event.s3.object.key,
+                region: &s3_event.aws_region,
+                content_length,
+                content_type: content_type.as_deref(),
+                content_encoding: content_encoding.as_deref(),
+                last_modified: timestamp,
+                bytes_read: bytes_read.load(Ordering::Relaxed),
+                error,
+            });
+        }
 
         // The BatchNotifier is cloned for each LogEvent in the batch stream, but the last
         // reference must be dropped before the status of the batch is sent to the channel.
