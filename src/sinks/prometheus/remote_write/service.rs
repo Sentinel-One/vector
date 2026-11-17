@@ -6,7 +6,7 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_types::region::Region;
 
 use bytes::Bytes;
-use http::Uri;
+use http::{HeaderName, Uri};
 
 use super::request_builder::RemoteWriteRequest;
 use crate::{
@@ -23,7 +23,6 @@ mod headers {
     pub(super) const X_PROMETHEUS_REMOTE_WRITE_VERSION: &str = "X-Prometheus-Remote-Write-Version";
     pub(super) const CONTENT_ENCODING: &str = "Content-Encoding";
     pub(super) const CONTENT_TYPE: &str = "Content-Type";
-    pub(super) const X_SCOPE_ORGID: &str = "X-Scope-OrgID";
 
     pub(super) const VERSION: &str = "0.1.0";
     pub(super) const APPLICATION_X_PROTOBUF: &str = "application/x-protobuf";
@@ -35,6 +34,7 @@ pub(super) struct RemoteWriteService {
     pub(super) auth: Option<Auth>,
     pub(super) client: HttpClient,
     pub(super) compression: super::Compression,
+    pub(super) tenant_header: HeaderName,
 }
 
 impl Service<RemoteWriteRequest> for RemoteWriteService {
@@ -52,6 +52,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
         let endpoint = self.endpoint.clone();
         let auth = self.auth.clone();
         let compression = self.compression;
+        let tenant_header = self.tenant_header.clone();
 
         Box::pin(async move {
             let metadata = std::mem::take(request.metadata_mut());
@@ -63,7 +64,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
                 &endpoint,
                 compression,
                 request.request,
-                request.tenant_id.as_ref(),
+                request.tenant_id.as_ref().map(|id| (&tenant_header, id)),
                 auth,
             )
             .await?;
@@ -105,7 +106,7 @@ pub(super) async fn build_request(
     endpoint: &Uri,
     compression: Compression,
     body: Bytes,
-    tenant_id: Option<&String>,
+    tenant: Option<(&HeaderName, &String)>,
     auth: Option<Auth>,
 ) -> crate::Result<http::Request<hyper::Body>> {
     let mut builder = http::Request::builder()
@@ -118,8 +119,8 @@ pub(super) async fn build_request(
         builder = builder.header(headers::CONTENT_ENCODING, content_encoding);
     }
 
-    if let Some(tenant_id) = tenant_id {
-        builder = builder.header(headers::X_SCOPE_ORGID, tenant_id);
+    if let Some((header, tenant_id)) = tenant {
+        builder = builder.header(header, tenant_id);
     }
 
     let mut request = builder.body(body)?;

@@ -1,4 +1,4 @@
-use http::Uri;
+use http::{HeaderName, Uri};
 use snafu::prelude::*;
 
 use crate::{
@@ -85,13 +85,20 @@ pub struct RemoteWriteConfig {
 
     /// The tenant ID to send.
     ///
-    /// If set, a header named `X-Scope-OrgID` is added to outgoing requests with the value of this setting.
+    /// If set, a header named by `tenant_header` is added to outgoing requests with the value of this setting.
     ///
     /// This may be used by Cortex or other remote services to identify the tenant making the request.
     #[serde(default)]
     #[configurable(metadata(docs::examples = "my-domain"))]
     #[configurable(metadata(docs::advanced))]
     pub tenant_id: Option<Template>,
+
+    /// The name of the header that carries `tenant_id`.
+    #[serde(default = "default_tenant_header")]
+    #[derivative(Default(value = "default_tenant_header()"))]
+    #[configurable(metadata(docs::examples = "THANOS-TENANT"))]
+    #[configurable(metadata(docs::advanced))]
+    pub tenant_header: String,
 
     #[configurable(derived)]
     pub tls: Option<TlsConfig>,
@@ -119,6 +126,10 @@ pub struct RemoteWriteConfig {
     pub compression: Compression,
 }
 
+fn default_tenant_header() -> String {
+    "X-Scope-OrgID".to_string()
+}
+
 const fn default_compression() -> Compression {
     Compression::Snappy
 }
@@ -134,6 +145,7 @@ impl SinkConfig for RemoteWriteConfig {
 
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let endpoint = self.endpoint.parse::<Uri>().context(UriParseSnafu)?;
+        let tenant_header = HeaderName::try_from(self.tenant_header.as_str())?;
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let request_settings = self.request.into_settings();
         let buckets = self.buckets.clone();
@@ -186,6 +198,7 @@ impl SinkConfig for RemoteWriteConfig {
             client,
             auth,
             compression: self.compression,
+            tenant_header,
         };
         let service = ServiceBuilder::new()
             .settings(request_settings, http_response_retry_logic())
