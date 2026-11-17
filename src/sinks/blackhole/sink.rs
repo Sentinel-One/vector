@@ -14,7 +14,7 @@ use tokio::{
     time::{interval, sleep_until},
 };
 use vector_lib::internal_event::{
-    ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output, Protocol,
+    ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output,
 };
 use vector_lib::EstimatedJsonEncodedSizeOf;
 
@@ -51,7 +51,7 @@ impl StreamSink<EventArray> for BlackholeSink {
         let total_raw_bytes = Arc::clone(&self.total_raw_bytes);
         let (shutdown, mut tripwire) = watch::channel(());
         let events_sent = register!(EventsSent::from(Output(None)));
-        let bytes_sent = register!(BytesSent::from(Protocol("blackhole".into())));
+        let bytes_sent = register!(BytesSent);
 
         if self.config.print_interval_secs.as_secs() > 0 {
             let interval_dur = self.config.print_interval_secs;

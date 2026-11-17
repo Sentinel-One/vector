@@ -19,7 +19,7 @@ use tokio_util::codec::Encoder;
 use vector_lib::json_size::JsonSize;
 use vector_lib::{
     configurable::configurable_component,
-    internal_event::{BytesSent, Protocol},
+    internal_event::BytesSent,
 };
 use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
@@ -262,7 +262,7 @@ where
     }
 
     async fn run_datagram(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        let bytes_sent = register!(BytesSent::from(Protocol::UNIX));
+        let bytes_sent = register!(BytesSent);
         let mut input = input.peekable();
 
         let mut encoder = self.encoder.clone();

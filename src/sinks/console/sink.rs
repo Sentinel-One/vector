@@ -6,7 +6,7 @@ use tokio_util::codec::Encoder as _;
 use vector_lib::codecs::encoding::Framer;
 use vector_lib::{
     internal_event::{
-        ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output, Protocol,
+        ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output,
     },
     EstimatedJsonEncodedSizeOf,
 };
@@ -29,7 +29,7 @@ where
     T: io::AsyncWrite + Send + Sync + Unpin,
 {
     async fn run(mut self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
-        let bytes_sent = register!(BytesSent::from(Protocol("console".into(),)));
+        let bytes_sent = register!(BytesSent);
         let events_sent = register!(EventsSent::from(Output(None)));
         while let Some(mut event) = input.next().await {
             let event_byte_size = event.estimated_json_encoded_size_of();

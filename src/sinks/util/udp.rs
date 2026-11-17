@@ -10,7 +10,7 @@ use snafu::{ResultExt, Snafu};
 use tokio::{net::UdpSocket, time::sleep};
 use tokio_util::codec::Encoder;
 use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{BytesSent, Protocol, Registered};
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use super::{
     datagram::{send_datagrams, DatagramSocket},
@@ -179,7 +179,7 @@ where
             connector,
             transformer,
             encoder,
-            bytes_sent: register!(BytesSent::from(Protocol::UDP)),
+            bytes_sent: register!(BytesSent),
         }
     }
 }

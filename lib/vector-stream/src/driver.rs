@@ -96,7 +96,9 @@ where
         let batched_input = input.ready_chunks(1024);
         pin!(batched_input);
 
-        let bytes_sent = protocol.map(|protocol| register(BytesSent { protocol }));
+        // The protocol name only turns on byte counting from the response; `BytesSent` has no
+        // `protocol` tag any more.
+        let bytes_sent = protocol.map(|_| register(BytesSent));
         let events_sent = RegisteredEventCache::new(());
 
         loop {
