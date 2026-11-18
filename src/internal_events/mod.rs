@@ -27,6 +27,8 @@ mod aws_kinesis_firehose;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 mod aws_sqs;
 mod batch;
+#[cfg(feature = "sources-bsp")]
+mod bsp;
 use vector_lib::codecs::internal_events::codecs;
 pub use vector_lib::internal_events::common;
 mod conditions;
@@ -172,6 +174,8 @@ pub(crate) use self::aws_kinesis::*;
 pub(crate) use self::aws_kinesis_firehose::*;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 pub(crate) use self::aws_sqs::*;
+#[cfg(feature = "sources-bsp")]
+pub(crate) use self::bsp::*;
 pub(crate) use self::codecs::*;
 #[cfg(feature = "sources-datadog_agent")]
 pub(crate) use self::datadog_agent::*;

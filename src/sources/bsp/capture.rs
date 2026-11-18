@@ -21,6 +21,7 @@ use super::{
     metrics::Metrics,
 };
 use crate::{
+    internal_events::{BspCaptureSessionError, BspControlFailure, BspControlStreamError},
     proto::beam::{
         beam_client::BeamClient, control_request, control_response, session_request,
         ControlRequest, ControlResponse, Data, Gap, HalfClose, Hello, Mode, Open, SessionRequest,
@@ -319,6 +320,7 @@ impl Capture {
             }
             .await;
             if let Err(status) = result {
+                emit!(BspCaptureSessionError { status: &status });
                 _ = resp_tx.send(Err(status)).await;
             }
         });
@@ -398,11 +400,17 @@ impl ControlLoop {
                 outcome
             }
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
-                error!(message = "Control-agent rejected the capture token.", %status);
+                emit!(BspControlStreamError {
+                    failure: BspControlFailure::Unauthenticated,
+                    error: &status,
+                });
                 self.stop("unauthenticated")
             }
             Err(status) => {
-                warn!(message = "Failed to open control stream.", %status, internal_log_rate_limit = true);
+                emit!(BspControlStreamError {
+                    failure: BspControlFailure::Open,
+                    error: &status,
+                });
                 ControlOutcome::Failed
             }
         }
@@ -426,15 +434,24 @@ impl ControlLoop {
                     }
                     Ok(Some(_)) => self.capture.metrics.ignored_responses.increment(1),
                     Ok(None) => {
-                        warn!(message = "Control stream ended.", internal_log_rate_limit = true);
+                        emit!(BspControlStreamError {
+                            failure: BspControlFailure::Ended,
+                            error: &"control-agent ended the stream without a Stop",
+                        });
                         break ControlOutcome::Connected;
                     }
                     Err(status) if status.code() == tonic::Code::Unauthenticated => {
-                        error!(message = "Control-agent rejected the capture token.", %status);
+                        emit!(BspControlStreamError {
+                            failure: BspControlFailure::Unauthenticated,
+                            error: &status,
+                        });
                         break self.stop("unauthenticated");
                     }
                     Err(status) => {
-                        warn!(message = "Control stream failed.", %status, internal_log_rate_limit = true);
+                        emit!(BspControlStreamError {
+                            failure: BspControlFailure::Failed,
+                            error: &status,
+                        });
                         break ControlOutcome::Connected;
                     }
                 },

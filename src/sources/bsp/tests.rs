@@ -16,6 +16,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status, Streaming};
+use vector_lib::event::MetricValue;
 
 use super::{
     config::{
@@ -46,6 +47,10 @@ enum OnHello {
     Ready,
     Stop,
     Hold,
+    /// Ends the control stream right after `Hello`, without `Ready` or `Stop`.
+    End,
+    /// Rejects the control RPC as `UNAUTHENTICATED`.
+    Reject,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +92,50 @@ impl FakeBeam {
             .authorization
             .push(authorization);
     }
+
+    /// Answers `Hello` according to `on_hello`, and sends `Stop` once `stop` flips.
+    fn serve_control(
+        &self,
+        mut inbound: Streaming<ControlRequest>,
+    ) -> Response<BoxStream<ControlResponse>> {
+        let (tx, rx) = mpsc::channel(8);
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut stop = this.stop.clone();
+            loop {
+                tokio::select! {
+                    message = inbound.message() => match message {
+                        Ok(Some(message)) => {
+                            let hello = matches!(message.msg, Some(control_request::Msg::Hello(_)));
+                            this.recorded.lock().unwrap().control.push(message);
+                            let reply = match (hello, this.on_hello) {
+                                (true, OnHello::Ready) => Some(control_response::Msg::Ready(BeamReady {})),
+                                (true, OnHello::Stop) => Some(control_response::Msg::Stop(Stop {
+                                    reason: "not admitted".into(),
+                                })),
+                                (true, OnHello::Hold | OnHello::End | OnHello::Reject) | (false, _) => None,
+                            };
+                            if let Some(reply) = reply {
+                                _ = tx.send(Ok(control_msg(reply))).await;
+                            }
+                            if hello && matches!(this.on_hello, OnHello::End) {
+                                break;
+                            }
+                        }
+                        Ok(None) | Err(_) => break,
+                    },
+                    Ok(()) = stop.changed() => {
+                        _ = tx
+                            .send(Ok(control_msg(control_response::Msg::Stop(Stop {
+                                reason: "run finished".into(),
+                            }))))
+                            .await;
+                    }
+                }
+            }
+        });
+        Response::new(Box::pin(ReceiverStream::new(rx)))
+    }
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -109,41 +158,12 @@ impl Beam for FakeBeam {
         request: Request<Streaming<ControlRequest>>,
     ) -> Result<Response<Self::ControlStream>, Status> {
         self.record_auth(&request);
-        let mut inbound = request.into_inner();
-        let (tx, rx) = mpsc::channel(8);
-        let this = self.clone();
-        tokio::spawn(async move {
-            let mut stop = this.stop.clone();
-            loop {
-                tokio::select! {
-                    message = inbound.message() => match message {
-                        Ok(Some(message)) => {
-                            let hello = matches!(message.msg, Some(control_request::Msg::Hello(_)));
-                            this.recorded.lock().unwrap().control.push(message);
-                            let reply = match (hello, this.on_hello) {
-                                (true, OnHello::Ready) => Some(control_response::Msg::Ready(BeamReady {})),
-                                (true, OnHello::Stop) => Some(control_response::Msg::Stop(Stop {
-                                    reason: "not admitted".into(),
-                                })),
-                                (true, OnHello::Hold) | (false, _) => None,
-                            };
-                            if let Some(reply) = reply {
-                                _ = tx.send(Ok(control_msg(reply))).await;
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    },
-                    Ok(()) = stop.changed() => {
-                        _ = tx
-                            .send(Ok(control_msg(control_response::Msg::Stop(Stop {
-                                reason: "run finished".into(),
-                            }))))
-                            .await;
-                    }
-                }
+        match self.on_hello {
+            OnHello::Reject => Err(Status::unauthenticated("bad token")),
+            OnHello::Ready | OnHello::Stop | OnHello::Hold | OnHello::End => {
+                Ok(self.serve_control(request.into_inner()))
             }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        }
     }
 
     async fn session(
@@ -1014,4 +1034,229 @@ async fn test_update_unix_stream_proxies_to_upstream_and_captures_bytes() {
         captured(&beam.half_closed_session(0).await).bytes,
         b"<13>local message"
     );
+}
+
+/// Sum of a counter across series whose tags include `tags`, from this test thread's registry.
+fn counter_total(name: &str, tags: &[(&str, &str)]) -> f64 {
+    vector_lib::metrics::Controller::get()
+        .unwrap()
+        .capture_metrics()
+        .into_iter()
+        .filter(|metric| {
+            metric.name() == name
+                && tags
+                    .iter()
+                    .all(|(tag, value)| metric.tag_matches(tag, value))
+        })
+        .map(|metric| match metric.value() {
+            MetricValue::Counter { value } => *value,
+            _ => 0.0,
+        })
+        .sum()
+}
+
+/// Polls until the counter reaches `at_least`; panics after [`WAIT`].
+async fn wait_for_counter(name: &str, tags: &[(&str, &str)], at_least: f64) -> f64 {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let total = counter_total(name, tags);
+        if total >= at_least {
+            break total;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {name} {tags:?} to reach {at_least}, at {total}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn tls_tcp_input(address: SocketAddr, upstream: SocketAddr) -> TcpInput {
+    let mut input = tcp_input(address, Some(tcp_upstream(upstream)));
+    input.tls = Some(TlsSourceConfig {
+        client_metadata_key: None,
+        tls_config: TlsEnableableConfig {
+            enabled: Some(true),
+            options: TlsConfig {
+                crt_file: Some(tls::TEST_PEM_CRT_PATH.into()),
+                key_file: Some(tls::TEST_PEM_KEY_PATH.into()),
+                ..Default::default()
+            },
+        },
+    });
+    input
+}
+
+#[tokio::test]
+async fn test_update_tcp_counts_tls_handshake_failure_from_plaintext_client() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::Ready, OnSession::Record).await;
+    let (upstream, mut received) = upstream_tcp().await;
+    let addr = next_addr();
+    let _bsp = start_bsp(
+        InputConfig::Tcp(tls_tcp_input(addr, upstream)),
+        beam.capture(),
+    )
+    .await;
+    beam.wait(hello_mode).await;
+
+    _ = exchange(connect_tcp(addr).await, b"GET / HTTP/1.1\r\n\r\n").await;
+
+    let failures = wait_for_counter(
+        "component_errors_total",
+        &[("error_code", "connection_failed")],
+        1.0,
+    )
+    .await;
+    assert_eq!(failures, 1.0);
+    assert!(received.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn test_update_tcp_does_not_count_bare_connect_as_tls_handshake_failure() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::Ready, OnSession::Record).await;
+    let (upstream, _received) = upstream_tcp().await;
+    let addr = next_addr();
+    let _bsp = start_bsp(
+        InputConfig::Tcp(tls_tcp_input(addr, upstream)),
+        beam.capture(),
+    )
+    .await;
+    beam.wait(hello_mode).await;
+
+    // A load-balancer health check: connect, then close without a ClientHello.
+    drop(connect_tcp(addr).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        counter_total(
+            "component_errors_total",
+            &[("error_code", "connection_failed")]
+        ),
+        0.0
+    );
+}
+
+#[tokio::test]
+async fn test_update_udp_counts_datagram_from_peer_outside_permit_origin_and_does_not_forward() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::Ready, OnSession::Record).await;
+    let upstream = upstream_udp().await;
+    let addr = next_addr();
+    let mut input = udp_input(
+        addr,
+        Some(UdpUpstream {
+            address: upstream,
+            capture: UpstreamCapture::default(),
+        }),
+    );
+    input.permit_origin = Some(serde_json::from_str(r#"["10.0.0.0/8"]"#).unwrap());
+    let _bsp = start_bsp(InputConfig::Udp(input), beam.capture()).await;
+    beam.wait(hello_mode).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    client.send_to(b"denied", addr).await.unwrap();
+
+    let denied =
+        wait_for_counter("component_errors_total", &[("error_code", "bad_peer")], 1.0).await;
+    assert_eq!(denied, 1.0);
+    let mut buf = [0u8; 64];
+    let reply = tokio::time::timeout(Duration::from_millis(300), client.recv(&mut buf)).await;
+    assert!(reply.is_err(), "no reply expected, got {reply:?}");
+    assert_eq!(beam.recorded.lock().unwrap().sessions.len(), 0);
+}
+
+#[tokio::test]
+async fn test_update_tcp_counts_capture_session_failure_and_keeps_proxying() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::Ready, OnSession::Fail).await;
+    let (upstream, received) = upstream_tcp().await;
+    let addr = next_addr();
+    let _bsp = start_bsp(
+        InputConfig::Tcp(tcp_input(addr, Some(tcp_upstream(upstream)))),
+        beam.capture(),
+    )
+    .await;
+    beam.wait(hello_mode).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let reply = exchange(connect_tcp(addr).await, b"payload").await.unwrap();
+
+    assert_eq!(reply, b"ack:7");
+    assert_eq!(received.await.unwrap(), b"payload");
+    let failures = wait_for_counter("bsp_capture_sessions_failed_total", &[], 1.0).await;
+    assert_eq!(failures, 1.0);
+    assert_eq!(
+        counter_total(
+            "component_errors_total",
+            &[("error_code", "capture_session_failed")]
+        ),
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn test_new_tcp_counts_capture_session_failure_when_resetting_client() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::Ready, OnSession::Fail).await;
+    let addr = next_addr();
+    let _bsp = start_bsp(InputConfig::Tcp(tcp_input(addr, None)), beam.capture()).await;
+    beam.wait(hello_mode).await;
+
+    _ = exchange(connect_tcp(addr).await, b"payload").await;
+
+    let failures = wait_for_counter("bsp_capture_sessions_failed_total", &[], 1.0).await;
+    assert_eq!(failures, 1.0);
+}
+
+#[tokio::test]
+async fn test_control_stream_counts_each_end_without_stop_while_reconnecting() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::End, OnSession::Record).await;
+    let (upstream, _received) = upstream_tcp().await;
+    let _bsp = start_bsp(
+        InputConfig::Tcp(tcp_input(next_addr(), Some(tcp_upstream(upstream)))),
+        beam.capture(),
+    )
+    .await;
+
+    wait_for_counter(
+        "bsp_control_stream_failures_total",
+        &[("reason", "ended")],
+        2.0,
+    )
+    .await;
+
+    let hellos = beam.recorded.lock().unwrap().control.len();
+    assert!(hellos >= 2, "expected reconnects, saw {hellos} Hello(s)");
+}
+
+#[tokio::test]
+async fn test_control_stream_counts_rejected_token_once_and_stops_reconnecting() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::Reject, OnSession::Record).await;
+    let (upstream, _received) = upstream_tcp().await;
+    let _bsp = start_bsp(
+        InputConfig::Tcp(tcp_input(next_addr(), Some(tcp_upstream(upstream)))),
+        beam.capture(),
+    )
+    .await;
+
+    wait_for_counter(
+        "bsp_control_stream_failures_total",
+        &[("reason", "unauthenticated")],
+        1.0,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        counter_total(
+            "bsp_control_stream_failures_total",
+            &[("reason", "unauthenticated")]
+        ),
+        1.0
+    );
+    assert_eq!(beam.recorded.lock().unwrap().authorization.len(), 1);
 }

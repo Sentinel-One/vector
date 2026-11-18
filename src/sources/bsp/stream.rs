@@ -22,6 +22,7 @@ use super::{
     tee::{Tee, Unit},
 };
 use crate::{
+    internal_events::{SocketMode, SocketReceiveError, TcpSocketTlsConnectionError},
     proto::beam::{session_response, SessionResponse},
     shutdown::ShutdownSignal,
     tcp::TcpKeepaliveConfig,
@@ -107,7 +108,11 @@ impl Client for TcpClient {
     }
 
     async fn handshake(&mut self) -> io::Result<()> {
-        self.stream.handshake().await.map_err(io::Error::other)?;
+        self.stream.handshake().await.map_err(|error| {
+            let failed = io::Error::other(error.to_string());
+            emit!(TcpSocketTlsConnectionError { error });
+            failed
+        })?;
         if let Some(keepalive) = self.keepalive {
             self.stream.set_keepalive(keepalive)?;
         }
@@ -170,6 +175,8 @@ impl Client for UnixClient {
 pub(super) trait Acceptor: Send + 'static {
     type Client: Client;
 
+    const MODE: SocketMode;
+
     fn accept(&mut self) -> impl Future<Output = io::Result<Self::Client>> + Send;
 }
 
@@ -181,6 +188,8 @@ pub(super) struct TcpAcceptor {
 
 impl Acceptor for TcpAcceptor {
     type Client = TcpClient;
+
+    const MODE: SocketMode = SocketMode::Tcp;
 
     async fn accept(&mut self) -> io::Result<TcpClient> {
         self.listener
@@ -199,6 +208,8 @@ pub(super) struct UnixAcceptor(pub(super) UnixListener);
 
 impl Acceptor for UnixAcceptor {
     type Client = UnixClient;
+
+    const MODE: SocketMode = SocketMode::Unix;
 
     async fn accept(&mut self) -> io::Result<UnixClient> {
         self.0.accept().await.map(|(stream, _)| UnixClient(stream))
@@ -293,7 +304,10 @@ impl StreamCtx {
             match next {
                 None => break,
                 Some((Err(error), _)) => {
-                    debug!(message = "Failed to accept connection.", %error);
+                    emit!(SocketReceiveError {
+                        mode: A::MODE,
+                        error: &error
+                    });
                 }
                 Some((Ok(client), permit)) => {
                     let ctx = Arc::clone(&self);

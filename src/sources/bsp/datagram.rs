@@ -23,6 +23,7 @@ use super::{
     tee::{Tee, Unit},
 };
 use crate::{
+    internal_events::{IpAllowlistDeniedError, SocketMode, SocketReceiveError, SocketSendError},
     proto::beam::{session_response, SessionResponse},
     shutdown::ShutdownSignal,
 };
@@ -30,6 +31,8 @@ use crate::{
 /// A listening datagram socket.
 pub(super) trait DgramSocket: Send + Sync + 'static {
     type Peer: Ord + Clone + Send + Sync + 'static;
+
+    const MODE: SocketMode;
 
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<(usize, Self::Peer)>> + Send;
 
@@ -60,6 +63,8 @@ pub(super) struct UdpListener {
 
 impl DgramSocket for UdpListener {
     type Peer = SocketAddr;
+
+    const MODE: SocketMode = SocketMode::Udp;
 
     async fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.socket.recv_from(buf).await
@@ -111,7 +116,10 @@ async fn udp_replies(upstream: Arc<UdpSocket>, listener: Arc<UdpListener>, peer:
     let mut buf = vec![0u8; 65536];
     while let Ok(len) = upstream.recv(&mut buf).await {
         if let Err(error) = listener.socket.send_to(&buf[..len], peer).await {
-            debug!(message = "Failed to relay upstream reply.", %error);
+            emit!(SocketSendError {
+                mode: SocketMode::Udp,
+                error
+            });
         }
     }
 }
@@ -121,6 +129,8 @@ pub(super) struct UnixDgramListener(pub(super) UnixDatagram);
 impl DgramSocket for UnixDgramListener {
     /// The client's bound path; unbound clients share the anonymous session `""`.
     type Peer = String;
+
+    const MODE: SocketMode = SocketMode::Unix;
 
     async fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, String)> {
         self.0.recv_from(buf).await.map(|(len, addr)| {
@@ -304,7 +314,10 @@ impl DgramCtx {
                     }
                 }
                 received = listener.recv(&mut buf) => match received {
-                    Err(error) => debug!(message = "Failed to receive datagram.", %error),
+                    Err(error) => emit!(SocketReceiveError {
+                        mode: L::MODE,
+                        error
+                    }),
                     Ok((len, peer)) if listener.permitted(&peer) => {
                         let len = if len > self.max_length {
                             self.capture.metrics.datagrams_truncated.increment(1);
@@ -316,7 +329,9 @@ impl DgramCtx {
                         self.datagram(&listener, &mut sessions, &ended_tx, peer, payload)
                             .await;
                     }
-                    Ok(_) => debug!(message = "Datagram from a peer outside permit_origin dropped."),
+                    Ok((_, peer)) => emit!(IpAllowlistDeniedError {
+                        peer: &L::describe(&peer)
+                    }),
                 },
             }
         }
@@ -464,7 +479,10 @@ impl DgramCtx {
                 }
                 *index += 1;
                 if let Err(error) = forwarder.send(&payload).await {
-                    debug!(message = "Failed to forward datagram upstream.", %error);
+                    emit!(SocketSendError {
+                        mode: L::MODE,
+                        error
+                    });
                 }
                 Ok(())
             }
@@ -501,7 +519,10 @@ async fn dgram_replies<L: DgramSocket>(
                 msg: Some(session_response::Msg::Reply(reply)),
             })) => {
                 if let Err(error) = listener.reply(reply.payload, &peer).await {
-                    debug!(message = "Failed to send reply datagram.", %error);
+                    emit!(SocketSendError {
+                        mode: L::MODE,
+                        error
+                    });
                 }
             }
             Some(Ok(SessionResponse {
