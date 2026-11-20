@@ -74,9 +74,7 @@ impl BytesDecoderConfig {
 /// This is basically a no-op and is used to convert from `BytesMut` to `Bytes`.
 #[derive(Debug, Clone)]
 pub struct BytesDecoder {
-    /// Whether the empty buffer has been flushed. This is important to
-    /// propagate empty frames in message based transports.
-    flushed: bool,
+    emitted: bool,
     min_chunk_bytes: u64,
 }
 
@@ -89,7 +87,7 @@ impl BytesDecoder {
     /// Creates a `BytesDecoder` that emits early once `min_chunk_bytes` have been buffered.
     pub const fn with_min_chunk_bytes(min_chunk_bytes: u64) -> Self {
         Self {
-            flushed: false,
+            emitted: false,
             min_chunk_bytes,
         }
     }
@@ -106,19 +104,15 @@ impl Decoder for BytesDecoder {
     type Error = BoxedFramingError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        self.flushed = false;
         let ready = !src.is_empty() && src.len() as u64 >= self.min_chunk_bytes;
+        self.emitted |= ready;
         Ok(ready.then(|| src.split().freeze()))
     }
 
     fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if self.flushed && src.is_empty() {
-            Ok(None)
-        } else {
-            self.flushed = true;
-            let frame = src.split();
-            Ok(Some(frame.freeze()))
-        }
+        let emit = !src.is_empty() || !self.emitted;
+        self.emitted |= emit;
+        Ok(emit.then(|| src.split().freeze()))
     }
 }
 
@@ -174,6 +168,30 @@ mod tests {
     }
 
     #[test]
+    fn decode_eof_after_frames_emitted_by_decode_yields_no_empty_frame() {
+        let mut input = BytesMut::from("abcd");
+        let mut decoder = BytesDecoder::with_min_chunk_bytes(4);
+
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "abcd");
+        assert_eq!(decoder.decode(&mut input).unwrap(), None);
+        assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
+        assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
+    }
+
+    #[test]
+    fn decode_eof_after_the_remainder_yields_nothing_however_often_it_is_called() {
+        let mut input = BytesMut::from("abcde");
+        let mut decoder = BytesDecoder::with_min_chunk_bytes(4);
+
+        assert_eq!(decoder.decode(&mut input).unwrap().unwrap(), "abcde");
+        input.extend_from_slice(b"fg");
+        assert_eq!(decoder.decode(&mut input).unwrap(), None);
+        assert_eq!(decoder.decode_eof(&mut input).unwrap().unwrap(), "fg");
+        assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
+        assert_eq!(decoder.decode_eof(&mut input).unwrap(), None);
+    }
+
+    #[test]
     fn decode_with_min_chunk_bytes_default_never_emits_before_eof() {
         let mut input = BytesMut::from("a lot of bytes");
         let mut decoder = BytesDecoderConfig::new().build();
@@ -189,6 +207,40 @@ mod tests {
 
         assert_eq!(reader.next().await.unwrap().unwrap(), "hello world");
         assert!(reader.next().await.is_none());
+    }
+
+    async fn frames(reads: &[&[u8]], min_chunk_bytes: u64) -> Vec<Bytes> {
+        let reads = reads
+            .iter()
+            .map(|read| Ok::<_, std::io::Error>(Bytes::copy_from_slice(read)))
+            .collect::<Vec<_>>();
+        FramedRead::new(
+            tokio_util::io::StreamReader::new(futures::stream::iter(reads)),
+            BytesDecoder::with_min_chunk_bytes(min_chunk_bytes),
+        )
+        .map(Result::unwrap)
+        .collect()
+        .await
+    }
+
+    #[tokio::test]
+    async fn decode_frame_reader_with_min_chunk_bytes_emits_the_whole_input_without_an_empty_frame()
+    {
+        assert_eq!(frames(&[b"hello world"], 1).await, ["hello world"]);
+    }
+
+    #[tokio::test]
+    async fn decode_frame_reader_trickled_one_byte_at_a_time_emits_no_empty_frame() {
+        let reads: Vec<&[u8]> = b"hello".chunks(1).collect();
+        assert_eq!(frames(&reads, 1).await, ["h", "e", "l", "l", "o"]);
+        assert_eq!(frames(&reads, 2).await, ["he", "ll", "o"]);
+        assert_eq!(frames(&reads, 5).await, ["hello"]);
+    }
+
+    #[tokio::test]
+    async fn decode_frame_reader_empty_with_min_chunk_bytes_emits_one_empty_frame() {
+        assert_eq!(frames(&[], 1).await, [""]);
+        assert_eq!(frames(&[b""], 4).await, [""]);
     }
 
     #[test]
