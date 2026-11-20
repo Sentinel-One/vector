@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex, MutexGuard, OnceLock,
     },
 };
@@ -19,8 +19,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{Event, Subscriber};
 use tracing_limit::RateLimitedLayer;
 use tracing_subscriber::{
-    filter::LevelFilter,
-    fmt::writer::MakeWriterExt,
+    filter::{dynamic_filter_fn, FilterExt, LevelFilter},
     layer::{Context, SubscriberExt},
     registry::LookupSpan,
     util::SubscriberInitExt,
@@ -53,6 +52,16 @@ static SUBSCRIBERS: Mutex<Option<Vec<oneshot::Sender<Vec<LogEvent>>>>> =
 /// has been initialized.
 static SENDER: OnceLock<Sender<LogEvent>> = OnceLock::new();
 
+/// A per-event on/off switch for use with `.and(..)` on a per-layer filter.
+///
+/// The `TRACE` max-level hint is deliberate: a dynamic filter has no hint by default, and combining a
+/// missing hint with the layer's `Targets` would discard the `--log-level` cap and raise the global max
+/// level, so disabled `debug!`/`trace!` callsites would no longer short-circuit on the static level check.
+fn gate<S>(enabled: fn() -> bool) -> impl tracing_subscriber::layer::Filter<S> {
+    dynamic_filter_fn(move |_: &tracing::Metadata<'_>, _: &Context<'_, S>| enabled())
+        .with_max_level_hint(LevelFilter::TRACE)
+}
+
 fn metrics_layer_enabled() -> bool {
     !matches!(std::env::var("DISABLE_INTERNAL_METRICS_TRACING_INTEGRATION"), Ok(x) if x == "true")
 }
@@ -67,8 +76,8 @@ static CONSOLE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Returns whether console log output is currently enabled.
 ///
-/// Used as the console writer's per-event predicate (see [`init`]): when it
-/// returns `false`, the writer discards the event.
+/// Used as the console layer's per-event filter (see [`init`]): when it returns
+/// `false` the event is rejected before it is rate-limited or formatted.
 fn console_enabled() -> bool {
     CONSOLE_ENABLED.load(Ordering::Acquire)
 }
@@ -98,7 +107,8 @@ pub fn init(
 
     let broadcast_layer = RateLimitedLayer::new(BroadcastLayer::new())
         .with_default_limit(internal_log_rate_limit)
-        .with_filter(fmt_filter.clone());
+        // Gate first, so with no consumer events reject on atomic loads before any target matching.
+        .with_filter(gate(should_process_tracing_event).and(fmt_filter.clone()));
 
     let subscriber = tracing_subscriber::registry()
         .with(metrics_layer)
@@ -124,38 +134,39 @@ pub fn init(
     // The console formatter is an independent layer from the `BroadcastLayer`
     // that feeds the `internal_logs` source, so toggling it never affects
     // `internal_logs`. Both formats write to stderr (stdout is reserved for
-    // pipeline output such as the `console` sink). The writer is gated on
-    // `console_enabled()`: while console logging is disabled it discards events
-    // (`OptionalWriter::none()`), and the gate is re-enabled at shutdown via
-    // `enable_console_output()` so shutdown-phase logs stay visible.
+    // pipeline output such as the `console` sink). The layer's filter is gated on
+    // `console_enabled()`: while console logging is disabled events are rejected
+    // before they are rate-limited or formatted, and the gate is re-enabled at
+    // shutdown via `enable_console_output()` so shutdown-phase logs stay visible.
     CONSOLE_ENABLED.store(!disable_console, Ordering::Release);
-    let console_writer = std::io::stderr.with_filter(|_meta| console_enabled());
+    // Gate first, so a disabled console rejects on one atomic load before any target matching.
+    let console_filter = gate(console_enabled).and(fmt_filter);
 
     if json {
         let formatter = tracing_subscriber::fmt::layer()
             .json()
             .flatten_event(true)
-            .with_writer(console_writer);
+            .with_writer(std::io::stderr);
 
         #[cfg(test)]
         let formatter = formatter.with_test_writer();
 
         let rate_limited =
             RateLimitedLayer::new(formatter).with_default_limit(internal_log_rate_limit);
-        let subscriber = subscriber.with(rate_limited.with_filter(fmt_filter));
+        let subscriber = subscriber.with(rate_limited.with_filter(console_filter));
 
         _ = subscriber.try_init();
     } else {
         let formatter = tracing_subscriber::fmt::layer()
             .with_ansi(color)
-            .with_writer(console_writer);
+            .with_writer(std::io::stderr);
 
         #[cfg(test)]
         let formatter = formatter.with_test_writer();
 
         let rate_limited =
             RateLimitedLayer::new(formatter).with_default_limit(internal_log_rate_limit);
-        let subscriber = subscriber.with(rate_limited.with_filter(fmt_filter));
+        let subscriber = subscriber.with(rate_limited.with_filter(console_filter));
 
         _ = subscriber.try_init();
     }
@@ -176,9 +187,14 @@ fn get_early_buffer() -> MutexGuard<'static, Option<Vec<LogEvent>>> {
 /// Determines whether tracing events should be processed (e.g. converted to log
 /// events) to avoid unnecessary performance overhead.
 ///
-/// Checks if [`BUFFER`] is set or if a trace sender exists
+/// True while early buffering is active, or while at least one [`TraceSubscription`] is alive
+/// (i.e. an `internal_logs` source exists). Used as the [`BroadcastLayer`]'s per-event
+/// filter, so with no consumer events skip rate limiting and conversion entirely.
+///
+/// Reads [`LIVE_SUBSCRIPTIONS`] rather than `Sender::receiver_count()`, which takes the
+/// broadcast channel's mutex and so would contend on every event across threads.
 fn should_process_tracing_event() -> bool {
-    get_early_buffer().is_some() || maybe_get_trace_sender().is_some()
+    SHOULD_BUFFER.load(Ordering::Acquire) || LIVE_SUBSCRIPTIONS.load(Ordering::Acquire) > 0
 }
 
 /// Attempts to buffer an event into the early buffer.
@@ -294,17 +310,21 @@ pub fn stop_early_buffering() {
 pub struct TraceSubscription {
     buffered_events_rx: Option<oneshot::Receiver<Vec<LogEvent>>>,
     trace_rx: Receiver<LogEvent>,
+    guard: SubscriptionGuard,
 }
 
 impl TraceSubscription {
     /// Registers a subscription to the internal log event stream.
     pub fn subscribe() -> TraceSubscription {
+        // Counted before the receiver exists, so no event sent to it is filtered out.
+        let guard = SubscriptionGuard::acquire();
         let buffered_events_rx = try_register_for_early_events();
         let trace_rx = get_trace_receiver();
 
         Self {
             buffered_events_rx,
             trace_rx,
+            guard,
         }
     }
 
@@ -326,7 +346,34 @@ impl TraceSubscription {
     pub fn into_stream(self) -> impl Stream<Item = LogEvent> + Unpin {
         // We ignore errors because the only error we get is when the broadcast receiver lags, and there's nothing we
         // can actually do about that so there's no reason to force callers to even deal with it.
-        BroadcastStream::new(self.trace_rx).filter_map(|event| ready(event.ok()))
+        let Self {
+            trace_rx, guard, ..
+        } = self;
+        // The stream owns the guard, so the subscription stays counted until the stream is dropped.
+        BroadcastStream::new(trace_rx).filter_map(move |event| {
+            let _ = &guard;
+            ready(event.ok())
+        })
+    }
+}
+
+/// Number of live [`TraceSubscription`]s (or streams made from one); read by
+/// [`should_process_tracing_event`] on every event.
+static LIVE_SUBSCRIPTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Holds one count in [`LIVE_SUBSCRIPTIONS`] for as long as it lives.
+struct SubscriptionGuard;
+
+impl SubscriptionGuard {
+    fn acquire() -> Self {
+        LIVE_SUBSCRIPTIONS.fetch_add(1, Ordering::AcqRel);
+        SubscriptionGuard
+    }
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        LIVE_SUBSCRIPTIONS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -347,23 +394,22 @@ where
     S: Subscriber + 'static + for<'lookup> LookupSpan<'lookup>,
 {
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        if should_process_tracing_event() {
-            let mut log = LogEvent::from(event);
-            // Add span fields if available
-            if let Some(parent_span) = ctx.event_span(event) {
-                for span in parent_span.scope().from_root() {
-                    if let Some(fields) = span.extensions().get::<SpanFields>() {
-                        for (k, v) in &fields.0 {
-                            log.insert(event_path!("vector", *k), v.clone());
-                        }
+        // Only reached when the layer's filter in `init` accepted the event, i.e. someone consumes it.
+        let mut log = LogEvent::from(event);
+        // Add span fields if available
+        if let Some(parent_span) = ctx.event_span(event) {
+            for span in parent_span.scope().from_root() {
+                if let Some(fields) = span.extensions().get::<SpanFields>() {
+                    for (k, v) in &fields.0 {
+                        log.insert(event_path!("vector", *k), v.clone());
                     }
                 }
             }
-            // Try buffering the event, and if we're not buffering anymore, try to
-            // send it along via the trace sender if it's been established.
-            if !try_buffer_event(&log) {
-                try_broadcast_event(log);
-            }
+        }
+        // Try buffering the event, and if we're not buffering anymore, try to
+        // send it along via the trace sender if it's been established.
+        if !try_buffer_event(&log) {
+            try_broadcast_event(log);
         }
     }
 
@@ -426,7 +472,33 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::thread;
 
-    use super::{console_enabled, enable_console_output, CONSOLE_ENABLED};
+    use super::{
+        console_enabled, enable_console_output, TraceSubscription, CONSOLE_ENABLED,
+        LIVE_SUBSCRIPTIONS,
+    };
+
+    /// The live-subscription count backs the broadcast layer's filter, so it must rise on
+    /// subscribe and fall when either the subscription or the stream made from it is dropped.
+    /// Compared against a baseline since other tests in the process may hold subscriptions.
+    #[test]
+    fn live_subscription_count_tracks_subscription_and_stream_lifetimes() {
+        let live = || LIVE_SUBSCRIPTIONS.load(Ordering::Acquire);
+        let baseline = live();
+
+        let subscription = TraceSubscription::subscribe();
+        assert_eq!(live(), baseline + 1);
+        drop(subscription);
+        assert_eq!(live(), baseline);
+
+        let stream = TraceSubscription::subscribe().into_stream();
+        assert_eq!(
+            live(),
+            baseline + 1,
+            "the stream must keep the subscription counted"
+        );
+        drop(stream);
+        assert_eq!(live(), baseline);
+    }
 
     // `CONSOLE_ENABLED` is a process-global. These tests both read and write it,
     // so when several of them share a process (as under plain `cargo test`) they
@@ -478,14 +550,14 @@ mod tests {
         assert!(console_enabled());
     }
 
-    /// End-to-end at the layer level: the console writer discards output while the
-    /// gate is disabled, then emits once it is re-enabled (the shutdown path).
-    /// Wired exactly like `init` — `writer.with_filter(|_| console_enabled())` —
+    /// End-to-end at the layer level: the console layer's filter rejects events while
+    /// the gate is disabled, then accepts them once it is re-enabled (the shutdown path).
+    /// Wired like `init` — `targets.and(dynamic_filter_fn(|_, _| console_enabled()))` —
     /// but capturing into a buffer instead of writing to stderr.
     #[test]
-    fn console_writer_suppresses_while_disabled_then_emits_after_enable() {
-        use tracing_subscriber::filter::LevelFilter;
-        use tracing_subscriber::fmt::writer::{MakeWriter, MakeWriterExt};
+    fn console_filter_suppresses_while_disabled_then_emits_after_enable() {
+        use tracing_subscriber::filter::{dynamic_filter_fn, FilterExt, LevelFilter};
+        use tracing_subscriber::fmt::writer::MakeWriter;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
 
@@ -514,11 +586,10 @@ mod tests {
         let _restore = save_gate();
 
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        // Same wiring as `init`: the writer is gated on `console_enabled()`.
-        let writer = CaptureWriter(Arc::clone(&buf)).with_filter(|_meta| console_enabled());
+        // Same wiring as `init`: the layer's filter is gated on `console_enabled()`.
         let layer = tracing_subscriber::fmt::layer()
-            .with_writer(writer)
-            .with_filter(LevelFilter::INFO);
+            .with_writer(CaptureWriter(Arc::clone(&buf)))
+            .with_filter(LevelFilter::INFO.and(dynamic_filter_fn(|_, _| console_enabled())));
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
@@ -531,11 +602,11 @@ mod tests {
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             !out.contains("while-disabled"),
-            "the writer must discard output while the gate is disabled; got: {out:?}"
+            "the filter must reject events while the gate is disabled; got: {out:?}"
         );
         assert!(
             out.contains("after-enable"),
-            "the writer must emit once the gate is re-enabled; got: {out:?}"
+            "the filter must accept events once the gate is re-enabled; got: {out:?}"
         );
     }
 
