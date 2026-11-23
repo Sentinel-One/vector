@@ -48,6 +48,16 @@ pub enum SetCond<'a> {
     Absent,
 }
 
+/// Whether a write keeps the checkpoint's earlier versions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum History {
+    /// Earlier versions stay until retention purges them.
+    #[default]
+    Keep,
+    /// The write removes earlier versions, leaving only the value it writes.
+    Discard,
+}
+
 impl SetCond<'_> {
     pub fn into_owned(self) -> SetCond<'static> {
         match self {
@@ -75,8 +85,8 @@ impl Error for ChkptErr {
 #[async_trait]
 pub trait Accessor: Send + dyn_clone::DynClone + Sync {
     async fn get(&self, id: Cow<'_, str>) -> Result<Value, ChkptErr>;
-    async fn set(&self, id: Cow<'_, str>, value: Cow<'_, str>, ctx: Cow<'_, str>) -> Result<(), ChkptErr>;
-    async fn compare_and_set(&self, id: Cow<'_, str>, value: Cow<'_, str>, cond: SetCond<'_>, ctx: Cow<'_, str>) -> Result<(), ChkptErr>;
+    async fn set(&self, id: Cow<'_, str>, value: Cow<'_, str>, ctx: Cow<'_, str>, history: History) -> Result<(), ChkptErr>;
+    async fn compare_and_set(&self, id: Cow<'_, str>, value: Cow<'_, str>, cond: SetCond<'_>, ctx: Cow<'_, str>, history: History) -> Result<(), ChkptErr>;
     async fn del(&self, id: Cow<'_, str>) -> Result<(), ChkptErr>;
     async fn compare_and_del(&self, id: Cow<'_, str>, if_old: Cow<'_, str>) -> Result<(), ChkptErr>;
     async fn del_range(&self, from: Cow<'_, str>, to: Cow<'_, str>) -> Result<u64, ChkptErr>;

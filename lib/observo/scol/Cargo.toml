@@ -51,6 +51,7 @@ url.workspace = true
 rand.workspace = true
 chrono.workspace = true
 cron = "0.15"
+humantime = "2"
 bstr = { version = "1.0", features = ["std"], default-features = false }
 hyper.workspace = true
 ipnet = { version = "2", default-features = false, features = ["std"] }
