@@ -15,7 +15,7 @@ use crate::{
     event::LogEvent,
     sinks::{prelude::*, util::encoding::Encoder},
     test_util::{
-        components::{run_and_assert_sink_compliance, SINK_TAGS},
+        components::{build_run_and_assert_sink_compliance, SINK_TAGS},
         http::{always_200_response, spawn_blackhole_http_server},
     },
 };
@@ -37,13 +37,16 @@ async fn component_spec_compliance() {
     };
 
     let context = SinkContext::default();
-    let (sink, _healthcheck) = config
-        .build_inner(context, mock_endpoint.into())
-        .await
-        .unwrap();
+    let sink_future = async {
+        config
+            .build_inner(context, mock_endpoint.into())
+            .await
+            .unwrap()
+            .0
+    };
 
     let event = Event::Log(LogEvent::from("simple message"));
-    run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, stream::once(ready(event)), &SINK_TAGS).await;
 }
 
 #[tokio::test]
@@ -190,12 +193,15 @@ async fn correct_request() {
     .await;
 
     let context = SinkContext::default();
-    let (sink, _healthcheck) = config
-        .build_inner(context, mock_endpoint.into())
-        .await
-        .unwrap();
+    let sink_future = async {
+        config
+            .build_inner(context, mock_endpoint.into())
+            .await
+            .unwrap()
+            .0
+    };
 
-    run_and_assert_sink_compliance(sink, stream::iter(vec![log1, log2]), &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, stream::iter(vec![log1, log2]), &SINK_TAGS).await;
 
     let request = timeout(Duration::from_millis(500), rx.recv())
         .await

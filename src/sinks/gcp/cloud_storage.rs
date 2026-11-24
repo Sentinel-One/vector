@@ -22,7 +22,7 @@ use crate::{
     config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
     event::Event,
     gcp::{GcpAuthConfig, GcpAuthenticator, Scope},
-    http::{get_http_scheme_from_uri, HttpClient},
+    http::HttpClient,
     serde::json::to_string,
     sinks::{
         gcs_common::{
@@ -287,15 +287,18 @@ impl GcsSinkConfig {
 
         let partitioner = self.key_partitioner()?;
 
-        let protocol = get_http_scheme_from_uri(&base_uri);
-
         let svc = ServiceBuilder::new()
             .settings(request, GcsRetryLogic)
-            .service(GcsService::new(client, base_uri.to_string(), auth));
+            .service(GcsService::new(
+                client,
+                base_uri.to_string(),
+                auth,
+                cx.bytes_sent(),
+            ));
 
         let request_settings = RequestSettings::new(self, cx)?;
 
-        let sink = GcsSink::new(svc, request_settings, partitioner, batch_settings, protocol);
+        let sink = GcsSink::new(svc, request_settings, partitioner, batch_settings);
 
         Ok(VectorSink::from_event_streamsink(sink))
     }
@@ -474,7 +477,7 @@ mod tests {
     use crate::codecs::Transformer;
     use crate::event::LogEvent;
     use crate::test_util::{
-        components::{run_and_assert_sink_compliance, SINK_TAGS},
+        components::{build_run_and_assert_sink_compliance, SINK_TAGS},
         http::{always_200_response, spawn_blackhole_http_server},
     };
 
@@ -540,12 +543,15 @@ mod tests {
 
         let config =
             default_config(stack_encoding_config(JsonSerializerConfig::default().into()));
-        let sink = config
-            .build_sink(client, mock_endpoint, GcpAuthenticator::None, context)
-            .expect("failed to build sink");
+        let sink_future = async {
+            config
+                .build_sink(client, mock_endpoint, GcpAuthenticator::None, context)
+                .expect("failed to build sink")
+        };
 
         let event = Event::Log(LogEvent::from("simple message"));
-        run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+        build_run_and_assert_sink_compliance(sink_future, stream::once(ready(event)), &SINK_TAGS)
+            .await;
     }
 
     #[test]
@@ -618,5 +624,23 @@ mod tests {
 
         let req = build_request(None, true, Compression::gzip_default());
         assert_ne!(req.key, "key/date.log.gz".to_string());
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: GcsSinkConfig = toml::from_str(
+            r#"
+            bucket = "b"
+            encoding = {codec = "stack", serializer = {codec = "json"}}
+            skip_authentication = true
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

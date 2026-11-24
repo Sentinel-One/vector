@@ -26,7 +26,7 @@ async fn interpolate_labels() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = LokiSink::new(config, client, crate::config::SinkContext::default().bytes_sent()).unwrap();
 
     let mut e1 = Event::Log(LogEvent::from("hello world"));
 
@@ -67,7 +67,7 @@ async fn use_label_from_dropped_fields() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = LokiSink::new(config, client, crate::config::SinkContext::default().bytes_sent()).unwrap();
 
     let mut e1 = Event::Log(LogEvent::from("hello world"));
 
@@ -163,7 +163,7 @@ async fn timestamp_out_of_range() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = LokiSink::new(config, client, crate::config::SinkContext::default().bytes_sent()).unwrap();
 
     let mut e1 = LogEvent::from("hello world");
     if let Some(timestamp_key) = log_schema().timestamp_key_target_path() {
@@ -193,7 +193,7 @@ async fn structured_metadata_as_json() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = LokiSink::new(config, client, crate::config::SinkContext::default().bytes_sent()).unwrap();
 
     let mut e1 = Event::Log(LogEvent::from("hello world"));
     e1.as_mut_log().insert("foo", "bar");
@@ -203,4 +203,53 @@ async fn structured_metadata_as_json() {
     let expected_metadata = serde_json::json!({"bar": "bar"});
 
     assert_eq!(body[2], expected_metadata);
+}
+
+#[tokio::test]
+async fn sent_bytes_series_exists_after_build() {
+    let config: LokiConfig = toml::from_str(
+        r#"
+        endpoint = "http://127.0.0.1:1"
+        encoding.codec = "json"
+        labels = {a = "b"}
+    "#,
+    )
+    .unwrap();
+    crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
+}
+
+#[tokio::test]
+async fn sent_bytes_counts_only_successful_requests() {
+    test_util::components::init_test();
+
+    // Builds a sink that sends one event to a server answering with `status`.
+    let send_one = |status: http::StatusCode| async move {
+        let addr = test_util::next_addr();
+        let (_rx, trigger, server) = crate::sinks::util::test::build_test_server_status(addr, status);
+        tokio::spawn(server);
+
+        let config: LokiConfig = toml::from_str(&format!(
+            r#"
+            endpoint = "http://{addr}"
+            encoding.codec = "json"
+            labels = {{a = "b"}}
+        "#
+        ))
+        .unwrap();
+        let (sink, _) = config
+            .build(crate::config::SinkContext::default())
+            .await
+            .unwrap();
+        sink.run_events(vec![Event::Log(LogEvent::from("hello"))])
+            .await
+            .unwrap();
+        drop(trigger);
+    };
+
+    // A rejected request (400 is not retried) adds nothing to the counter.
+    send_one(http::StatusCode::BAD_REQUEST).await;
+    assert_eq!(test_util::components::sent_bytes_total(), Some(0.0));
+
+    send_one(http::StatusCode::NO_CONTENT).await;
+    assert!(test_util::components::sent_bytes_total().unwrap() > 0.0);
 }

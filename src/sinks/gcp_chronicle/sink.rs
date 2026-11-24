@@ -8,7 +8,6 @@ pub struct ChronicleSink<Svc, RB> {
     request_builder: RB,
     partitioner: ChroniclePartitioner,
     batcher_settings: BatcherSettings,
-    protocol: &'static str,
 }
 
 impl<Svc, RB> ChronicleSink<Svc, RB> {
@@ -17,14 +16,12 @@ impl<Svc, RB> ChronicleSink<Svc, RB> {
         request_builder: RB,
         partitioner: ChroniclePartitioner,
         batcher_settings: BatcherSettings,
-        protocol: &'static str,
     ) -> Self {
         Self {
             service,
             request_builder,
             partitioner,
             batcher_settings,
-            protocol,
         }
     }
 }
@@ -63,7 +60,6 @@ where
                 }
             })
             .into_driver(self.service)
-            .protocol(self.protocol)
             .run()
             .await
     }

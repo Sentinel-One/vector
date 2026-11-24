@@ -5,11 +5,11 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use rumqttc::{AsyncClient, ClientError};
 use snafu::Snafu;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use super::config::MqttQoS;
 
 pub(super) struct MqttResponse {
-    byte_size: usize,
     json_size: GroupedCountByteSize,
 }
 
@@ -20,10 +20,6 @@ impl DriverResponse for MqttResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.json_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.byte_size)
     }
 }
 
@@ -54,6 +50,8 @@ pub(super) struct MqttService {
     pub(super) client: AsyncClient,
     pub(super) quality_of_service: MqttQoS,
     pub(super) retain: bool,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    pub(super) bytes_sent: Registered<BytesSent>,
 }
 
 #[derive(Debug, Snafu)]
@@ -75,6 +73,7 @@ impl Service<MqttRequest> for MqttService {
         let quality_of_service = self.quality_of_service;
         let retain = self.retain;
         let client = self.client.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let byte_size = req.body.len();
@@ -83,10 +82,12 @@ impl Service<MqttRequest> for MqttService {
                 .publish(&req.topic, quality_of_service.into(), retain, req.body)
                 .await;
             match res {
-                Ok(()) => Ok(MqttResponse {
-                    byte_size,
-                    json_size: req.metadata.into_events_estimated_json_encoded_byte_size(),
-                }),
+                Ok(()) => {
+                    bytes_sent.emit(ByteSize(byte_size));
+                    Ok(MqttResponse {
+                        json_size: req.metadata.into_events_estimated_json_encoded_byte_size(),
+                    })
+                }
                 Err(error) => Err(MqttError::Error { error }),
             }
         })

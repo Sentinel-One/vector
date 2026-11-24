@@ -114,8 +114,8 @@ impl GenerateConfig for NatsSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "nats")]
 impl SinkConfig for NatsSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let sink = NatsSink::new(self.clone()).await?;
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let sink = NatsSink::new(self.clone(), cx.bytes_sent()).await?;
         let healthcheck = healthcheck(self.clone()).boxed();
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }

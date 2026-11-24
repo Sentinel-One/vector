@@ -6,7 +6,6 @@ use futures_util::{
     StreamExt,
 };
 use tower::Service;
-use vector_lib::internal_event::Protocol;
 use vector_lib::stream::{BatcherSettings, DriverResponse};
 use vector_lib::{event::Event, sink::StreamSink};
 
@@ -21,7 +20,6 @@ pub(crate) struct StatsdSink<S> {
     service: S,
     batch_settings: BatcherSettings,
     request_builder: StatsdRequestBuilder,
-    protocol: Protocol,
 }
 
 impl<S> StatsdSink<S>
@@ -36,13 +34,11 @@ where
         service: S,
         batch_settings: BatcherSettings,
         request_builder: StatsdRequestBuilder,
-        protocol: Protocol,
     ) -> Self {
         Self {
             service,
             batch_settings,
             request_builder,
-            protocol,
         }
     }
 
@@ -69,7 +65,6 @@ where
             // Finally, we generate the driver which will take our requests, send them off, and appropriately handle
             // finalization of the events, and logging/metrics, as the requests are responded to.
             .into_driver(self.service)
-            .protocol(self.protocol)
             .run()
             .await
     }

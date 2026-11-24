@@ -16,3 +16,11 @@ crate::registered_event!(
         self.bytes_sent.increment(byte_size.0 as u64);
     }
 );
+
+// The handle is held by sink services, which derive `Debug`. Registered handles do not implement
+// it, and the counter has nothing useful to print.
+impl std::fmt::Debug for BytesSentHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BytesSentHandle").finish_non_exhaustive()
+    }
+}

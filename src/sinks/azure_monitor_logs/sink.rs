@@ -12,7 +12,6 @@ pub struct AzureMonitorLogsSink<S> {
     batch_settings: BatcherSettings,
     encoding: JsonEncoding,
     service: S,
-    protocol: String,
 }
 
 impl<S> AzureMonitorLogsSink<S>
@@ -27,13 +26,11 @@ where
         transformer: Transformer,
         service: S,
         time_generated_key: Option<OwnedValuePath>,
-        protocol: String,
     ) -> Self {
         Self {
             batch_settings,
             encoding: JsonEncoding::new(transformer, time_generated_key),
             service,
-            protocol,
         }
     }
 
@@ -56,7 +53,6 @@ where
                 }
             })
             .into_driver(self.service)
-            .protocol(self.protocol.clone())
             .run()
             .await
     }

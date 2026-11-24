@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions};
 use snafu::{ResultExt, Snafu};
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::tls::TlsError;
 
 use crate::internal_events::MqttConnectionError;
@@ -53,6 +54,7 @@ pub struct MqttSink {
     connector: MqttConnector,
     quality_of_service: MqttQoS,
     retain: bool,
+    bytes_sent: Registered<BytesSent>,
 }
 
 pub(super) struct MqttEvent {
@@ -61,7 +63,11 @@ pub(super) struct MqttEvent {
 }
 
 impl MqttSink {
-    pub fn new(config: &MqttSinkConfig, connector: MqttConnector) -> crate::Result<Self> {
+    pub fn new(
+        config: &MqttSinkConfig,
+        connector: MqttConnector,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<Self> {
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
@@ -72,6 +78,7 @@ impl MqttSink {
             connector,
             quality_of_service: config.quality_of_service,
             retain: config.retain,
+            bytes_sent,
         })
     }
 
@@ -118,6 +125,7 @@ impl MqttSink {
             client,
             quality_of_service: self.quality_of_service,
             retain: self.retain,
+            bytes_sent: self.bytes_sent.clone(),
         });
 
         let request_builder = MqttRequestBuilder {
@@ -140,7 +148,6 @@ impl MqttSink {
                 }
             })
             .into_driver(service)
-            .protocol("mqtt")
             .run()
             .await
     }

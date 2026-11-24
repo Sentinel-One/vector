@@ -256,8 +256,8 @@ impl GenerateConfig for KafkaSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "kafka")]
 impl SinkConfig for KafkaSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let sink = KafkaSink::new(self.clone())?;
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let sink = KafkaSink::new(self.clone(), cx.bytes_sent())?;
         let hc = healthcheck(self.clone()).boxed();
         Ok((VectorSink::from_event_streamsink(sink), hc))
     }
@@ -281,5 +281,18 @@ mod tests {
     #[test]
     fn generate_config() {
         KafkaSinkConfig::generate_config();
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: KafkaSinkConfig = toml::from_str(
+            r#"
+            bootstrap_servers = "127.0.0.1:1"
+            topic = "t"
+            encoding.codec = "json"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

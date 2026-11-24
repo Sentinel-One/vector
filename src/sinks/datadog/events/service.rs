@@ -38,11 +38,6 @@ impl DriverResponse for DatadogEventsResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.event_byte_size
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        // HttpBatchService emits EndpointBytesSend
-        None
-    }
 }
 
 #[derive(Clone)]

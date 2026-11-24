@@ -7,7 +7,7 @@ use futures::future::BoxFuture;
 use tower::Service;
 use vector_lib::request_metadata::GroupedCountByteSize;
 use vector_lib::stream::DriverResponse;
-use vector_lib::{event::EventStatus, ByteSizeOf};
+use vector_lib::event::EventStatus;
 
 use super::{client::Client, request_builder::SendMessageEntry};
 
@@ -62,15 +62,13 @@ where
 
     // Emission of internal events for errors and dropped events is handled upstream by the caller.
     fn call(&mut self, entry: SendMessageEntry) -> Self::Future {
-        let byte_size = entry.size_of();
         let client = self.client.clone();
 
-        Box::pin(async move { client.send_message(entry, byte_size).await })
+        Box::pin(async move { client.send_message(entry).await })
     }
 }
 
 pub(super) struct SendMessageResponse {
-    pub(crate) byte_size: usize,
     pub(crate) json_byte_size: GroupedCountByteSize,
 }
 
@@ -81,9 +79,5 @@ impl DriverResponse for SendMessageResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.json_byte_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.byte_size)
     }
 }

@@ -21,7 +21,7 @@ async fn publish_and_check(conf: NatsSinkConfig) -> Result<(), NatsError> {
     // successfully published.
 
     // Create Sink
-    let sink = NatsSink::new(conf.clone()).await?;
+    let sink = NatsSink::new(conf.clone(), crate::config::SinkContext::default().bytes_sent()).await?;
     let sink = VectorSink::from_event_streamsink(sink);
 
     // Establish the consumer subscription.

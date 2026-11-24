@@ -8,6 +8,7 @@ use http::{
 };
 use hyper::Body;
 use tower::Service;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
@@ -22,14 +23,22 @@ pub struct GcsService {
     client: HttpClient,
     base_url: String,
     auth: GcpAuthenticator,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl GcsService {
-    pub const fn new(client: HttpClient, base_url: String, auth: GcpAuthenticator) -> GcsService {
+    pub fn new(
+        client: HttpClient,
+        base_url: String,
+        auth: GcpAuthenticator,
+        bytes_sent: Registered<BytesSent>,
+    ) -> GcsService {
         GcsService {
             client,
             base_url,
             auth,
+            bytes_sent,
         }
     }
 }
@@ -91,10 +100,6 @@ impl DriverResponse for GcsResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         self.metadata.events_estimated_json_encoded_byte_size()
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.metadata.request_encoded_size())
-    }
 }
 
 impl Service<GcsRequest> for GcsService {
@@ -136,9 +141,16 @@ impl Service<GcsRequest> for GcsService {
         self.auth.apply(&mut http_request);
 
         let mut client = self.client.clone();
+        let bytes_sent = self.bytes_sent.clone();
+        let byte_size = metadata.request_encoded_size();
         Box::pin(async move {
             let result = client.call(http_request).await;
-            result.map(|inner| GcsResponse { inner, metadata })
+            result.map(|inner| {
+                if inner.status().is_success() {
+                    bytes_sent.emit(ByteSize(byte_size));
+                }
+                GcsResponse { inner, metadata }
+            })
         })
     }
 }

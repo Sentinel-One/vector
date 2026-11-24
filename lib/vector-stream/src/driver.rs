@@ -6,8 +6,7 @@ use tower::Service;
 use tracing::Instrument;
 use vector_common::internal_event::emit;
 use vector_common::internal_event::{
-    register, ByteSize, BytesSent, CallError, InternalEventHandle as _, PollReadyError, Registered,
-    RegisteredEventCache, SharedString, TaggedEventsSent,
+    CallError, PollReadyError, RegisteredEventCache, TaggedEventsSent,
 };
 use vector_common::request_metadata::{GroupedCountByteSize, MetaDescriptive};
 use vector_core::event::{EventFinalizers, EventStatus, Finalizable};
@@ -17,13 +16,6 @@ use super::FuturesUnorderedCount;
 pub trait DriverResponse {
     fn event_status(&self) -> EventStatus;
     fn events_sent(&self) -> &GroupedCountByteSize;
-
-    /// Return the number of bytes that were sent in the request that returned this response.
-    // TODO, remove the default implementation once all sinks have
-    // implemented this function.
-    fn bytes_sent(&self) -> Option<usize> {
-        None
-    }
 }
 
 /// Drives the interaction between a stream of items and a service which processes them
@@ -42,26 +34,11 @@ pub trait DriverResponse {
 pub struct Driver<St, Svc> {
     input: St,
     service: Svc,
-    protocol: Option<SharedString>,
 }
 
 impl<St, Svc> Driver<St, Svc> {
     pub fn new(input: St, service: Svc) -> Self {
-        Self {
-            input,
-            service,
-            protocol: None,
-        }
-    }
-
-    /// Set the protocol name for this driver.
-    ///
-    /// If this is set, the driver will fetch and use the `bytes_sent` value from responses in a
-    /// `BytesSent` event.
-    #[must_use]
-    pub fn protocol(mut self, protocol: impl Into<SharedString>) -> Self {
-        self.protocol = Some(protocol.into());
-        self
+        Self { input, service }
     }
 }
 
@@ -87,18 +64,11 @@ where
         let mut next_batch: Option<VecDeque<St::Item>> = None;
         let mut seq_num = 0usize;
 
-        let Self {
-            input,
-            mut service,
-            protocol,
-        } = self;
+        let Self { input, mut service } = self;
 
         let batched_input = input.ready_chunks(1024);
         pin!(batched_input);
 
-        // The protocol name only turns on byte counting from the response; `BytesSent` has no
-        // `protocol` tag any more.
-        let bytes_sent = protocol.map(|_| register(BytesSent));
         let events_sent = RegisteredEventCache::new(());
 
         loop {
@@ -165,7 +135,6 @@ where
                             request_id,
                         );
                         let finalizers = req.take_finalizers();
-                        let bytes_sent = bytes_sent.clone();
                         let events_sent = events_sent.clone();
                         let event_count = req.get_metadata().event_count();
 
@@ -176,7 +145,6 @@ where
                                 request_id,
                                 finalizers,
                                 event_count,
-                                bytes_sent.as_ref(),
                                 &events_sent,
                             ))
                             .instrument(info_span!("request", request_id).or_current());
@@ -202,7 +170,6 @@ where
         request_id: usize,
         finalizers: EventFinalizers,
         event_count: usize,
-        bytes_sent: Option<&Registered<BytesSent>>,
         events_sent: &RegisteredEventCache<(), TaggedEventsSent>,
     ) {
         match result {
@@ -214,12 +181,6 @@ where
                 trace!(message = "Service call succeeded.", request_id);
                 finalizers.update_status(response.event_status());
                 if response.event_status() == EventStatus::Delivered {
-                    if let Some(bytes_sent) = bytes_sent {
-                        if let Some(byte_size) = response.bytes_sent() {
-                            bytes_sent.emit(ByteSize(byte_size));
-                        }
-                    }
-
                     response.events_sent().emit_event(events_sent);
 
                 // This condition occurs specifically when the `HttpBatchService::call()` is called *within* the `Service::call()`

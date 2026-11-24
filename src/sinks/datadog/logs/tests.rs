@@ -27,7 +27,7 @@ use crate::{
     },
     test_util::{
         components::{
-            run_and_assert_data_volume_sink_compliance, run_and_assert_sink_compliance,
+            build_run_and_assert_data_volume_sink_compliance, build_run_and_assert_sink_compliance,
             run_and_assert_sink_error, COMPONENT_ERROR_TAGS, DATA_VOLUME_SINK_TAGS, SINK_TAGS,
         },
         next_addr, random_lines_with_stream,
@@ -90,7 +90,7 @@ async fn start_test_detail(
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async { config.build(cx).await.unwrap().0 };
 
     let (rx, _trigger, server) = test_server(addr, api_status);
     tokio::spawn(server);
@@ -99,10 +99,19 @@ async fn start_test_detail(
     let (expected, events) = random_lines_with_stream(100, 10, Some(batch));
 
     match test_type {
-        TestType::Happy => run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await,
-        TestType::Error => run_and_assert_sink_error(sink, events, &COMPONENT_ERROR_TAGS).await,
+        TestType::Happy => {
+            build_run_and_assert_sink_compliance(sink_future, events, &SINK_TAGS).await
+        }
+        TestType::Error => {
+            run_and_assert_sink_error(sink_future.await, events, &COMPONENT_ERROR_TAGS).await
+        }
         TestType::Telemetry => {
-            run_and_assert_data_volume_sink_compliance(sink, events, &DATA_VOLUME_SINK_TAGS).await
+            build_run_and_assert_data_volume_sink_compliance(
+                sink_future,
+                events,
+                &DATA_VOLUME_SINK_TAGS,
+            )
+            .await
         }
     }
 
@@ -502,7 +511,7 @@ async fn global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async { config.build(cx).await.unwrap().0 };
 
     let (rx, _trigger, server) = test_server(addr, ApiStatus::OKv1);
     tokio::spawn(server);
@@ -510,7 +519,7 @@ async fn global_options() {
     let (batch, receiver) = BatchNotifier::new_with_receiver();
     let (_expected, events) = random_lines_with_stream(100, 10, Some(batch));
 
-    run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, events, &SINK_TAGS).await;
 
     assert_eq!(receiver.await, BatchStatus::Delivered);
 
@@ -548,7 +557,7 @@ async fn override_global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async { config.build(cx).await.unwrap().0 };
 
     let (rx, _trigger, server) = test_server(addr, ApiStatus::OKv1);
     tokio::spawn(server);
@@ -556,7 +565,7 @@ async fn override_global_options() {
     let (batch, receiver) = BatchNotifier::new_with_receiver();
     let (_expected, events) = random_lines_with_stream(100, 10, Some(batch));
 
-    run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, events, &SINK_TAGS).await;
 
     assert_eq!(receiver.await, BatchStatus::Delivered);
 

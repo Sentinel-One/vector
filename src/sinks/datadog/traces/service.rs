@@ -5,6 +5,7 @@ use std::{
 
 use bytes::{Buf, Bytes};
 use futures::future::BoxFuture;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
 use snafu::ResultExt;
@@ -92,7 +93,6 @@ pub struct TraceApiResponse {
     status_code: StatusCode,
     body: Bytes,
     byte_size: GroupedCountByteSize,
-    uncompressed_size: usize,
 }
 
 impl DriverResponse for TraceApiResponse {
@@ -109,10 +109,6 @@ impl DriverResponse for TraceApiResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.byte_size
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.uncompressed_size)
-    }
 }
 
 /// Wrapper for the Datadog API.
@@ -123,11 +119,13 @@ impl DriverResponse for TraceApiResponse {
 #[derive(Debug, Clone)]
 pub struct TraceApiService {
     client: HttpClient,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl TraceApiService {
-    pub const fn new(client: HttpClient) -> Self {
-        Self { client }
+    pub fn new(client: HttpClient, bytes_sent: Registered<BytesSent>) -> Self {
+        Self { client, bytes_sent }
     }
 }
 
@@ -144,6 +142,7 @@ impl Service<TraceApiRequest> for TraceApiService {
     // Emission of Error internal event is handled upstream by the caller
     fn call(&mut self, mut request: TraceApiRequest) -> Self::Future {
         let client = self.client.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let metadata = std::mem::take(request.metadata_mut());
@@ -158,11 +157,14 @@ impl Service<TraceApiRequest> for TraceApiService {
                 .context(CallRequestSnafu)?;
             let body = body.copy_to_bytes(body.remaining());
 
+            if parts.status.is_success() {
+                bytes_sent.emit(ByteSize(uncompressed_size));
+            }
+
             Ok(TraceApiResponse {
                 status_code: parts.status,
                 body,
                 byte_size,
-                uncompressed_size,
             })
         })
     }

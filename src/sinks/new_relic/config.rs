@@ -148,7 +148,10 @@ impl SinkConfig for NewRelicConfig {
 
         let service = ServiceBuilder::new()
             .settings(request_limits, NewRelicApiRetry)
-            .service(NewRelicApiService { client });
+            .service(NewRelicApiService {
+                client,
+                bytes_sent: cx.bytes_sent(),
+            });
 
         let sink = NewRelicSink {
             service,
@@ -226,5 +229,23 @@ impl From<&NewRelicConfig> for NewRelicCredentials {
             region: config.region.unwrap_or(NewRelicRegion::Us),
             override_uri: config.override_uri.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: NewRelicConfig = toml::from_str(
+            r#"
+            license_key = "x"
+            account_id = "1"
+            api = "logs"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

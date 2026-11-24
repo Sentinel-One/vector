@@ -14,6 +14,7 @@ use snafu::Snafu;
 use std::collections::HashMap;
 use std::io;
 use tokio_util::codec::Encoder as _;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use tower::{Service, ServiceBuilder};
 use vector_lib::configurable::configurable_component;
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
@@ -254,7 +255,7 @@ impl SinkConfig for ChronicleUnstructuredConfig {
 
         let healthcheck = build_healthcheck(client.clone(), &healthcheck_endpoint, creds.clone())?;
         creds.spawn_regenerate_token(&APP_INFO);
-        let sink = self.build_sink(client, endpoint, creds)?;
+        let sink = self.build_sink(client, endpoint, creds, cx.bytes_sent())?;
 
         Ok((sink, healthcheck))
     }
@@ -277,6 +278,7 @@ impl ChronicleUnstructuredConfig {
         client: HttpClient,
         base_url: String,
         creds: GcpAuthenticator,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<VectorSink> {
         use crate::sinks::util::service::ServiceBuilderExt;
 
@@ -288,11 +290,11 @@ impl ChronicleUnstructuredConfig {
 
         let svc = ServiceBuilder::new()
             .settings(request, GcsRetryLogic)
-            .service(ChronicleService::new(client, base_url, creds));
+            .service(ChronicleService::new(client, base_url, creds, bytes_sent));
 
         let request_settings = ChronicleRequestBuilder::new(self)?;
 
-        let sink = ChronicleSink::new(svc, request_settings, partitioner, batch_settings, "http");
+        let sink = ChronicleSink::new(svc, request_settings, partitioner, batch_settings);
 
         Ok(VectorSink::from_event_streamsink(sink))
     }
@@ -520,14 +522,22 @@ pub struct ChronicleService {
     client: HttpClient,
     base_url: String,
     creds: GcpAuthenticator,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl ChronicleService {
-    pub const fn new(client: HttpClient, base_url: String, creds: GcpAuthenticator) -> Self {
+    pub fn new(
+        client: HttpClient,
+        base_url: String,
+        creds: GcpAuthenticator,
+        bytes_sent: Registered<BytesSent>,
+    ) -> Self {
         Self {
             client,
             base_url,
             creds,
+            bytes_sent,
         }
     }
 }
@@ -562,6 +572,8 @@ impl Service<ChronicleRequest> for ChronicleService {
         );
 
         let metadata = request.get_metadata().clone();
+        let byte_size = metadata.request_encoded_size();
+        let bytes_sent = self.bytes_sent.clone();
 
         let mut http_request = builder.body(Body::from(request.body)).unwrap();
         self.creds.apply(&mut http_request);
@@ -572,6 +584,7 @@ impl Service<ChronicleRequest> for ChronicleService {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
+                        bytes_sent.emit(ByteSize(byte_size));
                         Ok(GcsResponse {
                             inner: response,
                             metadata,

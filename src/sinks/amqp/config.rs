@@ -98,8 +98,8 @@ impl GenerateConfig for AmqpSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "amqp")]
 impl SinkConfig for AmqpSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let sink = AmqpSink::new(self.clone()).await?;
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let sink = AmqpSink::new(self.clone(), cx.bytes_sent()).await?;
         let hc = healthcheck(Arc::clone(&sink.channel)).boxed();
         Ok((VectorSink::from_event_streamsink(sink), hc))
     }

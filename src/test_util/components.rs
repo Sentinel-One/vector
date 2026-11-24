@@ -193,6 +193,21 @@ pub fn sent_bytes_total() -> Option<f64> {
         })
 }
 
+/// Builds the sink from `config` and asserts that its `component_sent_bytes_total` series exists at
+/// zero as soon as it is built, before any event or connection.
+///
+/// The recorder is installed first, so the series is created in this test's registry.
+pub async fn assert_sent_bytes_series_after_build(config: impl crate::config::SinkConfig) {
+    init_test();
+
+    let (_sink, _healthcheck) = config
+        .build(crate::config::SinkContext::default())
+        .await
+        .expect("sink should build");
+
+    assert_eq!(sent_bytes_total(), Some(0.0));
+}
+
 /// Tests if the given metric contains all the given tag names
 fn has_tags(metric: &Metric, names: &[&str]) -> bool {
     metric

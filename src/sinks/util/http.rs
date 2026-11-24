@@ -684,10 +684,6 @@ impl DriverResponse for HttpResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.events_byte_size
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.raw_byte_size)
-    }
 }
 
 /// Creates a `RetryLogic` for use with `HttpResponse`.

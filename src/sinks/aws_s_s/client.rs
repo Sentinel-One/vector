@@ -11,6 +11,5 @@ where
     fn send_message(
         &self,
         entry: SendMessageEntry,
-        byte_size: usize,
     ) -> impl Future<Output = Result<SendMessageResponse, SdkError<R, HttpResponse>>> + Send;
 }

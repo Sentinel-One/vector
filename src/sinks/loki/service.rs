@@ -4,6 +4,7 @@ use bytes::Bytes;
 use http::StatusCode;
 use snafu::Snafu;
 use tracing::Instrument;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use crate::{
     http::{Auth, HttpClient},
@@ -51,10 +52,6 @@ impl DriverResponse for LokiResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         self.metadata.events_estimated_json_encoded_byte_size()
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.metadata.request_encoded_size())
-    }
 }
 
 #[derive(Clone)]
@@ -86,6 +83,8 @@ impl MetaDescriptive for LokiRequest {
 pub struct LokiService {
     endpoint: UriSerde,
     client: HttpClient,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl LokiService {
@@ -94,10 +93,15 @@ impl LokiService {
         endpoint: UriSerde,
         path: String,
         auth: Option<Auth>,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<Self> {
         let endpoint = endpoint.append_path(&path)?.with_auth(auth);
 
-        Ok(Self { client, endpoint })
+        Ok(Self {
+            client,
+            endpoint,
+            bytes_sent,
+        })
     }
 }
 
@@ -118,6 +122,8 @@ impl Service<LokiRequest> for LokiService {
         let mut req = http::Request::post(&self.endpoint.uri).header("Content-Type", content_type);
 
         let metadata = request.get_metadata().clone();
+        let byte_size = metadata.request_encoded_size();
+        let bytes_sent = self.bytes_sent.clone();
 
         if let Some(tenant_id) = request.tenant_id {
             req = req.header("X-Scope-OrgID", tenant_id);
@@ -142,6 +148,7 @@ impl Service<LokiRequest> for LokiService {
                     let status = response.status();
 
                     if status.is_success() {
+                        bytes_sent.emit(ByteSize(byte_size));
                         Ok(LokiResponse { metadata })
                     } else {
                         Err(LokiError::ServerError { code: status })

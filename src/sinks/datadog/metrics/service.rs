@@ -3,6 +3,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use http::{
     header::{HeaderValue, CONTENT_ENCODING, CONTENT_TYPE},
     Request, StatusCode, Uri,
@@ -122,25 +123,24 @@ impl DriverResponse for DatadogMetricsResponse {
         self.request_metadata
             .events_estimated_json_encoded_byte_size()
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.request_metadata.request_encoded_size())
-    }
 }
 
 #[derive(Clone)]
 pub struct DatadogMetricsService {
     client: HttpClient,
     api_key: HeaderValue,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl DatadogMetricsService {
     /// Creates a new `DatadogMetricsService`.
-    pub fn new(client: HttpClient, api_key: &str) -> Self {
+    pub fn new(client: HttpClient, api_key: &str, bytes_sent: Registered<BytesSent>) -> Self {
         DatadogMetricsService {
             client,
             api_key: HeaderValue::from_str(api_key)
                 .expect("API key should be only valid ASCII characters"),
+            bytes_sent,
         }
     }
 }
@@ -161,9 +161,11 @@ impl Service<DatadogMetricsRequest> for DatadogMetricsService {
     fn call(&mut self, mut request: DatadogMetricsRequest) -> Self::Future {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let request_metadata = std::mem::take(request.metadata_mut());
+            let byte_size = request_metadata.request_encoded_size();
 
             let request = request
                 .into_http_request(api_key)
@@ -172,6 +174,10 @@ impl Service<DatadogMetricsRequest> for DatadogMetricsService {
 
             let result = client.send(request).await;
             let result = DatadogApiError::from_result(result)?;
+
+            if result.status().is_success() {
+                bytes_sent.emit(ByteSize(byte_size));
+            }
 
             Ok(DatadogMetricsResponse {
                 status_code: result.status(),

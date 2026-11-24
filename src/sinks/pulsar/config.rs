@@ -350,13 +350,13 @@ impl GenerateConfig for PulsarSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "pulsar")]
 impl SinkConfig for PulsarSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let client = self
             .create_pulsar_client()
             .await
             .context(super::sink::CreatePulsarSinkSnafu)?;
 
-        let sink = PulsarSink::new(client, self.clone())?;
+        let sink = PulsarSink::new(client, self.clone(), cx.bytes_sent())?;
 
         let hc = healthcheck(self.clone()).boxed();
 

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use snafu::ResultExt;
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use crate::sinks::prelude::*;
 
@@ -22,6 +23,7 @@ pub(super) struct NatsSink {
     encoder: Encoder<()>,
     publisher: Arc<NatsPublisher>,
     subject: Template,
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl NatsSink {
@@ -41,7 +43,10 @@ impl NatsSink {
         Some(NatsEvent { event, subject })
     }
 
-    pub(super) async fn new(config: NatsSinkConfig) -> Result<Self, NatsError> {
+    pub(super) async fn new(
+        config: NatsSinkConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> Result<Self, NatsError> {
         let publisher = Arc::new(config.publisher().await?);
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build().context(EncodingSnafu)?;
@@ -55,6 +60,7 @@ impl NatsSink {
             encoder,
             publisher,
             subject,
+            bytes_sent,
         })
     }
 
@@ -72,6 +78,7 @@ impl NatsSink {
             .settings(request, NatsRetryLogic)
             .service(NatsService {
                 publisher: Arc::clone(&self.publisher),
+                bytes_sent: self.bytes_sent.clone(),
             });
 
         input
@@ -87,7 +94,6 @@ impl NatsSink {
                 }
             })
             .into_driver(service)
-            .protocol("nats")
             .run()
             .await
     }

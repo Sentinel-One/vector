@@ -8,12 +8,15 @@ use greptimedb_ingester::{
     Compression, Database, Error as GreptimeError,
 };
 use std::{sync::Arc, task::Poll};
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use vector_lib::sensitive_string::SensitiveString;
 
 #[derive(Debug, Clone)]
 pub struct GreptimeDBGrpcService {
     /// the client that connects to greptimedb
     client: Arc<Database>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 fn new_client_from_config(config: &GreptimeDBGrpcServiceConfig) -> crate::Result<Client> {
@@ -61,7 +64,10 @@ fn try_from_tls_config(tls_config: &TlsConfig) -> crate::Result<ClientTlsOption>
 }
 
 impl GreptimeDBGrpcService {
-    pub fn try_new(config: impl Into<GreptimeDBGrpcServiceConfig>) -> crate::Result<Self> {
+    pub fn try_new(
+        config: impl Into<GreptimeDBGrpcServiceConfig>,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<Self> {
         let config = config.into();
 
         let grpc_client = new_client_from_config(&config)?;
@@ -77,6 +83,7 @@ impl GreptimeDBGrpcService {
 
         Ok(GreptimeDBGrpcService {
             client: Arc::new(client),
+            bytes_sent,
         })
     }
 }
@@ -93,10 +100,12 @@ impl Service<GreptimeDBGrpcRequest> for GreptimeDBGrpcService {
     // Convert vector metrics into GreptimeDB format and send them in batch
     fn call(&mut self, req: GreptimeDBGrpcRequest) -> Self::Future {
         let client = Arc::clone(&self.client);
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let metadata = req.metadata;
             let result = client.row_insert(req.items).await?;
+            bytes_sent.emit(ByteSize(metadata.request_encoded_size()));
 
             Ok(GreptimeDBGrpcBatchOutput {
                 _item_count: result,

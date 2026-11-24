@@ -133,11 +133,11 @@ impl_generate_config_from_default!(GreptimeDBMetricsConfig);
 #[typetag::serde(name = "greptimedb_metrics")]
 #[async_trait::async_trait]
 impl SinkConfig for GreptimeDBMetricsConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let request_settings = self.request.into_settings();
         let service = ServiceBuilder::new()
             .settings(request_settings, GreptimeDBGrpcRetryLogic)
-            .service(GreptimeDBGrpcService::try_new(self)?);
+            .service(GreptimeDBGrpcService::try_new(self, cx.bytes_sent())?);
         let sink = sink::GreptimeDBGrpcSink {
             service,
             batch_settings: self.batch.into_batcher_settings()?,
@@ -178,5 +178,16 @@ mod tests {
         "#};
 
         toml::from_str::<GreptimeDBMetricsConfig>(config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: GreptimeDBMetricsConfig = toml::from_str(
+            r#"
+            endpoint = "127.0.0.1:4001"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

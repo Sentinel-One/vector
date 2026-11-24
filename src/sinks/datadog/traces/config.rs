@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use http::Uri;
 use indoc::indoc;
 use snafu::ResultExt;
+use vector_lib::internal_event::{BytesSent, Registered};
 use tokio::sync::oneshot::{channel, Sender};
 use tower::ServiceBuilder;
 use vector_lib::config::{proxy::ProxyConfig, AcknowledgementsConfig};
@@ -131,6 +132,7 @@ impl DatadogTracesConfig {
         &self,
         dd_common: &DatadogCommonConfig,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<VectorSink> {
         let default_api_key: Arc<str> = Arc::from(dd_common.default_api_key.inner());
         let request_limits = self.request.into_settings();
@@ -145,7 +147,7 @@ impl DatadogTracesConfig {
 
         let service = ServiceBuilder::new()
             .settings(request_limits, TraceApiRetry)
-            .service(TraceApiService::new(client.clone()));
+            .service(TraceApiService::new(client.clone(), bytes_sent));
 
         // Object responsible for caching/processing APM stats from incoming trace events.
         let apm_stats_aggregator =
@@ -165,13 +167,7 @@ impl DatadogTracesConfig {
         // tripwire= Receiver that APM stats flush thread listens for exit signal on.
         let (shutdown, tripwire) = channel::<Sender<()>>();
 
-        let sink = TracesSink::new(
-            service,
-            request_builder,
-            batcher_settings,
-            shutdown,
-            self.get_protocol(dd_common),
-        );
+        let sink = TracesSink::new(service, request_builder, batcher_settings, shutdown);
 
         // Send the APM stats payloads independently of the sink framework.
         // This is necessary to comply with what the APM stats backend of Datadog expects with
@@ -203,14 +199,6 @@ impl DatadogTracesConfig {
         let app_info = crate::app_info();
         Ok(HttpClient::new(tls_settings, proxy, &app_info)?)
     }
-
-    fn get_protocol(&self, dd_common: &DatadogCommonConfig) -> String {
-        build_uri(&self.get_base_uri(dd_common), "")
-            .unwrap()
-            .scheme_str()
-            .unwrap_or("http")
-            .to_string()
-    }
 }
 
 #[async_trait::async_trait]
@@ -221,7 +209,7 @@ impl SinkConfig for DatadogTracesConfig {
         let global = cx.extra_context.get_or_default::<datadog::Options>();
         let dd_common = self.local_dd_common.with_globals(global)?;
         let healthcheck = dd_common.build_healthcheck(client.clone())?;
-        let sink = self.build_sink(&dd_common, client)?;
+        let sink = self.build_sink(&dd_common, client, cx.bytes_sent())?;
 
         Ok((sink, healthcheck))
     }
@@ -249,5 +237,16 @@ mod test {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<DatadogTracesConfig>();
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: DatadogTracesConfig = toml::from_str(
+            r#"
+            default_api_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

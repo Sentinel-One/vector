@@ -6,6 +6,7 @@ use bytes::Bytes;
 use pulsar::producer::Message;
 use pulsar::{Error as PulsarError, Executor, MultiTopicProducer, ProducerOptions, Pulsar};
 use tokio::sync::Mutex;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use crate::internal_events::PulsarSendingError;
 use crate::sinks::{prelude::*, pulsar::request_builder::PulsarMetadata};
@@ -18,7 +19,6 @@ pub(super) struct PulsarRequest {
 }
 
 pub struct PulsarResponse {
-    byte_size: usize,
     event_byte_size: GroupedCountByteSize,
 }
 
@@ -29,10 +29,6 @@ impl DriverResponse for PulsarResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.event_byte_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.byte_size)
     }
 }
 
@@ -56,6 +52,8 @@ pub struct PulsarService<Exe: Executor> {
     // NOTE: the reason for the Mutex here is because the `Producer` from the pulsar crate
     // needs to be `mut`, and the `Service::call()` returns a Future.
     producer: Arc<Mutex<MultiTopicProducer<Exe>>>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl<Exe: Executor> PulsarService<Exe> {
@@ -63,6 +61,7 @@ impl<Exe: Executor> PulsarService<Exe> {
         pulsar_client: Pulsar<Exe>,
         producer_options: ProducerOptions,
         producer_name: Option<String>,
+        bytes_sent: Registered<BytesSent>,
     ) -> PulsarService<Exe> {
         let mut builder = pulsar_client.producer().with_options(producer_options);
 
@@ -74,6 +73,7 @@ impl<Exe: Executor> PulsarService<Exe> {
 
         PulsarService {
             producer: Arc::new(Mutex::new(producer)),
+            bytes_sent,
         }
     }
 }
@@ -92,6 +92,7 @@ impl<Exe: Executor> Service<PulsarRequest> for PulsarService<Exe> {
 
     fn call(&mut self, request: PulsarRequest) -> Self::Future {
         let producer = Arc::clone(&self.producer);
+        let bytes_sent = self.bytes_sent.clone();
         let topic = request.metadata.topic.clone();
         let event_time = request
             .metadata
@@ -137,12 +138,14 @@ impl<Exe: Executor> Service<PulsarRequest> for PulsarService<Exe> {
 
             match fut {
                 Ok(resp) => match resp.await {
-                    Ok(_) => Ok(PulsarResponse {
-                        byte_size,
-                        event_byte_size: request
-                            .request_metadata
-                            .into_events_estimated_json_encoded_byte_size(),
-                    }),
+                    Ok(_) => {
+                        bytes_sent.emit(ByteSize(byte_size));
+                        Ok(PulsarResponse {
+                            event_byte_size: request
+                                .request_metadata
+                                .into_events_estimated_json_encoded_byte_size(),
+                        })
+                    }
                     Err(e) => {
                         emit!(PulsarSendingError {
                             error: Box::new(PulsarError::Custom("failed to send".to_string())),

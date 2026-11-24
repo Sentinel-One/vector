@@ -3,6 +3,7 @@
 use crate::sinks::prelude::*;
 use lapin::{options::ConfirmSelectOptions, BasicProperties};
 use serde::Serialize;
+use vector_lib::internal_event::{BytesSent, Registered};
 use std::sync::Arc;
 
 use super::{
@@ -33,10 +34,14 @@ pub(super) struct AmqpSink {
     properties: Option<AmqpPropertiesConfig>,
     transformer: Transformer,
     encoder: crate::codecs::Encoder<()>,
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl AmqpSink {
-    pub(super) async fn new(config: AmqpSinkConfig) -> crate::Result<Self> {
+    pub(super) async fn new(
+        config: AmqpSinkConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<Self> {
         let (_, channel) = config
             .connection
             .connect()
@@ -62,6 +67,7 @@ impl AmqpSink {
             properties: config.properties,
             transformer,
             encoder,
+            bytes_sent,
         })
     }
 
@@ -116,6 +122,7 @@ impl AmqpSink {
         };
         let service = ServiceBuilder::new().service(AmqpService {
             channel: Arc::clone(&self.channel),
+            bytes_sent: self.bytes_sent.clone(),
         });
 
         input
@@ -131,7 +138,6 @@ impl AmqpSink {
                 }
             })
             .into_driver(service)
-            .protocol("amqp_0_9_1")
             .run()
             .await
     }
