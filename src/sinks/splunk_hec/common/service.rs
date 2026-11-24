@@ -457,6 +457,7 @@ mod tests {
             EndpointTarget::Event,
             false,
             None,
+            crate::config::SinkContext::default().bytes_sent(),
         );
         HecService::new(
             BoxService::new(http_service),
@@ -515,7 +516,8 @@ mod tests {
             Arc::clone(&http_request_builder),
             EndpointTarget::Event,
             false,
-            None
+            None,
+            crate::config::SinkContext::default().bytes_sent(),
         );
         HecService::new(
             BoxService::new(http_service),
@@ -842,6 +844,7 @@ mod tests {
             EndpointTarget::Event,
             false,
             None,
+            crate::config::SinkContext::default().bytes_sent(),
         );
 
         let mut service = HecService::new(
@@ -890,6 +893,7 @@ mod tests {
             EndpointTarget::Event,
             false,
             None,
+            crate::config::SinkContext::default().bytes_sent(),
         );
 
         let mut service = HecService::new(
@@ -953,6 +957,7 @@ mod tests {
             EndpointTarget::Event,
             false,
             None,
+            crate::config::SinkContext::default().bytes_sent(),
         );
 
         let mut service = HecService::new(

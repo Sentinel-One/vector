@@ -108,9 +108,12 @@ pub static TRANSFORM_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| Componen
 /// The component test specification for sinks that are push-based.
 pub static SINK_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| {
     ComponentTests {
-        events: &["BytesSent", "EventsSent"], // EventsReceived is emitted in the topology
-        tagged_counters: &["component_sent_bytes_total"],
+        // EventsReceived is emitted in the topology. The bytes counter is held by the sink's
+        // service and has no `BytesSent` event or `protocol`/`endpoint` tags.
+        events: &["EventsSent"],
+        tagged_counters: &[],
         untagged_counters: &[
+            "component_sent_bytes_total",
             "component_sent_events_total",
             "component_sent_event_bytes_total",
         ],
@@ -439,6 +442,41 @@ where
     I: Into<EventArray>,
 {
     assert_sink_compliance(tags, async move {
+        let events = events.map(Into::into);
+        sink.run(events).await.expect("Running sink failed")
+    })
+    .await;
+}
+
+/// Builds the sink inside the compliance wrapper, after it resets the metrics registry, so handles
+/// registered at build time (`SinkContext::bytes_sent`) are not wiped. Pass an unstarted `async`
+/// block, not an already built sink.
+pub async fn build_run_and_assert_sink_compliance<B, S, I>(build: B, events: S, tags: &[&str])
+where
+    B: Future<Output = VectorSink>,
+    S: Stream<Item = I> + Send,
+    I: Into<EventArray>,
+{
+    assert_sink_compliance(tags, async move {
+        let sink = build.await;
+        let events = events.map(Into::into);
+        sink.run(events).await.expect("Running sink failed")
+    })
+    .await;
+}
+
+/// Same as `build_run_and_assert_sink_compliance`, with the data volume assertions.
+pub async fn build_run_and_assert_data_volume_sink_compliance<B, S, I>(
+    build: B,
+    events: S,
+    tags: &[&str],
+) where
+    B: Future<Output = VectorSink>,
+    S: Stream<Item = I> + Send,
+    I: Into<EventArray>,
+{
+    assert_data_volume_sink_compliance(tags, async move {
+        let sink = build.await;
         let events = events.map(Into::into);
         sink.run(events).await.expect("Running sink failed")
     })

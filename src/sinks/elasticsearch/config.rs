@@ -584,7 +584,9 @@ impl SinkConfig for ElasticsearchConfig {
                     self.rejection_report.clone(),
                     self.compression.clone(),
                     rej_ctx,
-                    compression_limits);
+                    compression_limits,
+                    cx.bytes_sent(),
+                );
 
                 (endpoint, service)
             })

@@ -148,7 +148,7 @@ impl SinkConfig for GreptimeDBLogsConfig {
         };
 
         let service: HttpService<GreptimeDBLogsHttpRequestBuilder, PartitionKey> =
-            HttpService::new(client.clone(), request_builder.clone());
+            HttpService::new(client.clone(), request_builder.clone(), cx.bytes_sent());
 
         let request_limits = self.request.into_settings();
 

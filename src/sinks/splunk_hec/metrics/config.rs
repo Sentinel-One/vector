@@ -209,7 +209,8 @@ impl HecMetricsSinkConfig {
                 Arc::clone(&http_request_builder),
                 EndpointTarget::Event,
                 false,
-                self.path.clone()
+                self.path.clone(),
+                cx.bytes_sent(),
             ));
 
         let rej_ctx = Arc::new(HecRejectionContext {

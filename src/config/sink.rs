@@ -13,6 +13,7 @@ use vector_lib::configurable::{
 use vector_lib::{
     config::{AcknowledgementsConfig, GlobalOptions, Input},
     id::Inputs,
+    internal_event::{BytesSent, Registered},
     sink::VectorSink,
 };
 
@@ -277,6 +278,16 @@ impl Default for SinkContext {
 }
 
 impl SinkContext {
+    /// Handle that counts the bytes a sink sent into `component_sent_bytes_total`.
+    ///
+    /// Call it from `SinkConfig::build`, which runs inside the sink's span, so the series carries
+    /// `component_id`, `component_kind` and `component_type`. Keep the handle for the life of the
+    /// sink: holding it keeps the series present from startup and stops it expiring while the sink
+    /// is idle. A sink that does not call this gets no series.
+    pub fn bytes_sent(&self) -> Registered<BytesSent> {
+        register!(BytesSent)
+    }
+
     pub const fn globals(&self) -> &GlobalOptions {
         &self.globals
     }

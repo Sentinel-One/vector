@@ -8,6 +8,7 @@ use futures::{
 use http::Request;
 use hyper::Body;
 use tower::{Service, ServiceExt};
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::stream::DriverResponse;
 use vector_lib::{
     request_metadata::{GroupedCountByteSize, MetaDescriptive},
@@ -58,23 +59,28 @@ impl DatadogEventsService {
         endpoint: http::Uri,
         default_api_key: SensitiveString,
         http_client: HttpClient<Body>,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
-        let batch_http_service = HttpBatchService::new(http_client, move |req| {
-            let req: DatadogEventsRequest = req;
+        let batch_http_service = HttpBatchService::new(
+            http_client,
+            move |req| {
+                let req: DatadogEventsRequest = req;
 
-            let api_key = match req.metadata.api_key.as_ref() {
-                Some(x) => x.as_ref(),
-                None => default_api_key.inner(),
-            };
+                let api_key = match req.metadata.api_key.as_ref() {
+                    Some(x) => x.as_ref(),
+                    None => default_api_key.inner(),
+                };
 
-            let request = Request::post(&endpoint)
-                .header("Content-Type", "application/json")
-                .header("DD-API-KEY", api_key)
-                .header("Content-Length", req.body.len())
-                .body(req.body)
-                .map_err(|x| x.into());
-            future::ready(request)
-        });
+                let request = Request::post(&endpoint)
+                    .header("Content-Type", "application/json")
+                    .header("DD-API-KEY", api_key)
+                    .header("Content-Length", req.body.len())
+                    .body(req.body)
+                    .map_err(|x| x.into());
+                future::ready(request)
+            },
+            bytes_sent,
+        );
 
         Self { batch_http_service }
     }

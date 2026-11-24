@@ -549,14 +549,16 @@ where
 async fn run_sink(extra_config: &str, assert_parts: impl Fn(http::request::Parts)) {
     let num_lines = 1000;
 
-    let (in_addr, sink) = build_sink(extra_config).await;
+    let (in_addr, config) = sink_config(extra_config);
+    // Built inside the compliance wrapper, after it installs the metrics recorder.
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let (rx, trigger, server) = build_test_server(in_addr);
     tokio::spawn(server);
 
     let (batch, mut receiver) = BatchNotifier::new_with_receiver();
     let (input_lines, events) = random_lines_with_stream(100, num_lines, Some(batch));
-    components::run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+    components::build_run_and_assert_sink_compliance(sink_future, events, &HTTP_SINK_TAGS).await;
     drop(trigger);
 
     assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
@@ -567,7 +569,7 @@ async fn run_sink(extra_config: &str, assert_parts: impl Fn(http::request::Parts
     assert_eq!(input_lines, output_lines);
 }
 
-async fn build_sink(extra_config: &str) -> (std::net::SocketAddr, crate::sinks::VectorSink) {
+fn sink_config(extra_config: &str) -> (std::net::SocketAddr, HttpSinkConfig) {
     let in_addr = next_addr();
 
     let config = format!(
@@ -582,9 +584,11 @@ async fn build_sink(extra_config: &str) -> (std::net::SocketAddr, crate::sinks::
         extras = extra_config,
     );
     let config: HttpSinkConfig = toml::from_str(&config).unwrap();
+    (in_addr, config)
+}
 
-    let cx = SinkContext::default();
-
-    let (sink, _) = config.build(cx).await.unwrap();
+async fn build_sink(extra_config: &str) -> (std::net::SocketAddr, crate::sinks::VectorSink) {
+    let (in_addr, config) = sink_config(extra_config);
+    let (sink, _) = config.build(SinkContext::default()).await.unwrap();
     (in_addr, sink)
 }

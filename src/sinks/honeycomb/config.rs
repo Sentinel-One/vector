@@ -122,7 +122,11 @@ impl SinkConfig for HoneycombConfig {
         let app_info = crate::app_info();
         let client = HttpClient::new(None, cx.proxy(), &app_info)?;
 
-        let service = HttpService::new(client.clone(), honeycomb_service_request_builder);
+        let service = HttpService::new(
+            client.clone(),
+            honeycomb_service_request_builder,
+            cx.bytes_sent(),
+        );
 
         let request_limits = self.request.into_settings();
 

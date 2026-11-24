@@ -191,13 +191,14 @@ mod tests {
         // to our local server
         config.endpoint = Some(format!("http://{}", addr));
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let sink_future = async { config.build(cx).await.unwrap().0 };
 
         let (mut rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);
 
         let (expected, events) = random_lines_with_stream(100, 10, None);
-        components::run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+        components::build_run_and_assert_sink_compliance(sink_future, events, &HTTP_SINK_TAGS)
+            .await;
 
         let output = rx.next().await.unwrap();
 

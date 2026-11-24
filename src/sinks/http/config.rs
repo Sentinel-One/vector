@@ -243,6 +243,7 @@ impl SinkConfig for HttpSinkConfig {
             validate_payload_wrapper(&self.payload_prefix, &self.payload_suffix, &encoder)?;
 
         let client = self.build_http_client(&cx)?;
+        let bytes_sent = cx.bytes_sent();
 
         let healthcheck = match cx.healthcheck.uri {
             Some(healthcheck_uri) => {
@@ -285,7 +286,7 @@ impl SinkConfig for HttpSinkConfig {
             content_encoding,
         );
 
-        let service = HttpService::new(client, http_sink_request_builder);
+        let service = HttpService::new(client, http_sink_request_builder, bytes_sent);
 
         let request_limits = self.request.tower.into_settings();
 

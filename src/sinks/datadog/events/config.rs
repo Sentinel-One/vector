@@ -2,6 +2,7 @@ use indoc::indoc;
 use tower::ServiceBuilder;
 use vector_lib::config::proxy::ProxyConfig;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::schema;
 use vrl::value::Kind;
 
@@ -58,11 +59,13 @@ impl DatadogEventsConfig {
         &self,
         dd_common: &DatadogCommonConfig,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<VectorSink> {
         let service = DatadogEventsService::new(
             dd_common.get_api_endpoint("/api/v1/events")?,
             dd_common.default_api_key.clone(),
             client,
+            bytes_sent,
         );
 
         let request_opts = self.request;
@@ -87,7 +90,7 @@ impl SinkConfig for DatadogEventsConfig {
         let global = cx.extra_context.get_or_default::<datadog::Options>();
         let dd_common = self.dd_common.with_globals(global)?;
         let healthcheck = dd_common.build_healthcheck(client.clone())?;
-        let sink = self.build_sink(&dd_common, client)?;
+        let sink = self.build_sink(&dd_common, client, cx.bytes_sent())?;
 
         Ok((sink, healthcheck))
     }

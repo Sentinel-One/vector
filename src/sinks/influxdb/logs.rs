@@ -222,6 +222,7 @@ impl SinkConfig for InfluxDbLogsConfig {
             request,
             batch.timeout,
             client,
+            cx.bytes_sent(),
         )
         .sink_map_err(|error| error!(message = "Fatal influxdb_logs sink error.", %error));
 
@@ -407,8 +408,8 @@ mod tests {
         },
         test_util::{
             components::{
-                run_and_assert_sink_compliance, run_and_assert_sink_error, COMPONENT_ERROR_TAGS,
-                HTTP_SINK_TAGS,
+                build_run_and_assert_sink_compliance, run_and_assert_sink_error,
+                COMPONENT_ERROR_TAGS, HTTP_SINK_TAGS,
             },
             next_addr,
         },
@@ -769,8 +770,6 @@ mod tests {
         let host = format!("http://{}", addr);
         config.endpoint = host;
 
-        let (sink, _) = config.build(cx).await.unwrap();
-
         let (rx, _trigger, server) = build_test_server_status(addr, status_code);
         tokio::spawn(server);
 
@@ -799,8 +798,16 @@ mod tests {
         drop(batch);
 
         if batch_status == BatchStatus::Delivered {
-            run_and_assert_sink_compliance(sink, stream::iter(events), &HTTP_SINK_TAGS).await;
+            // Built inside the compliance wrapper, after it installs the metrics recorder.
+            let sink_future = async { config.build(cx).await.unwrap().0 };
+            build_run_and_assert_sink_compliance(
+                sink_future,
+                stream::iter(events),
+                &HTTP_SINK_TAGS,
+            )
+            .await;
         } else {
+            let (sink, _) = config.build(cx).await.unwrap();
             run_and_assert_sink_error(sink, stream::iter(events), &COMPONENT_ERROR_TAGS).await;
         }
 

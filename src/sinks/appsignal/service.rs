@@ -9,6 +9,7 @@ use http::{header::AUTHORIZATION, Request, StatusCode, Uri};
 use hyper::Body;
 use tower::{Service, ServiceExt};
 
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::stream::DriverResponse;
 use vector_lib::{
     finalization::EventStatus, request_metadata::GroupedCountByteSize,
@@ -37,20 +38,25 @@ impl AppsignalService {
         endpoint: Uri,
         push_api_key: SensitiveString,
         compression: Compression,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
-        let batch_service = HttpBatchService::new(http_client, move |req| {
-            let req: AppsignalRequest = req;
+        let batch_service = HttpBatchService::new(
+            http_client,
+            move |req| {
+                let req: AppsignalRequest = req;
 
-            let mut request = Request::post(&endpoint)
-                .header("Content-Type", "application/json")
-                .header(AUTHORIZATION, format!("Bearer {}", push_api_key.inner()))
-                .header("Content-Length", req.payload.len());
-            if let Some(ce) = compression.content_encoding() {
-                request = request.header("Content-Encoding", ce)
-            }
-            let result = request.body(req.payload).map_err(|x| x.into());
-            future::ready(result)
-        });
+                let mut request = Request::post(&endpoint)
+                    .header("Content-Type", "application/json")
+                    .header(AUTHORIZATION, format!("Bearer {}", push_api_key.inner()))
+                    .header("Content-Length", req.payload.len());
+                if let Some(ce) = compression.content_encoding() {
+                    request = request.header("Content-Encoding", ce)
+                }
+                let result = request.body(req.payload).map_err(|x| x.into());
+                future::ready(result)
+            },
+            bytes_sent,
+        );
         Self { batch_service }
     }
 }
