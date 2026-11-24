@@ -116,8 +116,8 @@ mod tests {
         sinks::util::test::build_test_server_generic,
         test_util::{
             components::{
-                run_and_assert_data_volume_sink_compliance, run_and_assert_sink_compliance,
-                DATA_VOLUME_SINK_TAGS, HTTP_SINK_TAGS,
+                build_run_and_assert_data_volume_sink_compliance,
+                build_run_and_assert_sink_compliance, DATA_VOLUME_SINK_TAGS, HTTP_SINK_TAGS,
             },
             next_addr, random_lines_with_stream,
         },
@@ -146,7 +146,7 @@ mod tests {
 
         let cx = SinkContext::default();
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let sink_future = async { config.build(cx).await.unwrap().0 };
         let (rx, trigger, server) = build_test_server_generic(in_addr, move || {
             hyper::Response::builder()
                 .header("grpc-status", "0") // OK
@@ -161,11 +161,17 @@ mod tests {
         let (input_lines, events) = random_lines_with_stream(8, num_lines, Some(batch));
 
         match test_type {
-            TestType::Normal => run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await,
+            TestType::Normal => {
+                build_run_and_assert_sink_compliance(sink_future, events, &HTTP_SINK_TAGS).await
+            }
 
             TestType::DataVolume => {
-                run_and_assert_data_volume_sink_compliance(sink, events, &DATA_VOLUME_SINK_TAGS)
-                    .await
+                build_run_and_assert_data_volume_sink_compliance(
+                    sink_future,
+                    events,
+                    &DATA_VOLUME_SINK_TAGS,
+                )
+                .await
             }
         }
 
@@ -441,6 +447,52 @@ mod tests {
             config.build(cx).await.is_err(),
             "build should fail for inline token with invalid characters"
         );
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_before_any_request() {
+        crate::test_util::components::init_test();
+
+        // Nothing listens on this address, and no event is sent.
+        let config = format!(r#"address = "http://{}/""#, next_addr());
+        let config: VectorConfig = toml::from_str(&config).unwrap();
+        let (_sink, _) = config.build(SinkContext::default()).await.unwrap();
+
+        // The series is there, at zero, as soon as the sink is built.
+        assert_eq!(crate::test_util::components::sent_bytes_total(), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_counts_only_successful_requests() {
+        crate::test_util::components::init_test();
+
+        // Builds a sink that sends one event to a server answering with the gRPC status `grpc_status`.
+        let send_one = |grpc_status: &'static str| async move {
+            let in_addr = next_addr();
+            let (_rx, trigger, server) = build_test_server_generic(in_addr, move || {
+                hyper::Response::builder()
+                    .header("grpc-status", grpc_status)
+                    .header("content-type", "application/grpc")
+                    .body(hyper::Body::from(encode_body(proto::PushEventsResponse {})))
+                    .unwrap()
+            });
+            tokio::spawn(server);
+
+            let config = format!(r#"address = "http://{in_addr}/""#);
+            let config: VectorConfig = toml::from_str(&config).unwrap();
+            let (sink, _) = config.build(SinkContext::default()).await.unwrap();
+            sink.run_events(vec![Event::Log("hello".into())])
+                .await
+                .unwrap();
+            drop(trigger);
+        };
+
+        // Unauthenticated (16) is not retried, and adds nothing to the counter.
+        send_one("16").await;
+        assert_eq!(crate::test_util::components::sent_bytes_total(), Some(0.0));
+
+        send_one("0").await;
+        assert!(crate::test_util::components::sent_bytes_total().unwrap() > 0.0);
     }
 
     // taken from <https://github.com/hyperium/tonic/blob/5aa8ae1fec27377cd4c2a41d309945d7e38087d0/examples/src/grpc-web/client.rs#L45-L75>

@@ -30,30 +30,6 @@ impl InternalEvent for EndpointBytesReceived<'_> {
 }
 
 #[derive(Debug)]
-pub struct EndpointBytesSent<'a> {
-    pub byte_size: usize,
-    pub protocol: &'a str,
-    pub endpoint: &'a str,
-}
-
-impl InternalEvent for EndpointBytesSent<'_> {
-    fn emit(self) {
-        trace!(
-            message = "Bytes sent.",
-            byte_size = %self.byte_size,
-            protocol = %self.protocol,
-            endpoint = %self.endpoint
-        );
-        counter!(
-            "component_sent_bytes_total",
-            "protocol" => self.protocol.to_string(),
-            "endpoint" => self.endpoint.to_string()
-        )
-        .increment(self.byte_size as u64);
-    }
-}
-
-#[derive(Debug)]
 pub struct SocketOutgoingConnectionError<E> {
     pub error: E,
 }

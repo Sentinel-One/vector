@@ -7,11 +7,11 @@ use aws_types::region::Region;
 
 use bytes::Bytes;
 use http::Uri;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use super::request_builder::RemoteWriteRequest;
 use crate::{
     http::HttpClient,
-    internal_events::EndpointBytesSent,
     sinks::{
         prelude::*,
         util::{auth::Auth, http::HttpResponse},
@@ -35,6 +35,8 @@ pub(super) struct RemoteWriteService {
     pub(super) auth: Option<Auth>,
     pub(super) client: HttpClient,
     pub(super) compression: super::Compression,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    pub(super) bytes_sent: Registered<BytesSent>,
 }
 
 impl Service<RemoteWriteRequest> for RemoteWriteService {
@@ -52,6 +54,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
         let endpoint = self.endpoint.clone();
         let auth = self.auth.clone();
         let compression = self.compression;
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let metadata = std::mem::take(request.metadata_mut());
@@ -74,12 +77,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
             let http_response = hyper::Response::from_parts(parts, body);
 
             if http_response.status().is_success() {
-                // We can't rely on the framework to emit this because we need to specify the additional `endpoint` tag.
-                emit!(EndpointBytesSent {
-                    byte_size: raw_byte_size,
-                    protocol: "http",
-                    endpoint: &endpoint.to_string(),
-                });
+                bytes_sent.emit(ByteSize(raw_byte_size));
             }
 
             Ok(HttpResponse {

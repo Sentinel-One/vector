@@ -147,10 +147,16 @@ impl SinkConfig for VectorConfig {
             .clone()
             .map(|uri| uri.uri)
             .unwrap_or_else(|| uri.clone());
-        let healthcheck_client =
-            VectorService::new(client.clone(), healthcheck_uri, false, self.auth.clone())?;
+        let bytes_sent = cx.bytes_sent();
+        let healthcheck_client = VectorService::new(
+            client.clone(),
+            healthcheck_uri,
+            false,
+            self.auth.clone(),
+            bytes_sent.clone(),
+        )?;
         let healthcheck = healthcheck(healthcheck_client, cx.healthcheck);
-        let service = VectorService::new(client, uri, self.compression, self.auth.clone())?;
+        let service = VectorService::new(client, uri, self.compression, self.auth.clone(), bytes_sent)?;
         let request_settings = self.request.into_settings();
         let batch_settings = self.batch.into_batcher_settings()?;
 

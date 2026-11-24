@@ -15,7 +15,9 @@ use vector_lib::finalization::{EventFinalizers, EventStatus, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
-use crate::{internal_events::EndpointBytesSent, sinks::util::retries::RetryLogic};
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
+
+use crate::sinks::util::retries::RetryLogic;
 
 #[derive(Clone)]
 pub struct DatabendRetryLogic;
@@ -48,6 +50,8 @@ pub struct DatabendService {
     table: String,
     file_format_options: BTreeMap<&'static str, &'static str>,
     copy_options: BTreeMap<&'static str, &'static str>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 #[derive(Clone)]
@@ -98,6 +102,7 @@ impl DatabendService {
         table: String,
         file_format_options: BTreeMap<&'static str, &'static str>,
         copy_options: BTreeMap<&'static str, &'static str>,
+        bytes_sent: Registered<BytesSent>,
     ) -> Result<Self, DatabendError> {
         if table.is_empty() {
             return Err(DatabendError::BadArgument("table is required".to_string()));
@@ -107,6 +112,7 @@ impl DatabendService {
             table,
             file_format_options,
             copy_options,
+            bytes_sent,
         })
     }
 
@@ -158,18 +164,38 @@ impl Service<DatabendRequest> for DatabendService {
 
         let future = async move {
             let metadata = request.get_metadata().clone();
-            let protocol = service.client.scheme.as_str();
-            let host_port = format!("{}:{}", service.client.host, service.client.port);
-            let endpoint = host_port.as_str();
             let byte_size = request.data.len();
             service.insert_with_stage(request.data).await?;
-            emit!(EndpointBytesSent {
-                byte_size,
-                protocol,
-                endpoint,
-            });
+            service.bytes_sent.emit(ByteSize(byte_size));
             Ok(DatabendResponse { metadata })
         };
         Box::pin(future)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SinkContext;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_before_any_request() {
+        crate::test_util::components::init_test();
+
+        // Nothing listens on this port, and no request is sent.
+        let client = DatabendAPIClient::new("databend://localhost:1/default?sslmode=disable", None)
+            .await
+            .unwrap();
+        let _service = DatabendService::new(
+            client,
+            "table".to_string(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            SinkContext::default().bytes_sent(),
+        )
+        .unwrap();
+
+        // The series is there, at zero, as soon as the service is built.
+        assert_eq!(crate::test_util::components::sent_bytes_total(), Some(0.0));
     }
 }

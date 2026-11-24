@@ -123,7 +123,10 @@ pub static SINK_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| {
 /// The component test specification for sinks with source and service identification.
 pub static DATA_VOLUME_SINK_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| {
     ComponentTests {
-        events: &["BytesSent", "EventsSent"], // EventsReceived is emitted in the topology
+        // EventsReceived is emitted in the topology. `BytesSent` is no longer required: a sink
+        // that holds the handle from `SinkContext::bytes_sent` registers it at build time, before
+        // the compliance wrapper clears the recorded event names.
+        events: &["EventsSent"],
         tagged_counters: &[
             "component_sent_events_total",
             "component_sent_event_bytes_total",
@@ -174,6 +177,20 @@ impl ComponentTests {
 pub fn init_test() {
     super::trace_init();
     event_test_util::clear_recorded_events();
+}
+
+/// Value of `component_sent_bytes_total` in this test's metrics registry, or `None` if the series
+/// does not exist. Call `init_test()` first so the registry belongs to this test.
+pub fn sent_bytes_total() -> Option<f64> {
+    Controller::get()
+        .expect("metrics are initialized")
+        .capture_metrics()
+        .into_iter()
+        .find(|metric| metric.name() == "component_sent_bytes_total")
+        .map(|metric| match metric.value() {
+            MetricValue::Counter { value } => *value,
+            other => panic!("unexpected metric value {other:?}"),
+        })
 }
 
 /// Tests if the given metric contains all the given tag names
