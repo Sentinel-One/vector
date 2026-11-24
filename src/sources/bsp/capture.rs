@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::body::BoxBody;
 use tower::Service;
+use tracing::Instrument;
 
 use super::{
     config::{CaptureConfig, CaptureLimits, ReconnectBackoff},
@@ -81,6 +82,12 @@ impl BeamSvc {
                 config.endpoint
             ))
         }?;
+        if uri.scheme() == Some(&http::uri::Scheme::HTTP) {
+            warn!(
+                message = "Capture endpoint is plaintext HTTP: the token and captured traffic are sent unencrypted.",
+                endpoint = %config.endpoint,
+            );
+        }
         let tls = MaybeTlsSettings::from_config(config.tls.as_ref(), false)?;
 
         let mut http = HttpConnector::new();
@@ -189,10 +196,10 @@ impl Capture {
             transport,
             phase: phase_rx,
             exhausted: watch::Sender::new(false),
-            sessions: Arc::new(Semaphore::new(config.limits.max_sessions)),
+            sessions: Arc::new(Semaphore::new(config.limits.max_sessions.get())),
             spent: AtomicU64::new(0),
             limits: config.limits.clone(),
-            rate: RateLimit::new(config.limits.max_bytes_per_sec),
+            rate: RateLimit::new(config.limits.max_bytes_per_sec.get()),
             seq: AtomicU64::new(0),
             metrics: Metrics::new(),
         });
@@ -219,9 +226,17 @@ impl Capture {
             .unwrap_or(Phase::Stopped)
     }
 
+    /// Resolves once control-agent stops the run. The control loop going away is not a stop: on
+    /// shutdown, connections outlive it and may drain for `shutdown_timeout`.
     pub(super) async fn stopped(&self) {
         let mut phase = self.phase.clone();
-        _ = phase.wait_for(|phase| *phase == Phase::Stopped).await;
+        if phase
+            .wait_for(|phase| *phase == Phase::Stopped)
+            .await
+            .is_err()
+        {
+            futures::future::pending::<()>().await;
+        }
     }
 
     pub(super) fn budget_exhausted(&self) -> bool {
@@ -300,37 +315,40 @@ impl Capture {
 
         let (resp_tx, resp_rx) = mpsc::channel(SESSION_QUEUE);
         let capture = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            let result = async {
-                let mut request = tonic::Request::new(ReceiverStream::new(rx));
-                request.metadata_mut().insert(
-                    "authorization",
-                    capture.bearer().map_err(tonic::Status::unauthenticated)?,
-                );
-                let mut responses = capture.client.clone().session(request).await?.into_inner();
-                let mut forwarding = true;
-                // Keep reading after the session side is gone: dropping the response stream early
-                // would cancel the RPC instead of letting it end normally.
-                while let Some(response) = responses.message().await? {
-                    if forwarding {
-                        forwarding = resp_tx.send(Ok(response)).await.is_ok();
+        let task = tokio::spawn(
+            async move {
+                let result = async {
+                    let mut request = tonic::Request::new(ReceiverStream::new(rx));
+                    request.metadata_mut().insert(
+                        "authorization",
+                        capture.bearer().map_err(tonic::Status::unauthenticated)?,
+                    );
+                    let mut responses = capture.client.clone().session(request).await?.into_inner();
+                    let mut forwarding = true;
+                    // Keep reading after the session side is gone: dropping the response stream early
+                    // would cancel the RPC instead of letting it end normally.
+                    while let Some(response) = responses.message().await? {
+                        if forwarding {
+                            forwarding = resp_tx.send(Ok(response)).await.is_ok();
+                        }
                     }
+                    Ok::<(), tonic::Status>(())
                 }
-                Ok::<(), tonic::Status>(())
+                .await;
+                if let Err(status) = result {
+                    emit!(BspCaptureSessionError { status: &status });
+                    _ = resp_tx.send(Err(status)).await;
+                }
             }
-            .await;
-            if let Err(status) = result {
-                emit!(BspCaptureSessionError { status: &status });
-                _ = resp_tx.send(Err(status)).await;
-            }
-        });
+            .in_current_span(),
+        );
 
         SessionStream {
             tx: SessionTx(Some(tx)),
             rx: resp_rx,
             guard: SessionGuard {
                 task: Some(task),
-                _permit: admission.permit,
+                permit: Some(admission.permit),
             },
         }
     }
@@ -342,7 +360,7 @@ impl ControlLoop {
         loop {
             match self.connect_once().await {
                 ControlOutcome::Stopped => break,
-                ControlOutcome::Connected => delay = self.backoff.initial,
+                ControlOutcome::Armed => delay = self.backoff.initial,
                 ControlOutcome::Failed => {}
             }
             self.phase.send_if_modified(|phase| {
@@ -352,9 +370,14 @@ impl ControlLoop {
                 }
                 reset
             });
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(Self::jittered(delay)).await;
             delay = (delay * 2).min(self.backoff.max);
         }
+    }
+
+    /// Up to 20% shorter, so replicas that lost control-agent together don't retry in lockstep.
+    pub(super) fn jittered(delay: Duration) -> Duration {
+        delay.mul_f64(1.0 - 0.2 * rand::random::<f64>())
     }
 
     fn stop(&self, reason: &str) -> ControlOutcome {
@@ -389,24 +412,34 @@ impl ControlLoop {
             request
         });
         let response = match request {
-            Ok(request) => capture.client.clone().control(request).await,
-            Err(message) => Err(tonic::Status::unauthenticated(message)),
+            Ok(request) => capture.client.clone().control(request).await.map_err(Some),
+            Err(message) => {
+                // A missing or unreadable token file is local and usually transient (secret not
+                // mounted yet, or mid-rotation), so it is retried; only control-agent rejecting the
+                // token stops capture.
+                emit!(BspControlStreamError {
+                    failure: BspControlFailure::Token,
+                    error: &message,
+                });
+                Err(None)
+            }
         };
         match response {
+            Err(None) => ControlOutcome::Failed,
             Ok(response) => {
                 capture.metrics.control_stream_connected.set(1.0);
                 let outcome = self.drive(response.into_inner(), tx, exhausted).await;
                 capture.metrics.control_stream_connected.set(0.0);
                 outcome
             }
-            Err(status) if status.code() == tonic::Code::Unauthenticated => {
+            Err(Some(status)) if status.code() == tonic::Code::Unauthenticated => {
                 emit!(BspControlStreamError {
                     failure: BspControlFailure::Unauthenticated,
                     error: &status,
                 });
                 self.stop("unauthenticated")
             }
-            Err(status) => {
+            Err(Some(status)) => {
                 emit!(BspControlStreamError {
                     failure: BspControlFailure::Open,
                     error: &status,
@@ -422,11 +455,13 @@ impl ControlLoop {
         tx: mpsc::Sender<ControlRequest>,
         mut exhausted: watch::Receiver<bool>,
     ) -> ControlOutcome {
+        let mut armed = false;
         loop {
             tokio::select! {
                 message = responses.message() => match message {
                     Ok(Some(ControlResponse { msg: Some(control_response::Msg::Ready(_)) })) => {
                         debug!(message = "Capture ready.");
+                        armed = true;
                         self.phase.send_replace(Phase::Ready);
                     }
                     Ok(Some(ControlResponse { msg: Some(control_response::Msg::Stop(stop)) })) => {
@@ -438,7 +473,7 @@ impl ControlLoop {
                             failure: BspControlFailure::Ended,
                             error: &"control-agent ended the stream without a Stop",
                         });
-                        break ControlOutcome::Connected;
+                        break ControlOutcome::ended(armed);
                     }
                     Err(status) if status.code() == tonic::Code::Unauthenticated => {
                         emit!(BspControlStreamError {
@@ -452,7 +487,7 @@ impl ControlLoop {
                             failure: BspControlFailure::Failed,
                             error: &status,
                         });
-                        break ControlOutcome::Connected;
+                        break ControlOutcome::ended(armed);
                     }
                 },
                 Ok(()) = exhausted.changed() => {
@@ -467,9 +502,20 @@ impl ControlLoop {
 
 enum ControlOutcome {
     Stopped,
-    /// The stream was up and then ended, so the backoff starts over.
-    Connected,
+    /// Control-agent sent `Ready` before the stream ended, so the backoff starts over.
+    Armed,
     Failed,
+}
+
+impl ControlOutcome {
+    /// A control-agent that accepts the stream and drops it before `Ready` keeps backing off.
+    const fn ended(armed: bool) -> Self {
+        if armed {
+            Self::Armed
+        } else {
+            Self::Failed
+        }
+    }
 }
 
 const fn status_exhausted() -> ControlRequest {
@@ -488,6 +534,13 @@ pub(super) fn now() -> prost_types::Timestamp {
         seconds: since_epoch.as_secs() as i64,
         nanos: since_epoch.subsec_nanos() as i32,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TrySendError {
+    Full,
+    /// The RPC is gone.
+    Closed,
 }
 
 /// Sending half of a `Session` RPC.
@@ -528,6 +581,33 @@ impl SessionTx {
         self.send(session_request::Msg::HalfClose(HalfClose {}))
             .await
     }
+
+    /// Never waits: a datagram that doesn't fit the queue is dropped, like on the wire.
+    pub(super) fn try_data(
+        &self,
+        offset: u64,
+        received_at: prost_types::Timestamp,
+        payload: bytes::Bytes,
+    ) -> Result<(), TrySendError> {
+        self.try_send(session_request::Msg::Data(Data {
+            offset,
+            received_at: Some(received_at),
+            payload,
+        }))
+    }
+
+    fn try_send(&self, msg: session_request::Msg) -> Result<(), TrySendError> {
+        match &self.0 {
+            Some(tx) => {
+                tx.try_send(SessionRequest { msg: Some(msg) })
+                    .map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => TrySendError::Full,
+                        mpsc::error::TrySendError::Closed(_) => TrySendError::Closed,
+                    })
+            }
+            None => Err(TrySendError::Closed),
+        }
+    }
 }
 
 /// One `Session` RPC.
@@ -553,22 +633,28 @@ impl SessionStream {
 /// Keeps the RPC and its `max_sessions` slot alive; cancels the RPC when dropped.
 pub(super) struct SessionGuard {
     task: Option<tokio::task::JoinHandle<()>>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl SessionGuard {
-    /// Lets the RPC end normally once the sending half is dropped.
+    /// Lets the RPC end normally once the sending half is dropped. The `max_sessions` slot is
+    /// held until the RPC is over, so finishing sessions can't push live RPCs past the limit.
     pub(super) fn finish(mut self) {
         if let Some(task) = self.task.take() {
+            let permit = self.permit.take();
             let abort = task.abort_handle();
-            tokio::spawn(async move {
-                if tokio::time::timeout(SESSION_FINISH_GRACE, task)
-                    .await
-                    .is_err()
-                {
-                    abort.abort();
+            tokio::spawn(
+                async move {
+                    let _permit = permit;
+                    if tokio::time::timeout(SESSION_FINISH_GRACE, task)
+                        .await
+                        .is_err()
+                    {
+                        abort.abort();
+                    }
                 }
-            });
+                .in_current_span(),
+            );
         }
     }
 }

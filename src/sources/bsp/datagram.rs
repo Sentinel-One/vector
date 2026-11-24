@@ -8,19 +8,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ipnet::IpNet;
+use metrics::Counter;
 use tokio::{
     net::{UdpSocket, UnixDatagram},
     sync::mpsc,
     task::JoinHandle,
 };
+use tracing::Instrument;
 
 use super::{
-    capture::{now, Capture, SessionGuard, SessionTx},
+    capture::{now, Capture, SessionGuard, SessionTx, TrySendError},
     metrics::ActiveSession,
     stream::End,
     tee::{Tee, Unit},
+    Sampled,
 };
 use crate::{
     internal_events::{IpAllowlistDeniedError, SocketMode, SocketReceiveError, SocketSendError},
@@ -48,17 +51,21 @@ pub(super) trait DgramSocket: Send + Sync + 'static {
         peer: &Self::Peer,
     ) -> impl Future<Output = io::Result<()>> + Send;
 
-    /// Opens the per-session path to the upstream source.
+    /// Opens the per-session path to the upstream source. A reply path that fails reports it on
+    /// `ended`, so the whole session ends with it.
     fn forwarder(
         self: &Arc<Self>,
         upstream: &DgramUpstream,
         peer: &Self::Peer,
+        ended: &mpsc::UnboundedSender<(Self::Peer, End)>,
     ) -> impl Future<Output = io::Result<Forwarder>> + Send;
 }
 
 pub(super) struct UdpListener {
     pub(super) socket: UdpSocket,
     pub(super) allowlist: Option<Vec<IpNet>>,
+    pub(super) max_length: usize,
+    pub(super) truncated: Counter,
 }
 
 impl DgramSocket for UdpListener {
@@ -89,6 +96,7 @@ impl DgramSocket for UdpListener {
         self: &Arc<Self>,
         upstream: &DgramUpstream,
         peer: &SocketAddr,
+        ended: &mpsc::UnboundedSender<(SocketAddr, End)>,
     ) -> io::Result<Forwarder> {
         match upstream {
             DgramUpstream::Udp(addr) => {
@@ -99,8 +107,10 @@ impl DgramSocket for UdpListener {
                 };
                 let socket = Arc::new(UdpSocket::bind(bind).await?);
                 socket.connect(addr).await?;
-                let replies =
-                    tokio::spawn(udp_replies(Arc::clone(&socket), Arc::clone(self), *peer));
+                let replies = tokio::spawn(
+                    udp_replies(Arc::clone(&socket), Arc::clone(self), *peer, ended.clone())
+                        .in_current_span(),
+                );
                 Ok(Forwarder::Udp {
                     socket,
                     replies: Some(replies),
@@ -112,16 +122,52 @@ impl DgramSocket for UdpListener {
 }
 
 /// Upstream replies to one client, sent back from the public socket.
-async fn udp_replies(upstream: Arc<UdpSocket>, listener: Arc<UdpListener>, peer: SocketAddr) {
-    let mut buf = vec![0u8; 65536];
-    while let Ok(len) = upstream.recv(&mut buf).await {
-        if let Err(error) = listener.socket.send_to(&buf[..len], peer).await {
-            emit!(SocketSendError {
+///
+/// The buffer is only allocated while a reply is ready, so idle sessions don't each hold one.
+async fn udp_replies(
+    upstream: Arc<UdpSocket>,
+    listener: Arc<UdpListener>,
+    peer: SocketAddr,
+    ended: mpsc::UnboundedSender<(SocketAddr, End)>,
+) {
+    loop {
+        if let Err(error) = upstream.readable().await {
+            emit!(SocketReceiveError {
                 mode: SocketMode::Udp,
-                error
+                error: &error
             });
+            break;
+        }
+        let mut buf = BytesMut::with_capacity(listener.max_length + 1);
+        match upstream.try_recv_buf(&mut buf) {
+            Ok(len) => {
+                let len = if len > listener.max_length {
+                    listener.truncated.increment(1);
+                    listener.max_length
+                } else {
+                    len
+                };
+                if let Err(error) = listener.socket.send_to(&buf[..len], peer).await {
+                    emit!(SocketSendError {
+                        mode: SocketMode::Udp,
+                        error
+                    });
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            // An ICMP unreachable from a restarting upstream surfaces here once; replies resume
+            // when it is back.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+            Err(error) => {
+                emit!(SocketReceiveError {
+                    mode: SocketMode::Udp,
+                    error: &error
+                });
+                break;
+            }
         }
     }
+    _ = ended.send((peer, End::Reset));
 }
 
 pub(super) struct UnixDgramListener(pub(super) UnixDatagram);
@@ -158,6 +204,7 @@ impl DgramSocket for UnixDgramListener {
         self: &Arc<Self>,
         upstream: &DgramUpstream,
         _peer: &String,
+        _ended: &mpsc::UnboundedSender<(String, End)>,
     ) -> io::Result<Forwarder> {
         match upstream {
             DgramUpstream::Unix(path) => Ok(Forwarder::Unix {
@@ -210,8 +257,8 @@ impl Drop for Forwarder {
 
 pub(super) struct DgramUpdate {
     pub(super) upstream: DgramUpstream,
-    pub(super) sampling_rate: f64,
-    pub(super) buffer_bytes: usize,
+    pub(super) max_peers: usize,
+    pub(super) sampled: Sampled,
 }
 
 pub(super) struct DgramCtx {
@@ -228,8 +275,7 @@ enum Session {
         forwarder: Forwarder,
         tee: Option<Tee>,
         index: u64,
-        sampling_rate: f64,
-        buffer_bytes: usize,
+        sampled: Sampled,
         _active: ActiveSession,
     },
     New {
@@ -245,20 +291,20 @@ enum Session {
 impl Session {
     fn close(self, end: End) {
         match self {
-            Self::Update { tee, .. } => {
-                if let Some(tee) = tee {
-                    tee.finish();
-                }
-            }
+            Self::Update { tee, .. } => match (tee, end) {
+                (Some(tee), End::Closed) => tee.finish(),
+                (Some(tee), End::Reset) => tee.abort(),
+                (None, _) => {}
+            },
             Self::New {
                 tx, guard, replies, ..
             } => {
                 replies.abort();
-                drop(tx);
                 match end {
                     End::Closed => guard.finish(),
                     End::Reset => drop(guard),
                 }
+                drop(tx);
             }
         }
     }
@@ -356,9 +402,14 @@ impl DgramCtx {
         peer: L::Peer,
         payload: Bytes,
     ) {
-        let entry = match sessions.remove(&peer) {
-            Some(entry) => Some(entry),
-            None => self
+        let entry = match (sessions.remove(&peer), &self.update) {
+            (Some(entry), _) => Some(entry),
+            // Refused rather than evicting another peer, so established clients keep flowing.
+            (None, Some(update)) if sessions.len() >= update.max_peers => {
+                self.capture.metrics.sessions_peer_limited.increment(1);
+                None
+            }
+            (None, _) => self
                 .open(listener, ended, &peer)
                 .await
                 .map(|session| Entry {
@@ -392,13 +443,12 @@ impl DgramCtx {
         peer: &L::Peer,
     ) -> Option<Session> {
         match &self.update {
-            Some(update) => match listener.forwarder(&update.upstream, peer).await {
+            Some(update) => match listener.forwarder(&update.upstream, peer, ended).await {
                 Ok(forwarder) => Some(Session::Update {
                     forwarder,
                     tee: None,
                     index: 0,
-                    sampling_rate: update.sampling_rate,
-                    buffer_bytes: update.buffer_bytes,
+                    sampled: update.sampled,
                     _active: self.capture.metrics.active(false),
                 }),
                 Err(error) => {
@@ -419,13 +469,17 @@ impl DgramCtx {
                     let stream =
                         self.capture
                             .open(admission, L::describe(peer), self.local_addr.clone());
-                    let replies = tokio::spawn(dgram_replies(
-                        stream.rx,
-                        Arc::clone(listener),
-                        peer.clone(),
-                        ended.clone(),
-                        Arc::clone(&self.capture),
-                    ));
+                    let replies = tokio::spawn(
+                        dgram_replies(
+                            stream.rx,
+                            Arc::clone(listener),
+                            peer.clone(),
+                            ended.clone(),
+                            Arc::clone(&self.capture),
+                            self.max_length,
+                        )
+                        .in_current_span(),
+                    );
                     Some(Session::New {
                         tx: stream.tx,
                         guard: stream.guard,
@@ -451,55 +505,80 @@ impl DgramCtx {
                 forwarder,
                 tee,
                 index,
-                sampling_rate,
-                buffer_bytes,
+                sampled,
                 ..
             } => {
-                let sampled = rand::random::<f64>() < *sampling_rate;
-                if sampled && tee.is_none() {
+                let picked = sampled.pick();
+                if picked && tee.is_none() {
                     *tee = self.capture.admit().map(|admission| {
-                        let stream = self.capture.open(
+                        Tee::open(
+                            &self.capture,
                             admission,
                             L::describe(peer),
                             self.local_addr.clone(),
-                        );
-                        Tee::spawn(
-                            Arc::clone(&self.capture),
-                            stream,
-                            *buffer_bytes,
+                            sampled.buffer_bytes,
                             Unit::Datagrams,
                             *index,
                         )
                     });
                 }
-                match (tee.as_mut(), sampled) {
-                    (Some(tee), true) => tee.push(payload.clone()),
+                match (tee.as_mut(), picked) {
+                    (Some(tee), true) => tee.push(&payload),
                     (Some(tee), false) => tee.skip(),
                     (None, _) => {}
                 }
                 *index += 1;
-                if let Err(error) = forwarder.send(&payload).await {
-                    emit!(SocketSendError {
-                        mode: L::MODE,
-                        error
-                    });
+                match forwarder.send(&payload).await {
+                    Ok(()) => Ok(()),
+                    // Same as on the reply path: a restarting upstream, not a dead session.
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                        emit!(SocketSendError {
+                            mode: L::MODE,
+                            error
+                        });
+                        Ok(())
+                    }
+                    Err(error) => {
+                        emit!(SocketSendError {
+                            mode: L::MODE,
+                            error
+                        });
+                        Err(End::Reset)
+                    }
                 }
-                Ok(())
             }
             Session::New {
                 tx, index, bytes, ..
             } => {
+                // Never waits, so one slow session can't stall the other peers or delay shutdown and
+                // `Stop`; like UDP itself, a datagram that can't go now is dropped.
                 let len = payload.len();
-                if *bytes + len as u64 > self.capture.max_session_bytes() {
+                let metrics = &self.capture.metrics;
+                let sent = if *bytes + len as u64 > self.capture.max_session_bytes() {
                     Err(End::Closed)
+                } else if !self.capture.try_rate(len) {
+                    metrics
+                        .capture_bytes_dropped_rate_limited
+                        .increment(len as u64);
+                    Ok(())
                 } else {
-                    self.capture.rate(len).await;
-                    self.capture.charge(len);
-                    *bytes += len as u64;
-                    let sent = tx.data(*index, now(), payload).await;
-                    *index += 1;
-                    sent.map_err(|()| End::Reset)
-                }
+                    match tx.try_data(*index, now(), payload) {
+                        Ok(()) => {
+                            self.capture.charge(len);
+                            *bytes += len as u64;
+                            Ok(())
+                        }
+                        Err(TrySendError::Full) => {
+                            metrics
+                                .capture_bytes_dropped_buffer_full
+                                .increment(len as u64);
+                            Ok(())
+                        }
+                        Err(TrySendError::Closed) => Err(End::Reset),
+                    }
+                };
+                *index += 1;
+                sent
             }
         }
     }
@@ -512,13 +591,20 @@ async fn dgram_replies<L: DgramSocket>(
     peer: L::Peer,
     ended: mpsc::UnboundedSender<(L::Peer, End)>,
     capture: Arc<Capture>,
+    max_length: usize,
 ) {
     let end = loop {
         match rx.recv().await {
             Some(Ok(SessionResponse {
                 msg: Some(session_response::Msg::Reply(reply)),
             })) => {
-                if let Err(error) = listener.reply(reply.payload, &peer).await {
+                let payload = if reply.payload.len() > max_length {
+                    capture.metrics.datagrams_truncated.increment(1);
+                    reply.payload.slice(..max_length)
+                } else {
+                    reply.payload
+                };
+                if let Err(error) = listener.reply(payload, &peer).await {
                     emit!(SocketSendError {
                         mode: L::MODE,
                         error

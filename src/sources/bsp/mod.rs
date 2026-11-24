@@ -11,21 +11,28 @@ mod tee;
 #[cfg(test)]
 mod tests;
 
-use std::{future::Future, path::Path, sync::Arc};
+use std::{
+    future::Future,
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use futures::FutureExt;
 use listenfd::ListenFd;
+use tracing::Instrument;
 use vector_lib::config::{DataType, LogNamespace};
 
 pub use self::config::BspConfig;
 use self::{
     capture::{Capture, Phase},
-    config::{CaptureSampling, InputConfig},
+    config::{CaptureSampling, InputConfig, ReconnectBackoff, UpstreamCapture},
     datagram::{DgramCtx, DgramUpdate, DgramUpstream, UdpListener, UnixDgramListener},
     stream::{DialTarget, StreamCtx, TcpAcceptor, UnixAcceptor, Upstream},
 };
 use crate::{
     config::{GenerateConfig, Resource, SourceConfig, SourceContext, SourceOutput},
+    internal_events::UnixSocketFileDeleteError,
     proto::beam::{Mode, Transport},
     schema::Definition,
     shutdown::ShutdownSignal,
@@ -68,46 +75,68 @@ impl CaptureSampling {
     }
 }
 
-impl InputConfig {
-    const fn mode(&self) -> Mode {
-        let update = match self {
-            Self::Tcp(input) => input.upstream.is_some(),
-            Self::Udp(input) => input.upstream.is_some(),
-            Self::UnixStream(input) => input.upstream.is_some(),
-            Self::UnixDatagram(input) => input.upstream.is_some(),
-        };
-        if update {
-            Mode::Update
+/// Update-mode capture settings, validated.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Sampled {
+    rate: f64,
+    pub(super) buffer_bytes: usize,
+}
+
+impl Sampled {
+    /// Whether the next session (stream) or datagram is captured.
+    pub(super) fn pick(&self) -> bool {
+        rand::random::<f64>() < self.rate
+    }
+}
+
+impl UpstreamCapture {
+    fn validated(&self) -> crate::Result<Sampled> {
+        self.sampling.validated().map(|rate| Sampled {
+            rate,
+            buffer_bytes: self.buffer_bytes,
+        })
+    }
+}
+
+impl ReconnectBackoff {
+    fn validated(&self) -> crate::Result<()> {
+        if self.initial.is_zero() || self.initial > self.max {
+            Err(format!(
+                "capture.reconnect_backoff.initial must be positive and at most max, got initial {:?}, max {:?}",
+                self.initial, self.max
+            )
+            .into())
         } else {
-            Mode::New
+            Ok(())
+        }
+    }
+}
+
+impl InputConfig {
+    fn upstream_capture(&self) -> Option<&UpstreamCapture> {
+        match self {
+            Self::Tcp(input) => input.upstream.as_ref().map(|upstream| &upstream.capture),
+            Self::Udp(input) => input.upstream.as_ref().map(|upstream| &upstream.capture),
+            Self::UnixStream(input) => input.upstream.as_ref().map(|upstream| &upstream.capture),
+            Self::UnixDatagram(input) => input.upstream.as_ref().map(|upstream| &upstream.capture),
         }
     }
 
-    fn sampling(&self) -> Option<&CaptureSampling> {
-        match self {
-            Self::Tcp(input) => input
-                .upstream
-                .as_ref()
-                .map(|upstream| &upstream.capture.sampling),
-            Self::Udp(input) => input
-                .upstream
-                .as_ref()
-                .map(|upstream| &upstream.capture.sampling),
-            Self::UnixStream(input) => input
-                .upstream
-                .as_ref()
-                .map(|upstream| &upstream.capture.sampling),
-            Self::UnixDatagram(input) => input
-                .upstream
-                .as_ref()
-                .map(|upstream| &upstream.capture.sampling),
+    fn mode(&self) -> Mode {
+        match self.upstream_capture() {
+            Some(_) => Mode::Update,
+            None => Mode::New,
         }
+    }
+
+    fn sampled(&self) -> crate::Result<Option<Sampled>> {
+        self.upstream_capture()
+            .map(UpstreamCapture::validated)
+            .transpose()
     }
 
     fn validate(&self) -> crate::Result<()> {
-        self.sampling()
-            .map(CaptureSampling::validated)
-            .transpose()?;
+        self.sampled()?;
         match self {
             Self::Tcp(input)
                 if input
@@ -117,7 +146,9 @@ impl InputConfig {
             {
                 Err("input.tls.client_metadata_key is not supported: bsp emits no events".into())
             }
-            Self::Tcp(_) | Self::Udp(_) | Self::UnixStream(_) | Self::UnixDatagram(_) => Ok(()),
+            Self::UnixStream(input) => SocketFile::stale(&input.path).map(|_| ()),
+            Self::UnixDatagram(input) => SocketFile::stale(&input.path).map(|_| ()),
+            Self::Tcp(_) | Self::Udp(_) => Ok(()),
         }
     }
 
@@ -132,6 +163,7 @@ impl InputConfig {
 
     /// The listener future, given an armed capture client.
     async fn listen(self, capture: Arc<Capture>, shutdown: ShutdownSignal) -> crate::Result<()> {
+        let sampled = self.sampled()?;
         match self {
             Self::Tcp(input) => {
                 let tls = MaybeTlsSettings::from_config(
@@ -141,15 +173,12 @@ impl InputConfig {
                 let upstream = input
                     .upstream
                     .as_ref()
-                    .map(|upstream| {
-                        upstream.capture.sampling.validated().map(|rate| Upstream {
-                            target: DialTarget::Tcp(upstream.address),
-                            connect_timeout: upstream.connect_timeout,
-                            sampling_rate: rate,
-                            buffer_bytes: upstream.capture.buffer_bytes,
-                        })
-                    })
-                    .transpose()?;
+                    .zip(sampled)
+                    .map(|(upstream, sampled)| Upstream {
+                        target: DialTarget::Tcp(upstream.address),
+                        connect_timeout: upstream.connect_timeout,
+                        sampled,
+                    });
                 let allowlist = input.permit_origin.clone().map(Into::into);
                 let listener =
                     try_bind_tcp_listener(input.address, ListenFd::from_env(), &tls, allowlist)
@@ -162,7 +191,7 @@ impl InputConfig {
                 let ctx = Arc::new(StreamCtx {
                     capture,
                     local_addr,
-                    max_chunk_bytes: input.max_chunk_bytes,
+                    max_chunk_bytes: input.max_chunk_bytes.get(),
                     upstream,
                     connection_limit: input.connection_limit,
                     max_connection_duration: input.max_connection_duration,
@@ -172,6 +201,7 @@ impl InputConfig {
                     listener,
                     keepalive: input.keepalive,
                     receive_buffer_bytes: input.receive_buffer_bytes,
+                    handshake_timeout: input.handshake_timeout,
                 };
                 ctx.serve(acceptor, shutdown).await;
                 Ok(())
@@ -180,47 +210,40 @@ impl InputConfig {
                 let upstream = input
                     .upstream
                     .as_ref()
-                    .map(|upstream| {
-                        upstream.capture.sampling.validated().map(|rate| Upstream {
-                            target: DialTarget::Unix(upstream.path.clone()),
-                            connect_timeout: upstream.connect_timeout,
-                            sampling_rate: rate,
-                            buffer_bytes: upstream.capture.buffer_bytes,
-                        })
-                    })
-                    .transpose()?;
-                remove_stale_socket(&input.path)?;
+                    .zip(sampled)
+                    .map(|(upstream, sampled)| Upstream {
+                        target: DialTarget::Unix(upstream.path.clone()),
+                        connect_timeout: upstream.connect_timeout,
+                        sampled,
+                    });
+                SocketFile::claim(&input.path)?;
                 let listener = tokio::net::UnixListener::bind(&input.path)?;
+                let socket_file = SocketFile::bound(&input.path)?;
                 change_socket_permissions(&input.path, input.socket_file_mode)?;
                 info!(message = "Listening.", path = ?input.path, r#type = "unix_stream");
                 let ctx = Arc::new(StreamCtx {
                     capture,
                     local_addr: input.path.display().to_string(),
-                    max_chunk_bytes: input.max_chunk_bytes,
+                    max_chunk_bytes: input.max_chunk_bytes.get(),
                     upstream,
                     connection_limit: input.connection_limit,
                     max_connection_duration: None,
                     shutdown_timeout: input.shutdown_timeout,
                 });
                 ctx.serve(UnixAcceptor(listener), shutdown).await;
+                drop(socket_file);
                 Ok(())
             }
             Self::Udp(input) => {
                 let update = input
                     .upstream
                     .as_ref()
-                    .map(|upstream| {
-                        upstream
-                            .capture
-                            .sampling
-                            .validated()
-                            .map(|rate| DgramUpdate {
-                                upstream: DgramUpstream::Udp(upstream.address),
-                                sampling_rate: rate,
-                                buffer_bytes: upstream.capture.buffer_bytes,
-                            })
-                    })
-                    .transpose()?;
+                    .zip(sampled)
+                    .map(|(upstream, sampled)| DgramUpdate {
+                        upstream: DgramUpstream::Udp(upstream.address),
+                        max_peers: upstream.max_peers.get(),
+                        sampled,
+                    });
                 let socket = try_bind_udp_socket(input.address, ListenFd::from_env()).await?;
                 if let Some(bytes) = input.receive_buffer_bytes {
                     if let Err(error) = crate::net::set_receive_buffer_size(&socket, bytes) {
@@ -235,11 +258,13 @@ impl InputConfig {
                 let listener = Arc::new(UdpListener {
                     socket,
                     allowlist: input.permit_origin.clone().map(Into::into),
+                    max_length: input.max_length.get(),
+                    truncated: capture.metrics.datagrams_truncated.clone(),
                 });
                 let ctx = DgramCtx {
                     capture,
                     local_addr,
-                    max_length: input.max_length,
+                    max_length: input.max_length.get(),
                     session_idle_timeout: input.session_idle_timeout,
                     update,
                 };
@@ -250,41 +275,81 @@ impl InputConfig {
                 let update = input
                     .upstream
                     .as_ref()
-                    .map(|upstream| {
-                        upstream
-                            .capture
-                            .sampling
-                            .validated()
-                            .map(|rate| DgramUpdate {
-                                upstream: DgramUpstream::Unix(upstream.path.clone()),
-                                sampling_rate: rate,
-                                buffer_bytes: upstream.capture.buffer_bytes,
-                            })
-                    })
-                    .transpose()?;
-                remove_stale_socket(&input.path)?;
+                    .zip(sampled)
+                    .map(|(upstream, sampled)| DgramUpdate {
+                        upstream: DgramUpstream::Unix(upstream.path.clone()),
+                        max_peers: upstream.max_peers.get(),
+                        sampled,
+                    });
+                SocketFile::claim(&input.path)?;
                 let socket = tokio::net::UnixDatagram::bind(&input.path)?;
+                let socket_file = SocketFile::bound(&input.path)?;
                 change_socket_permissions(&input.path, input.socket_file_mode)?;
                 info!(message = "Listening.", path = ?input.path, r#type = "unix_datagram");
                 let ctx = DgramCtx {
                     capture,
                     local_addr: input.path.display().to_string(),
-                    max_length: input.max_length,
+                    max_length: input.max_length.get(),
                     session_idle_timeout: input.session_idle_timeout,
                     update,
                 };
                 ctx.serve(Arc::new(UnixDgramListener(socket)), shutdown)
                     .await;
+                drop(socket_file);
                 Ok(())
             }
         }
     }
 }
 
-fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-        Ok(()) | Err(_) => Ok(()),
+/// The file of a socket this instance bound. Removed on drop unless another socket has replaced
+/// it since.
+struct SocketFile {
+    path: PathBuf,
+    inode: u64,
+}
+
+impl SocketFile {
+    /// Whether a stale socket is at `path`. Any other kind of file is an error: it is never
+    /// removed to make room.
+    fn stale(path: &Path) -> crate::Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+            Ok(metadata) if metadata.file_type().is_socket() => Ok(true),
+            Ok(_) => Err(format!("`{}` exists and is not a socket", path.display()).into()),
+        }
+    }
+
+    /// Removes a stale socket at `path` so it can be bound.
+    fn claim(path: &Path) -> crate::Result<()> {
+        if Self::stale(path)? {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn bound(path: &Path) -> crate::Result<Self> {
+        let inode = std::fs::symlink_metadata(path)?.ino();
+        Ok(Self {
+            path: path.to_owned(),
+            inode,
+        })
+    }
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let ours = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.ino() == self.inode);
+        if ours {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                emit!(UnixSocketFileDeleteError {
+                    path: &self.path,
+                    error
+                });
+            }
+        }
     }
 }
 
@@ -311,6 +376,7 @@ async fn until_shutdown(
 impl SourceConfig for BspConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
         self.input.validate()?;
+        self.capture.reconnect_backoff.validated()?;
         let input = self.input.clone();
         let mode = input.mode();
         let (capture, control) = Capture::new(
@@ -322,7 +388,7 @@ impl SourceConfig for BspConfig {
         let shutdown = cx.shutdown;
 
         Ok(async move {
-            let control = tokio::spawn(control.run());
+            let control = tokio::spawn(control.run().in_current_span());
             // New mode binds only once control-agent is ready to supply replies.
             let armed = match mode {
                 Mode::New => {

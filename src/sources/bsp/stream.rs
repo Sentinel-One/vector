@@ -15,11 +15,14 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpStream, UnixListener, UnixStream},
     sync::Semaphore,
+    time::Instant,
 };
+use tracing::Instrument;
 
 use super::{
     capture::{now, Admission, Capture, SessionStream},
     tee::{Tee, Unit},
+    Sampled,
 };
 use crate::{
     internal_events::{SocketMode, SocketReceiveError, TcpSocketTlsConnectionError},
@@ -64,6 +67,7 @@ pub(super) struct TcpClient {
     stream: MaybeTlsIncomingStream<TcpStream>,
     keepalive: Option<TcpKeepaliveConfig>,
     receive_buffer_bytes: Option<usize>,
+    handshake_timeout: Duration,
 }
 
 impl AsyncRead for TcpClient {
@@ -108,11 +112,14 @@ impl Client for TcpClient {
     }
 
     async fn handshake(&mut self) -> io::Result<()> {
-        self.stream.handshake().await.map_err(|error| {
-            let failed = io::Error::other(error.to_string());
-            emit!(TcpSocketTlsConnectionError { error });
-            failed
-        })?;
+        tokio::time::timeout(self.handshake_timeout, self.stream.handshake())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
+            .map_err(|error| {
+                let failed = io::Error::other(error.to_string());
+                emit!(TcpSocketTlsConnectionError { error });
+                failed
+            })?;
         if let Some(keepalive) = self.keepalive {
             self.stream.set_keepalive(keepalive)?;
         }
@@ -184,6 +191,7 @@ pub(super) struct TcpAcceptor {
     pub(super) listener: MaybeTlsListener,
     pub(super) keepalive: Option<TcpKeepaliveConfig>,
     pub(super) receive_buffer_bytes: Option<usize>,
+    pub(super) handshake_timeout: Duration,
 }
 
 impl Acceptor for TcpAcceptor {
@@ -199,6 +207,7 @@ impl Acceptor for TcpAcceptor {
                 stream,
                 keepalive: self.keepalive,
                 receive_buffer_bytes: self.receive_buffer_bytes,
+                handshake_timeout: self.handshake_timeout,
             })
             .map_err(io::Error::other)
     }
@@ -238,8 +247,7 @@ impl DialTarget {
 pub(super) struct Upstream {
     pub(super) target: DialTarget,
     pub(super) connect_timeout: Duration,
-    pub(super) sampling_rate: f64,
-    pub(super) buffer_bytes: usize,
+    pub(super) sampled: Sampled,
 }
 
 pub(super) struct StreamCtx {
@@ -312,19 +320,27 @@ impl StreamCtx {
                 Some((Ok(client), permit)) => {
                     let ctx = Arc::clone(&self);
                     let tripwire = tripwire.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        tokio::select! {
-                            () = ctx.connection(client) => {}
-                            () = tripwire => {}
+                    let deadline = self
+                        .max_connection_duration
+                        .map(|duration| Instant::now() + duration);
+                    // Connections outlive `serve`, so shutdown never waits on them; the tripwire
+                    // drops them.
+                    tokio::spawn(
+                        async move {
+                            let _permit = permit;
+                            tokio::select! {
+                                () = ctx.connection(client, deadline) => {}
+                                () = tripwire => {}
+                            }
                         }
-                    });
+                        .in_current_span(),
+                    );
                 }
             }
         }
     }
 
-    async fn connection<C: Client>(self: Arc<Self>, client: C) {
+    async fn connection<C: Client>(self: Arc<Self>, client: C, deadline: Option<Instant>) {
         // New mode refuses before the handshake, so a client isn't kept waiting on a session
         // that won't be captured.
         let admission = match &self.upstream {
@@ -333,48 +349,65 @@ impl StreamCtx {
         };
         match admission {
             Err(()) => self.capture.metrics.sessions_refused.increment(1),
+            // In update mode the deadline ends only the capture (see `proxy`), never the
+            // connection.
             Ok(admission) => {
-                let session = self.handshaken(client, admission);
-                match self.max_connection_duration {
-                    Some(duration) => _ = tokio::time::timeout(duration, session).await,
-                    None => session.await,
+                let session = self.handshaken(client, admission, deadline);
+                match (&self.upstream, deadline) {
+                    (None, Some(deadline)) => {
+                        _ = tokio::time::timeout_at(deadline, session).await;
+                    }
+                    _ => session.await,
                 }
             }
         }
     }
 
-    async fn handshaken<C: Client>(&self, mut client: C, admission: Option<Admission>) {
+    async fn handshaken<C: Client>(
+        &self,
+        mut client: C,
+        admission: Option<Admission>,
+        deadline: Option<Instant>,
+    ) {
         match (client.handshake().await, admission, &self.upstream) {
             (Err(error), _, _) => debug!(message = "Client handshake failed.", %error),
-            (Ok(()), _, Some(upstream)) => self.update(upstream, client).await,
+            (Ok(()), _, Some(upstream)) => self.update(upstream, client, deadline).await,
             (Ok(()), Some(admission), None) => self.new_mode(client, admission).await,
             (Ok(()), None, None) => {}
         }
     }
 
-    async fn update<C: Client>(&self, upstream: &Upstream, client: C) {
-        let connected =
-            tokio::time::timeout(upstream.connect_timeout, upstream.target.connect()).await;
+    async fn update<C: Client>(&self, upstream: &Upstream, client: C, deadline: Option<Instant>) {
+        let connected = tokio::time::timeout(upstream.connect_timeout, upstream.target.connect())
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out connecting to upstream",
+                ))
+            });
         match connected {
-            Ok(Ok(conn)) => {
-                let peer = client.peer();
-                let tee = (rand::random::<f64>() < upstream.sampling_rate)
+            Ok(conn) => {
+                let tee = upstream
+                    .sampled
+                    .pick()
                     .then(|| self.capture.admit())
                     .flatten()
                     .map(|admission| {
-                        let session = self.capture.open(admission, peer, self.local_addr.clone());
-                        Tee::spawn(
-                            Arc::clone(&self.capture),
-                            session,
-                            upstream.buffer_bytes,
+                        Tee::open(
+                            &self.capture,
+                            admission,
+                            client.peer(),
+                            self.local_addr.clone(),
+                            upstream.sampled.buffer_bytes,
                             self.unit(),
                             0,
                         )
                     });
                 let _active = self.capture.metrics.active(tee.is_some());
-                self.proxy(client, conn, tee).await;
+                self.proxy(client, conn, tee, deadline).await;
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 warn!(message = "Failed to connect to upstream.", %error, internal_log_rate_limit = true);
                 self.capture
                     .metrics
@@ -382,38 +415,52 @@ impl StreamCtx {
                     .increment(1);
                 client.arm_reset();
             }
-            Err(_) => {
-                warn!(
-                    message = "Timed out connecting to upstream.",
-                    internal_log_rate_limit = true
-                );
-                self.capture
-                    .metrics
-                    .sessions_upstream_connect_failed
-                    .increment(1);
-                client.arm_reset();
-            }
         }
     }
 
-    async fn proxy<C: Conn, U: Conn>(&self, client: C, upstream: U, mut tee: Option<Tee>) {
+    async fn proxy<C: Conn, U: Conn>(
+        &self,
+        client: C,
+        upstream: U,
+        mut tee: Option<Tee>,
+        deadline: Option<Instant>,
+    ) {
         let (mut client_rx, mut client_tx) = tokio::io::split(client);
         let (mut upstream_rx, mut upstream_tx) = tokio::io::split(upstream);
         let up = async {
             let mut buf = BytesMut::with_capacity(READ_BUF);
             loop {
                 buf.reserve(READ_BUF);
-                if client_rx.read_buf(&mut buf).await? == 0 {
-                    if let Some(tee) = tee.as_mut() {
-                        tee.half_close();
+                let expires = deadline.filter(|_| tee.is_some());
+                let read = tokio::select! {
+                    read = client_rx.read_buf(&mut buf) => Some(read?),
+                    () = async {
+                        match expires {
+                            Some(expires) => tokio::time::sleep_until(expires).await,
+                            None => futures::future::pending().await,
+                        }
+                    } => None,
+                };
+                match read {
+                    None => {
+                        if let Some(tee) = tee.take() {
+                            tee.abort();
+                        }
                     }
-                    break upstream_tx.shutdown().await;
+                    Some(0) => {
+                        if let Some(tee) = tee.as_mut() {
+                            tee.half_close();
+                        }
+                        break upstream_tx.shutdown().await;
+                    }
+                    Some(_) => {
+                        let chunk = buf.split().freeze();
+                        if let Some(tee) = tee.as_mut() {
+                            tee.push(&chunk);
+                        }
+                        upstream_tx.write_all(&chunk).await?;
+                    }
                 }
-                let chunk = buf.split().freeze();
-                if let Some(tee) = tee.as_mut() {
-                    tee.push(chunk.clone());
-                }
-                upstream_tx.write_all(&chunk).await?;
             }
         };
         let down = async {

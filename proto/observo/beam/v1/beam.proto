@@ -9,7 +9,9 @@ service Beam {
   // One per BSP instance. It lives as long as the instance.
   rpc Control(stream ControlRequest) returns (stream ControlResponse);
   // One per session. Ending the stream normally means the session closed;
-  // cancelling it (RST_STREAM) means the session was reset or aborted.
+  // cancelling it (RST_STREAM) means the session was reset or aborted. BSP's
+  // HTTP/2 client may deliver a cancel as a normal end, so a normal end does
+  // not prove the client closed cleanly.
   rpc Session(stream SessionRequest) returns (stream SessionResponse);
 }
 

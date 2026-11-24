@@ -6,6 +6,7 @@ pub(super) struct Metrics {
     pub sessions_active_uncaptured: Gauge,
     pub sessions_closed: Counter,
     pub sessions_reset: Counter,
+    pub sessions_peer_limited: Counter,
     pub sessions_upstream_connect_failed: Counter,
     pub sessions_refused: Counter,
     pub capture_bytes: Counter,
@@ -26,6 +27,7 @@ impl Metrics {
             sessions_active_uncaptured: gauge!("bsp_sessions_active", "captured" => "false"),
             sessions_closed: counter!("bsp_sessions_total", "outcome" => "closed"),
             sessions_reset: counter!("bsp_sessions_total", "outcome" => "reset"),
+            sessions_peer_limited: counter!("bsp_sessions_total", "outcome" => "peer_limited"),
             sessions_upstream_connect_failed: counter!(
                 "bsp_sessions_total",
                 "outcome" => "upstream_connect_failed"

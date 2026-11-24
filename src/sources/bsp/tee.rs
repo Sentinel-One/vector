@@ -5,8 +5,9 @@ use std::sync::{
 
 use bytes::Bytes;
 use tokio::{sync::mpsc, task::JoinHandle};
+use tracing::Instrument;
 
-use super::capture::{now, Capture, SessionStream, SessionTx};
+use super::capture::{now, Admission, Capture, SessionStream, SessionTx};
 use crate::proto::beam::{session_response, SessionResponse};
 
 /// How a session's offsets advance.
@@ -84,6 +85,20 @@ pub(super) struct Tee {
 }
 
 impl Tee {
+    /// Opens the `Session` RPC for an admitted session and starts draining towards it.
+    pub(super) fn open(
+        capture: &Arc<Capture>,
+        admission: Admission,
+        client_addr: String,
+        local_addr: String,
+        limit: usize,
+        unit: Unit,
+        offset: u64,
+    ) -> Self {
+        let session = capture.open(admission, client_addr, local_addr);
+        Self::spawn(Arc::clone(capture), session, limit, unit, offset)
+    }
+
     pub(super) fn spawn(
         capture: Arc<Capture>,
         session: SessionStream,
@@ -101,7 +116,11 @@ impl Tee {
             gap: PendingGap::default(),
             sent: 0,
         };
-        let drain = tokio::spawn(drain.run(session, rx, Arc::clone(&capturing)));
+        let drain = tokio::spawn(
+            drain
+                .run(session, rx, Arc::clone(&capturing))
+                .in_current_span(),
+        );
         Self {
             queue,
             queued,
@@ -115,7 +134,9 @@ impl Tee {
         }
     }
 
-    pub(super) fn push(&mut self, payload: Bytes) {
+    /// Queues a copy of `payload`. Do not queue a slice of the caller's read buffer: it would keep
+    /// the whole buffer alive while queued, and `limit` only counts the payload.
+    pub(super) fn push(&mut self, payload: &[u8]) {
         let len = payload.len();
         let advance = self.unit.advance(len);
         let full = self.queued.load(Ordering::Relaxed) + len > self.limit;
@@ -134,7 +155,7 @@ impl Tee {
                 _ = self.queue.send(Item::Data {
                     offset: self.offset,
                     received_at: now(),
-                    payload,
+                    payload: Bytes::copy_from_slice(payload),
                 });
             }
         }
@@ -162,7 +183,7 @@ impl Tee {
         self.flush_gap();
     }
 
-    /// Cancels the `Session` RPC: the session was reset.
+    /// Cancels the `Session` RPC: the session was reset or cut short.
     pub(super) fn abort(self) {
         self.drain.abort();
     }
@@ -190,10 +211,13 @@ impl Drain {
         mut queue: mpsc::UnboundedReceiver<Item>,
         capturing: Arc<AtomicBool>,
     ) {
+        let capture = Arc::clone(&self.capture);
+        let stopped = capture.stopped();
+        tokio::pin!(stopped);
         let end = loop {
             tokio::select! {
                 biased;
-                _ = self.capture.stopped() => break DrainEnd::Finish,
+                () = &mut stopped => break DrainEnd::Finish,
                 response = session.rx.recv() => match response {
                     Some(Ok(SessionResponse { msg: Some(session_response::Msg::Stop(_)) })) => {
                         break DrainEnd::Finish;

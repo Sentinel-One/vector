@@ -12,6 +12,8 @@ pub enum BspControlFailure {
     Failed,
     /// Control-agent rejected the token. Capture stays off until the next reload.
     Unauthenticated,
+    /// The token file could not be read. Retried with backoff.
+    Token,
 }
 
 impl BspControlFailure {
@@ -21,6 +23,7 @@ impl BspControlFailure {
             Self::Ended => "ended",
             Self::Failed => "failed",
             Self::Unauthenticated => "unauthenticated",
+            Self::Token => "token",
         }
     }
 
@@ -30,6 +33,7 @@ impl BspControlFailure {
             Self::Ended => "Control stream ended.",
             Self::Failed => "Control stream failed.",
             Self::Unauthenticated => "Control-agent rejected the capture token.",
+            Self::Token => "Failed to read the capture token.",
         }
     }
 }

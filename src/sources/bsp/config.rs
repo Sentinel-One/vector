@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU64, NonZeroUsize},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde_with::serde_as;
 use vector_lib::{configurable::configurable_component, ipallowlist::IpAllowlistConfig};
@@ -22,12 +27,20 @@ const fn default_session_idle_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
-const fn default_max_chunk_bytes() -> usize {
-    1024 * 1024
+const fn default_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
-const fn default_max_length() -> usize {
-    65535
+const fn default_max_chunk_bytes() -> NonZeroUsize {
+    NonZeroUsize::new(1024 * 1024).unwrap()
+}
+
+const fn default_max_length() -> NonZeroUsize {
+    NonZeroUsize::new(65535).unwrap()
+}
+
+const fn default_max_peers() -> NonZeroUsize {
+    NonZeroUsize::new(16384).unwrap()
 }
 
 /// Configuration for the `bsp` source.
@@ -99,7 +112,9 @@ pub struct TcpInput {
     #[configurable(metadata(docs::type_unit = "connections"))]
     pub connection_limit: Option<u32>,
 
-    /// Maximum time to keep each client connection open.
+    /// Maximum time to capture each client connection. In new mode the connection is closed
+    /// when it is reached; in update mode only the capture ends and the client keeps talking to
+    /// the upstream.
     #[serde_as(as = "Option<serde_with::DurationSecondsWithFrac<f64>>")]
     #[serde(alias = "max_connection_duration_secs")]
     pub max_connection_duration: Option<Duration>,
@@ -109,10 +124,19 @@ pub struct TcpInput {
     #[serde(default = "default_shutdown_timeout", alias = "shutdown_timeout_secs")]
     pub shutdown_timeout: Duration,
 
+    /// How long a client may take to complete its TLS handshake before it is dropped, so clients
+    /// that never send a ClientHello can't hold a connection or capture slot.
+    #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
+    #[serde(
+        default = "default_handshake_timeout",
+        alias = "handshake_timeout_secs"
+    )]
+    pub handshake_timeout: Duration,
+
     /// Maximum payload of one captured `Data` message.
     #[serde(default = "default_max_chunk_bytes")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub max_chunk_bytes: usize,
+    pub max_chunk_bytes: NonZeroUsize,
 
     /// The relocated old source. Present means update mode.
     #[configurable(derived)]
@@ -147,10 +171,11 @@ pub struct UdpInput {
     /// The public address to listen on.
     pub address: SocketListenAddr,
 
-    /// Maximum datagram size. Longer datagrams are truncated.
+    /// Maximum datagram size, in both directions: client datagrams and the replies sent back to
+    /// clients. Longer datagrams are truncated.
     #[serde(default = "default_max_length")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub max_length: usize,
+    pub max_length: NonZeroUsize,
 
     /// The size of the socket receive buffer.
     #[configurable(metadata(docs::type_unit = "bytes"))]
@@ -181,6 +206,12 @@ pub struct UdpUpstream {
     /// Address the upstream source listens on.
     pub address: SocketAddr,
 
+    /// Concurrent client sessions. Each one holds an upstream socket until it goes idle; datagrams
+    /// from further clients are dropped.
+    #[serde(default = "default_max_peers")]
+    #[configurable(metadata(docs::type_unit = "sessions"))]
+    pub max_peers: NonZeroUsize,
+
     #[configurable(derived)]
     #[serde(default)]
     pub capture: UpstreamCapture,
@@ -210,7 +241,7 @@ pub struct UnixStreamInput {
     /// Maximum payload of one captured `Data` message.
     #[serde(default = "default_max_chunk_bytes")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub max_chunk_bytes: usize,
+    pub max_chunk_bytes: NonZeroUsize,
 
     /// The relocated old source. Present means update mode.
     #[configurable(derived)]
@@ -248,10 +279,11 @@ pub struct UnixDatagramInput {
     /// Unix file mode bits applied to the socket file.
     pub socket_file_mode: Option<u32>,
 
-    /// Maximum datagram size. Longer datagrams are truncated.
+    /// Maximum datagram size, in both directions: client datagrams and the replies sent back to
+    /// clients. Longer datagrams are truncated.
     #[serde(default = "default_max_length")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub max_length: usize,
+    pub max_length: NonZeroUsize,
 
     /// A datagram session ends after this much idle time.
     #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
@@ -273,6 +305,12 @@ pub struct UnixDatagramInput {
 pub struct UnixDatagramUpstream {
     /// Socket path the upstream source listens on.
     pub path: PathBuf,
+
+    /// Concurrent client sessions. Each one holds an upstream socket until it goes idle; datagrams
+    /// from further clients are dropped.
+    #[serde(default = "default_max_peers")]
+    #[configurable(metadata(docs::type_unit = "sessions"))]
+    pub max_peers: NonZeroUsize,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -369,7 +407,7 @@ pub struct CaptureAuth {
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReconnectBackoff {
-    /// First delay after a failure.
+    /// First delay after a failure. Must be positive and at most `max`.
     #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
     #[serde(alias = "initial_secs")]
     pub initial: Duration,
@@ -395,7 +433,7 @@ impl Default for ReconnectBackoff {
 #[serde(deny_unknown_fields, default)]
 pub struct CaptureLimits {
     /// Concurrent captured sessions.
-    pub max_sessions: usize,
+    pub max_sessions: NonZeroUsize,
 
     /// Capture budget for this instance. Once spent, no new sessions are captured, and BSP reports
     /// it to control-agent.
@@ -404,7 +442,7 @@ pub struct CaptureLimits {
 
     /// Capture rate across all sessions.
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub max_bytes_per_sec: u64,
+    pub max_bytes_per_sec: NonZeroU64,
 
     /// Per-session capture cap.
     #[configurable(metadata(docs::type_unit = "bytes"))]
@@ -414,9 +452,9 @@ pub struct CaptureLimits {
 impl Default for CaptureLimits {
     fn default() -> Self {
         Self {
-            max_sessions: 200,
+            max_sessions: NonZeroUsize::new(200).unwrap(),
             max_bytes: 2 * 1024 * 1024 * 1024,
-            max_bytes_per_sec: 10 * 1024 * 1024,
+            max_bytes_per_sec: NonZeroU64::new(10 * 1024 * 1024).unwrap(),
             max_session_bytes: 256 * 1024 * 1024,
         }
     }
