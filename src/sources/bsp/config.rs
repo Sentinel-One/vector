@@ -428,6 +428,7 @@ impl Default for ReconnectBackoff {
 }
 
 /// Bounds on the cost of capture, per BSP instance.
+#[serde_as]
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
@@ -448,6 +449,14 @@ pub struct CaptureLimits {
     /// starts a new session.
     #[configurable(metadata(docs::type_unit = "bytes"))]
     pub max_session_bytes: NonZeroU64,
+
+    /// How long a captured session may take, once its connection has ended, to deliver what is
+    /// still queued and end its `Session` RPC. After that the RPC is cancelled and its slot
+    /// freed. In new mode it also ends a session whose client has closed its side once
+    /// control-agent has sent nothing for this long.
+    #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
+    #[serde(alias = "finish_timeout_secs")]
+    pub finish_timeout: Duration,
 }
 
 impl Default for CaptureLimits {
@@ -457,6 +466,7 @@ impl Default for CaptureLimits {
             max_bytes: NonZeroU64::new(2 * 1024 * 1024 * 1024).unwrap(),
             max_bytes_per_sec: NonZeroU64::new(10 * 1024 * 1024).unwrap(),
             max_session_bytes: NonZeroU64::new(256 * 1024 * 1024).unwrap(),
+            finish_timeout: Duration::from_secs(30),
         }
     }
 }

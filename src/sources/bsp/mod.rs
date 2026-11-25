@@ -26,7 +26,7 @@ use vector_lib::config::{DataType, LogNamespace};
 pub use self::config::BspConfig;
 use self::{
     capture::{Capture, Phase},
-    config::{CaptureSampling, InputConfig, ReconnectBackoff, UpstreamCapture},
+    config::{CaptureLimits, CaptureSampling, InputConfig, ReconnectBackoff, UpstreamCapture},
     datagram::{DgramCtx, DgramUpdate, DgramUpstream, UdpListener, UnixDgramListener},
     stream::{DialTarget, StreamCtx, TcpAcceptor, UnixAcceptor, Upstream},
 };
@@ -106,6 +106,16 @@ impl ReconnectBackoff {
                 self.initial, self.max
             )
             .into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CaptureLimits {
+    fn validated(&self) -> crate::Result<()> {
+        if self.finish_timeout.is_zero() {
+            Err("capture.limits.finish_timeout must be positive".into())
         } else {
             Ok(())
         }
@@ -421,6 +431,7 @@ impl SourceConfig for BspConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
         self.input.validate()?;
         self.capture.reconnect_backoff.validated()?;
+        self.capture.limits.validated()?;
         let input = self.input.clone();
         let mode = input.mode();
         let (capture, control) = Capture::new(

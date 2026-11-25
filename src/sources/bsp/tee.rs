@@ -4,7 +4,12 @@ use std::sync::{
 };
 
 use bytes::Bytes;
-use tokio::{sync::mpsc, task::JoinHandle};
+use futures::FutureExt;
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+    time::Instant,
+};
 use tracing::Instrument;
 
 use super::capture::{now, Admission, Capture, SessionStream, SessionTx};
@@ -90,6 +95,8 @@ pub(super) struct Tee {
     gap: PendingGap,
     capture: Arc<Capture>,
     drain: JoinHandle<()>,
+    /// Never sent: dropping it with the Tee tells the drain the connection has ended.
+    _connected: oneshot::Sender<()>,
 }
 
 impl Tee {
@@ -115,6 +122,7 @@ impl Tee {
         offset: u64,
     ) -> Self {
         let (queue, rx) = mpsc::unbounded_channel();
+        let (connected, disconnected) = oneshot::channel();
         let queued = Arc::new(AtomicUsize::new(0));
         let capturing = Arc::new(AtomicBool::new(true));
         let drain = Drain {
@@ -126,7 +134,7 @@ impl Tee {
         };
         let drain = tokio::spawn(
             drain
-                .run(session, rx, Arc::clone(&capturing))
+                .run(session, rx, disconnected, Arc::clone(&capturing))
                 .in_current_span(),
         );
         Self {
@@ -139,6 +147,7 @@ impl Tee {
             gap: PendingGap::default(),
             capture,
             drain,
+            _connected: connected,
         }
     }
 
@@ -219,44 +228,69 @@ impl Drain {
         mut self,
         mut session: SessionStream,
         mut queue: mpsc::UnboundedReceiver<Item>,
+        disconnected: oneshot::Receiver<()>,
         capturing: Arc<AtomicBool>,
     ) {
         let capture = Arc::clone(&self.capture);
         let stopped = capture.stopped();
         tokio::pin!(stopped);
-        let end = loop {
-            tokio::select! {
-                biased;
-                () = &mut stopped => break DrainEnd::Finish,
-                response = session.rx.recv() => match response {
-                    Some(Ok(SessionResponse { msg: Some(session_response::Msg::Stop(_)) })) => {
-                        break DrainEnd::Finish;
-                    }
-                    Some(Ok(_)) => self.capture.metrics.ignored_responses.increment(1),
-                    Some(Err(status)) => {
-                        debug!(message = "Capture session failed; proxying continues.", %status);
-                        break DrainEnd::Gone;
-                    }
-                    None => break DrainEnd::Gone,
-                },
-                item = queue.recv() => match item {
-                    None => {
-                        break match self.flush_gap(&session.tx).await {
-                            Ok(()) => DrainEnd::Finish,
-                            Err(()) => DrainEnd::Gone,
-                        };
-                    }
-                    Some(item) => match self.handle(&session.tx, item).await {
-                        Ok(true) => {}
-                        Ok(false) => break DrainEnd::Finish,
-                        Err(()) => break DrainEnd::Gone,
+        // Once the connection ends, delivering what is queued and ending the RPC must fit in
+        // `finish_timeout`, so a stalled control-agent can't keep the session alive.
+        let finish_timeout = session.finish_timeout();
+        let deadline = async move {
+            _ = disconnected.await;
+            Instant::now() + finish_timeout
+        }
+        .shared();
+        let expired = {
+            let deadline = deadline.clone();
+            async move { tokio::time::sleep_until(deadline.await).await }
+        };
+        let pump = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut stopped => break DrainEnd::Finish,
+                    response = session.rx.recv() => match response {
+                        Some(Ok(SessionResponse { msg: Some(session_response::Msg::Stop(_)) })) => {
+                            break DrainEnd::Finish;
+                        }
+                        Some(Ok(_)) => self.capture.metrics.ignored_responses.increment(1),
+                        Some(Err(status)) => {
+                            debug!(message = "Capture session failed; proxying continues.", %status);
+                            break DrainEnd::Gone;
+                        }
+                        None => break DrainEnd::Gone,
                     },
-                },
+                    item = queue.recv() => match item {
+                        None => {
+                            break match self.flush_gap(&session.tx).await {
+                                Ok(()) => DrainEnd::Finish,
+                                Err(()) => DrainEnd::Gone,
+                            };
+                        }
+                        Some(item) => match self.handle(&session.tx, item).await {
+                            Ok(true) => {}
+                            Ok(false) => break DrainEnd::Finish,
+                            Err(()) => break DrainEnd::Gone,
+                        },
+                    },
+                }
+            }
+        };
+        let end = tokio::select! {
+            end = pump => end,
+            () = expired => {
+                debug!(message = "Capture session did not finish in time; cancelling it.");
+                DrainEnd::Gone
             }
         };
         capturing.store(false, Ordering::Relaxed);
         match end {
-            DrainEnd::Finish => session.finish(),
+            DrainEnd::Finish => match deadline.now_or_never() {
+                Some(deadline) => session.finish_by(deadline),
+                None => session.finish(),
+            },
             DrainEnd::Gone => drop(session),
         }
     }

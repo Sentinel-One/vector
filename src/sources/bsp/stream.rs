@@ -14,7 +14,7 @@ use futures::FutureExt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpStream, UnixListener, UnixStream},
-    sync::Semaphore,
+    sync::{watch, Semaphore},
     time::Instant,
 };
 use tracing::Instrument;
@@ -510,6 +510,8 @@ pub(super) enum End {
 /// New mode: client bytes go to control-agent with backpressure; its replies go to the client.
 async fn relay<C: Conn>(capture: &Capture, client: C, mut session: SessionStream, unit: Unit) {
     let (mut client_rx, mut client_tx) = tokio::io::split(client);
+    let finish_timeout = session.finish_timeout();
+    let (client_done, client_done_rx) = watch::channel(false);
     let end = {
         let tx = &session.tx;
         let rx = &mut session.rx;
@@ -539,7 +541,21 @@ async fn relay<C: Conn>(capture: &Capture, client: C, mut session: SessionStream
         };
         let down = async {
             loop {
-                match rx.recv().await {
+                // Once the client has closed its side, a control-agent that sends nothing for
+                // `finish_timeout` ends the session, so it can't hold a slot forever.
+                let mut done = client_done_rx.clone();
+                let quiet = async move {
+                    _ = done.wait_for(|done| *done).await;
+                    tokio::time::sleep(finish_timeout).await;
+                };
+                let response = tokio::select! {
+                    response = rx.recv() => response,
+                    () = quiet => {
+                        debug!(message = "Control-agent went quiet after the client closed; ending the session.");
+                        break End::Closed;
+                    }
+                };
+                match response {
                     Some(Ok(SessionResponse {
                         msg: Some(session_response::Msg::Reply(reply)),
                     })) => {
@@ -571,7 +587,10 @@ async fn relay<C: Conn>(capture: &Capture, client: C, mut session: SessionStream
         loop {
             tokio::select! {
                 result = &mut up, if !up_done => match result {
-                    Ok(()) => up_done = true,
+                    Ok(()) => {
+                        up_done = true;
+                        client_done.send_replace(true);
+                    }
                     Err(end) => break end,
                 },
                 end = &mut down => break end,

@@ -63,12 +63,16 @@ enum OnSession {
     Stall(Duration),
     /// Like `Record`, but keeps the response stream open this long after the requests end.
     Linger(Duration),
+    /// Like `Record`, but also sends a `tick` reply at this interval until bsp drops the RPC.
+    Chatter(Duration),
 }
 
 #[derive(Default)]
 struct Recorded {
     control: Vec<ControlRequest>,
     sessions: Vec<Arc<Mutex<Vec<SessionRequest>>>>,
+    /// `Chatter` sessions whose replies bsp stopped accepting, i.e. whose RPC bsp dropped.
+    chatter_ended: usize,
     authorization: Vec<String>,
 }
 
@@ -184,7 +188,28 @@ impl Beam for FakeBeam {
         let on_session = self.on_session;
         match on_session {
             OnSession::Fail => Err(Status::internal("injected session failure")),
-            OnSession::Record | OnSession::Echo | OnSession::Stall(_) | OnSession::Linger(_) => {
+            OnSession::Record
+            | OnSession::Echo
+            | OnSession::Stall(_)
+            | OnSession::Linger(_)
+            | OnSession::Chatter(_) => {
+                if let OnSession::Chatter(every) = on_session {
+                    let tx = tx.clone();
+                    let recorded = Arc::clone(&self.recorded);
+                    tokio::spawn(async move {
+                        let mut ticks = tokio::time::interval(every);
+                        loop {
+                            ticks.tick().await;
+                            let tick = session_msg(session_response::Msg::Reply(Reply {
+                                payload: b"tick".to_vec().into(),
+                            }));
+                            if tx.send(Ok(tick)).await.is_err() {
+                                recorded.lock().unwrap().chatter_ended += 1;
+                                break;
+                            }
+                        }
+                    });
+                }
                 tokio::spawn(async move {
                     if let OnSession::Stall(delay) = on_session {
                         tokio::time::sleep(delay).await;
@@ -2372,4 +2397,207 @@ async fn test_build_rejects_zero_unix_datagram_session_idle_timeout() {
         error.contains("session_idle_timeout must be positive"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn test_build_rejects_zero_finish_timeout() {
+    let mut capture = Harness::start(OnHello::Ready, OnSession::Record)
+        .await
+        .capture();
+    capture.limits.finish_timeout = Duration::ZERO;
+    let error = build_error(BspConfig {
+        input: InputConfig::Tcp(tcp_input(next_addr(), None)),
+        capture,
+    })
+    .await;
+    assert!(error.contains("finish_timeout must be positive"), "{error}");
+}
+
+#[tokio::test]
+async fn test_update_tcp_finish_timeout_cancels_a_drain_stuck_on_a_stalled_control_agent() {
+    let beam = Harness::start(OnHello::Ready, OnSession::Stall(Duration::from_secs(60))).await;
+    let upstream = upstream_tcp_many().await;
+    let addr = next_addr();
+    let mut upstream_config = tcp_upstream(upstream);
+    upstream_config.capture.buffer_bytes = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+    let mut capture = beam.capture();
+    capture.limits.max_sessions = NonZeroUsize::new(1).unwrap();
+    capture.limits.max_bytes_per_sec = NonZeroU64::new(64 * 1024 * 1024).unwrap();
+    capture.limits.finish_timeout = Duration::from_millis(500);
+    let _bsp = start_bsp(
+        InputConfig::Tcp(tcp_input(addr, Some(upstream_config))),
+        capture,
+    )
+    .await;
+    beam.wait(hello_mode).await;
+    // More than the HTTP/2 windows and the session queue hold, so the drain blocks.
+    let reply = exchange(connect_tcp(addr).await, &vec![7u8; 6 * 1024 * 1024])
+        .await
+        .unwrap();
+    assert_eq!(reply, b"ack");
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let reply = exchange(connect_tcp(addr).await, b"next").await.unwrap();
+
+    assert_eq!(reply, b"ack");
+    beam.wait(|recorded| (recorded.sessions.len() == 2).then_some(()))
+        .await;
+}
+
+#[tokio::test]
+async fn test_new_udp_finish_timeout_frees_the_slot_of_an_idle_session_whose_rpc_never_ends() {
+    let beam = Harness::start(OnHello::Ready, OnSession::Linger(Duration::from_secs(60))).await;
+    let addr = next_addr();
+    let mut input = udp_input(addr, None);
+    input.session_idle_timeout = Duration::from_millis(500);
+    let mut capture = beam.capture();
+    capture.limits.max_sessions = NonZeroUsize::new(1).unwrap();
+    capture.limits.finish_timeout = Duration::from_millis(500);
+    let _bsp = start_bsp(InputConfig::Udp(input), capture).await;
+    beam.wait(hello_mode).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    first.send_to(b"one", addr).await.unwrap();
+    beam.wait(|recorded| session_messages(recorded, 0)).await;
+
+    // Idle expiry runs every second, then the finish timeout must free the slot.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    second.send_to(b"two", addr).await.unwrap();
+
+    let messages = beam.wait(|recorded| session_messages(recorded, 1)).await;
+    assert_eq!(captured(&messages).bytes, b"two");
+}
+
+#[tokio::test]
+async fn test_new_tcp_finish_timeout_ends_a_session_whose_client_left_and_control_agent_went_quiet()
+{
+    let beam = Harness::start(OnHello::Ready, OnSession::Linger(Duration::from_secs(60))).await;
+    let addr = next_addr();
+    let mut capture = beam.capture();
+    capture.limits.max_sessions = NonZeroUsize::new(1).unwrap();
+    capture.limits.finish_timeout = Duration::from_millis(500);
+    let _bsp = start_bsp(InputConfig::Tcp(tcp_input(addr, None)), capture).await;
+    let mut first = connect_tcp(addr).await;
+    first.write_all(b"one").await.unwrap();
+    first.shutdown().await.unwrap();
+    beam.wait(|recorded| {
+        session_messages(recorded, 0)
+            .map(|messages| captured(&messages))
+            .filter(|captured| captured.half_closed)
+    })
+    .await;
+
+    // The quiet session ends after one finish timeout, its RPC after at most another.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let mut second = connect_tcp(addr).await;
+    second.write_all(b"two").await.unwrap();
+
+    let messages = beam.wait(|recorded| session_messages(recorded, 1)).await;
+    assert_eq!(captured(&messages).bytes, b"two");
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(WAIT, first.read(&mut buf))
+        .await
+        .unwrap();
+    assert!(
+        matches!(read, Ok(0)),
+        "first client should see a FIN: {read:?}"
+    );
+}
+
+/// Reads ticks until EOF; returns how many arrived.
+async fn read_ticks_until_eof(client: &mut TcpStream) -> usize {
+    let mut buf = [0u8; 1024];
+    let mut received = 0;
+    loop {
+        match tokio::time::timeout(WAIT, client.read(&mut buf))
+            .await
+            .unwrap()
+        {
+            Ok(0) => break received,
+            Ok(read) => received += read,
+            Err(error) => panic!("client should see a FIN: {error}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_new_tcp_replying_control_agent_keeps_a_half_closed_session_past_finish_timeout() {
+    let beam = Harness::start(
+        OnHello::Ready,
+        OnSession::Chatter(Duration::from_millis(100)),
+    )
+    .await;
+    let addr = next_addr();
+    let mut capture = beam.capture();
+    capture.limits.finish_timeout = Duration::from_millis(300);
+    let _bsp = start_bsp(InputConfig::Tcp(tcp_input(addr, None)), capture).await;
+    let mut client = connect_tcp(addr).await;
+    client.write_all(b"one").await.unwrap();
+    client.shutdown().await.unwrap();
+    beam.wait(|recorded| {
+        session_messages(recorded, 0)
+            .map(|messages| captured(&messages))
+            .filter(|captured| captured.half_closed)
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let mut buf = [0u8; 1024];
+    let read = tokio::time::timeout(Duration::from_millis(500), client.read(&mut buf))
+        .await
+        .expect("ticks should still arrive");
+
+    assert!(matches!(read, Ok(read) if read > 0), "{read:?}");
+    assert_eq!(beam.recorded.lock().unwrap().chatter_ended, 0);
+}
+
+#[tokio::test]
+async fn test_new_tcp_session_with_a_replying_control_agent_ends_at_shutdown_timeout_after_unload()
+{
+    let beam = Harness::start(
+        OnHello::Ready,
+        OnSession::Chatter(Duration::from_millis(100)),
+    )
+    .await;
+    let addr = next_addr();
+    let mut input = tcp_input(addr, None);
+    input.shutdown_timeout = Duration::from_secs(1);
+    let mut capture = beam.capture();
+    capture.limits.finish_timeout = Duration::from_millis(300);
+    let (bsp, mut shutdown) = start_bsp_with_shutdown(InputConfig::Tcp(input), capture).await;
+    let mut client = connect_tcp(addr).await;
+    client.write_all(b"one").await.unwrap();
+    client.shutdown().await.unwrap();
+    beam.wait(|recorded| {
+        session_messages(recorded, 0)
+            .map(|messages| captured(&messages))
+            .filter(|captured| captured.half_closed)
+    })
+    .await;
+    let mut buf = [0u8; 1024];
+    while let Ok(read) =
+        tokio::time::timeout(Duration::from_millis(50), client.read(&mut buf)).await
+    {
+        assert!(read.unwrap() > 0, "session ended before the unload");
+    }
+
+    let began = std::time::Instant::now();
+    let completed = shutdown.shutdown_source(
+        &crate::config::ComponentKey::from("bsp"),
+        tokio::time::Instant::now() + WAIT,
+    );
+    assert!(completed.await, "source should finish before the deadline");
+    assert_eq!(bsp.await.unwrap(), Ok(()));
+    let returned = began.elapsed();
+    let ticks = read_ticks_until_eof(&mut client).await;
+
+    assert!(
+        returned < Duration::from_millis(500),
+        "returned after {returned:?}"
+    );
+    assert!(began.elapsed() >= Duration::from_secs(1));
+    assert!(ticks > 0, "ticks should keep arriving after the unload");
+    beam.wait(|recorded| (recorded.chatter_ended == 1).then_some(()))
+        .await;
 }

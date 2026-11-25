@@ -33,7 +33,6 @@ use crate::{
 };
 
 const SESSION_QUEUE: usize = 16;
-const SESSION_FINISH_GRACE: Duration = Duration::from_secs(30);
 const HTTP2_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Where the instance stands with control-agent.
@@ -349,6 +348,7 @@ impl Capture {
             guard: SessionGuard {
                 task: Some(task),
                 permit: Some(admission.permit),
+                finish_timeout: self.limits.finish_timeout,
             },
         }
     }
@@ -622,11 +622,22 @@ pub(super) struct SessionStream {
 }
 
 impl SessionStream {
-    /// Ends the RPC normally.
+    /// Ends the RPC normally, cancelling it if it hasn't ended within `finish_timeout`.
     pub(super) fn finish(self) {
         let Self { tx, rx, guard } = self;
         drop((tx, rx));
         guard.finish();
+    }
+
+    /// Ends the RPC normally, cancelling it if it hasn't ended by `deadline`.
+    pub(super) fn finish_by(self, deadline: tokio::time::Instant) {
+        let Self { tx, rx, guard } = self;
+        drop((tx, rx));
+        guard.finish_by(deadline);
+    }
+
+    pub(super) const fn finish_timeout(&self) -> Duration {
+        self.guard.finish_timeout
     }
 }
 
@@ -634,22 +645,25 @@ impl SessionStream {
 pub(super) struct SessionGuard {
     task: Option<tokio::task::JoinHandle<()>>,
     permit: Option<OwnedSemaphorePermit>,
+    finish_timeout: Duration,
 }
 
 impl SessionGuard {
     /// Lets the RPC end normally once the sending half is dropped. The `max_sessions` slot is
     /// held until the RPC is over, so finishing sessions can't push live RPCs past the limit.
-    pub(super) fn finish(mut self) {
+    pub(super) fn finish(self) {
+        let deadline = tokio::time::Instant::now() + self.finish_timeout;
+        self.finish_by(deadline);
+    }
+
+    fn finish_by(mut self, deadline: tokio::time::Instant) {
         if let Some(task) = self.task.take() {
             let permit = self.permit.take();
             let abort = task.abort_handle();
             tokio::spawn(
                 async move {
                     let _permit = permit;
-                    if tokio::time::timeout(SESSION_FINISH_GRACE, task)
-                        .await
-                        .is_err()
-                    {
+                    if tokio::time::timeout_at(deadline, task).await.is_err() {
                         abort.abort();
                     }
                 }
