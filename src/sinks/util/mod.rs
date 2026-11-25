@@ -49,7 +49,7 @@ pub use builder::SinkBuilderExt;
 pub use compressor::Compressor;
 pub use compressor::Decompressor;
 pub use jwt_auth::AuthTokenConfig;
-#[cfg(feature = "sinks-vector")]
+#[cfg(any(feature = "sinks-vector", feature = "sources-bsp"))]
 pub use jwt_auth::{AuthState, AuthToken};
 pub use normalizer::Normalizer;
 pub use rejection_report::{emit_rejection_error, RejectionContext, RejectionReport};

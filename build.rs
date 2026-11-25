@@ -128,6 +128,7 @@ fn main() {
         println!("cargo:rerun-if-changed=proto/vector/dd_trace.proto");
         println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
         println!("cargo:rerun-if-changed=proto/vector/vector.proto");
+        println!("cargo:rerun-if-changed=proto/observo/beam/v1/beam.proto");
 
         // Create and store the "file descriptor set" from the compiled Protocol Buffers packages.
         //
@@ -141,6 +142,7 @@ fn main() {
         let mut prost_build = prost_build::Config::new();
         prost_build
             .btree_map(["."])
+            .bytes([".observo.beam.v1"])
             .file_descriptor_set_path(protobuf_fds_path);
 
         tonic_build::configure()
@@ -155,10 +157,12 @@ fn main() {
                     "proto/third-party/google/pubsub/v1/pubsub.proto",
                     "proto/third-party/google/rpc/status.proto",
                     "proto/vector/vector.proto",
+                    "proto/observo/beam/v1/beam.proto",
                 ],
                 &[
                     "proto/third-party",
                     "proto/vector",
+                    "proto/observo",
                     "lib/vector-core/proto/",
                 ],
             )
