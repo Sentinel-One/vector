@@ -10770,6 +10770,7 @@ dependencies = [
  "futures 0.3.31",
  "futures-util",
  "http 0.2.9",
+ "humantime",
  "hyper 0.14.28",
  "hyper 1.4.1",
  "inventory",
