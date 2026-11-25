@@ -135,6 +135,3 @@ pub enum HealthcheckError {
     #[snafu(display("Unexpected status: {}", status))]
     UnexpectedStatus { status: ::http::StatusCode },
 }
-
-#[cfg(test)]
-mod bytes_sent_coverage;

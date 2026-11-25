@@ -127,13 +127,6 @@ impl Controller {
         self.recorder.with_registry(Registry::clear);
     }
 
-    /// How many handles outside the registry point at the counters called `name`. A counter that
-    /// something still holds a handle to is not removed by `expire_metrics_secs`. Used by tests.
-    pub fn outstanding_counter_handles(&self, name: &str) -> usize {
-        self.recorder
-            .with_registry(|registry| registry.outstanding_counter_handles(name))
-    }
-
     /// Get a handle to the globally registered controller, if it's initialized.
     ///
     /// # Errors
