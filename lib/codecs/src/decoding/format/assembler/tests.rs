@@ -1429,3 +1429,131 @@ fn demo_packet_capture_summary_is_denormalized_onto_earlier_packets() {
         ]
     );
 }
+
+/// `run`, over raw reads, which may split a multi-byte character.
+fn run_reads(decoder: &mut Decoder, reads: &[&[u8]]) -> Vec<Step> {
+    let mut buf = BytesMut::new();
+    let mut steps: Vec<Step> = reads
+        .iter()
+        .flat_map(|read| {
+            buf.extend_from_slice(read);
+            std::iter::from_fn(|| step(decoder.decode(&mut buf))).collect::<Vec<_>>()
+        })
+        .collect();
+    match steps.iter().position(|s| matches!(s, Err(false))) {
+        Some(fatal) => steps.truncate(fatal + 1),
+        None => steps.extend(std::iter::from_fn(|| step(decoder.decode_eof(&mut buf)))),
+    }
+    steps
+}
+
+/// Each read becomes its own frame, so the inner deserializer sees the input `size` bytes at a
+/// time.
+const ONE_FRAME_PER_READ: &str = "{ method: bytes, bytes: { min_chunk_bytes: 1 } }";
+
+#[test]
+fn demo_nsg_flow_logs_assemble_from_frames_of_a_few_bytes() {
+    let input = nsg_input();
+    [1, 2, 3, 7].into_iter().for_each(|size| {
+        let reads: Vec<&[u8]> = input.as_bytes().chunks(size).collect();
+        let steps = run_reads(&mut nsg_decoder(ONE_FRAME_PER_READ), &reads);
+        assert_eq!(errors(&steps), Vec::<bool>::new(), "frames of {size} bytes");
+        assert_eq!(values(&steps), nsg_expected(), "frames of {size} bytes");
+    });
+}
+
+/// Batches streamed by `json_paths`: each event gets its batch's `source`, and `flush` reports
+/// every id the unit carried.
+fn batch_decoder(framing: &str) -> Decoder {
+    decoder(&formatdoc! {r#"
+        framing: {framing}
+        decoding:
+          codec: assembled
+          deserializer:
+            codec: json_paths
+            config:
+              paths:
+                source: {{ op: identity }}
+                events: {{ op: explode }}
+          assembler:
+            process:
+              - if:
+                  when: {{ eq: {{ path: .expr, value: source }} }}
+                  then:
+                    - merge: {{ from: .data, to: "%h.source", move: true }}
+                    - stop
+              - merge: {{ from: .data, to: ., move: true }}
+              - reset: {{ to: .expr }}
+              - merge: {{ from: "%h.source", to: .source, move: false }}
+              - append: {{ from: .id, to: "%ids", move: false }}
+            flush:
+              actions:
+                - merge: {{ from: "%ids", to: .ids, move: true }}
+    "#})
+}
+
+const BATCH_INPUT: &str = concat!(
+    r#"{"source": "café ☕", "events": [{"id": 1, "msg": "naïve"}, {"id": 2, "msg": "日本語"}]}"#,
+    "\n",
+    r#"{"source":"b","events":[{"id":3,"msg":"x"}]}{"source":"c","events":[]}"#,
+);
+
+fn batch_expected() -> Vec<serde_json::Value> {
+    vec![
+        json!({"id": 1, "msg": "naïve", "source": "café ☕"}),
+        json!({"id": 2, "msg": "日本語", "source": "café ☕"}),
+        json!({"id": 3, "msg": "x", "source": "b"}),
+        json!({"ids": [1, 2, 3]}),
+    ]
+}
+
+#[test]
+fn json_paths_batches_assemble_from_the_whole_input() {
+    let steps = run(&mut batch_decoder("{ method: bytes }"), &[BATCH_INPUT]);
+    assert_eq!(errors(&steps), Vec::<bool>::new());
+    assert_eq!(values(&steps), batch_expected());
+}
+
+#[test]
+fn json_paths_batches_assemble_identically_from_frames_of_any_size() {
+    let input = BATCH_INPUT.as_bytes();
+    [1, 2, 3, 5, 8].into_iter().for_each(|size| {
+        let reads: Vec<&[u8]> = input.chunks(size).collect();
+        let steps = run_reads(&mut batch_decoder(ONE_FRAME_PER_READ), &reads);
+        assert_eq!(errors(&steps), Vec::<bool>::new(), "frames of {size} bytes");
+        assert_eq!(values(&steps), batch_expected(), "frames of {size} bytes");
+    });
+}
+
+#[test]
+fn json_paths_batches_assemble_identically_wherever_the_input_is_split_in_two() {
+    let input = BATCH_INPUT.as_bytes();
+    (0..=input.len()).for_each(|at| {
+        let (head, tail) = input.split_at(at);
+        let steps = run_reads(&mut batch_decoder(ONE_FRAME_PER_READ), &[head, tail]);
+        assert_eq!(errors(&steps), Vec::<bool>::new(), "split at byte {at}");
+        assert_eq!(values(&steps), batch_expected(), "split at byte {at}");
+    });
+}
+
+#[test]
+fn bytes_codec_under_one_byte_frames_sees_no_empty_frame_at_the_end_of_the_unit() {
+    let mut decoder = decoder(indoc! {r#"
+        framing: { method: bytes, bytes: { min_chunk_bytes: 1 } }
+        decoding:
+          codec: assembled
+          deserializer: { codec: bytes }
+          assembler:
+            process:
+              - append: { from: .message, to: "%parts", move: true }
+              - stop
+            flush:
+              actions:
+                - merge: { from: "%parts", to: .parts, move: true }
+    "#});
+    let reads: Vec<&[u8]> = b"abc".chunks(1).collect();
+    assert_eq!(
+        values(&run_reads(&mut decoder, &reads)),
+        vec![json!({"parts": ["a", "b", "c"]})]
+    );
+}

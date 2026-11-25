@@ -613,10 +613,46 @@ pub struct JsonPathDeserializer {
     feeder_capacity: usize,
 }
 
+/// U+FFFD, which lossy mode puts in place of invalid UTF-8.
+const REPLACEMENT_CHARACTER_UTF8: &[u8] = &[0xEF, 0xBF, 0xBD];
+
 /// State maintained across parse() calls for streaming
 struct StreamingParserState {
     parser: JsonParser<PushJsonFeeder>,
     state: ParserState,
+    utf8_tail: Vec<u8>,
+}
+
+impl StreamingParserState {
+    fn take_lossy_utf8(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut input = std::mem::take(&mut self.utf8_tail);
+        input.extend_from_slice(bytes);
+        let mut out = Vec::with_capacity(input.len());
+        let mut rest = input.as_slice();
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    out.extend_from_slice(valid.as_bytes());
+                    rest = &[];
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    out.extend_from_slice(valid);
+                    match error.error_len() {
+                        Some(len) => {
+                            out.extend_from_slice(REPLACEMENT_CHARACTER_UTF8);
+                            rest = &after[len..];
+                        }
+                        None => {
+                            self.utf8_tail = after.to_vec();
+                            rest = &[];
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Builds `JsonPathDeserializer`s that share one compiled set of path rules.
@@ -674,6 +710,7 @@ impl JsonPathDeserializer {
         StreamingParserState {
             parser: JsonParser::new_with_options(feeder, parser_options),
             state: ParserState::new(),
+            utf8_tail: Vec::new(),
         }
     }
 }
@@ -740,10 +777,7 @@ impl Deserializer for JsonPathDeserializer {
         }
 
         let bytes_slice = if self.lossy {
-            match std::str::from_utf8(&bytes) {
-                Ok(_) => bytes.to_vec(),
-                Err(_) => String::from_utf8_lossy(&bytes).into_owned().into_bytes(),
-            }
+            self.parser_state.take_lossy_utf8(&bytes)
         } else {
             bytes.to_vec()
         };
@@ -3104,5 +3138,178 @@ op = "explode"
             out[n - 1],
             format!(r#"{{"c":[[{}]],"i":{}}}"#, n - 1, n - 1)
         );
+    }
+
+    /// Two documents and a third, concatenated, that between them split every kind of token: keys
+    /// (one with a multi-byte character), escapes, literals, numbers, raw multi-byte characters,
+    /// empty containers and the whitespace between tokens and between documents.
+    const TRICKLE_INPUT: &str = concat!(
+        r#"{"meta": {"name": "h\u00e9llo \"q\" \\ \ud83d\ude00", "raw": "héllo 😀 ü", "clé": "v","#,
+        r#" "ok": true, "no": false, "nil": null, "n": -12.5e+3, "i": 42, "zero": 0, "empty": "","#,
+        r#" "eo": {}, "ea": []},"#,
+        "\n  \"records\": [{\"id\": 1, \"tags\": [\"a\", \"b\"], \"deep\": {\"x\": [1, [2, 3]]}},",
+        "\t{\"id\": 2, \"tags\": [], \"deep\": {\"x\": []}}],\r\n",
+        r#" "blob": {"k": [true, null, 1.5]}}"#,
+        "\n",
+        r#"{"meta":{"name":"second"},"records":[{"id":3,"tags":["c"],"deep":{"x":[4]}}],"blob":{"k":[]}}"#,
+        r#"{"records":[]} "#,
+    );
+
+    fn trickle_configs() -> Vec<(&'static str, PathOperationConfig)> {
+        vec![
+            (
+                "concrete identity, explode and bytes",
+                wildcard_config(&[
+                    ("meta", PathOperation::Identity, "*"),
+                    ("records", PathOperation::Explode, "*"),
+                    ("blob", PathOperation::Bytes, "*"),
+                ]),
+            ),
+            (
+                "wildcards descending past concrete rules",
+                wildcard_config(&[
+                    ("meta.*", PathOperation::Identity, "*"),
+                    ("records.id", PathOperation::Identity, "*"),
+                    ("records.tags", PathOperation::Explode, "*"),
+                    ("records.deep.*", PathOperation::Identity, "*"),
+                    ("blob", PathOperation::Drop, "*"),
+                ]),
+            ),
+            (
+                "a leaf wildcard emitting each top-level value whole",
+                wildcard_config(&[("*", PathOperation::Identity, "*")]),
+            ),
+            (
+                "bytes under a descending wildcard",
+                wildcard_config(&[
+                    ("*", PathOperation::Drop, "*"),
+                    ("*.*", PathOperation::Bytes, "*"),
+                ]),
+            ),
+        ]
+    }
+
+    fn trickle_options() -> [JsonPathDeserializerOptions; 2] {
+        [
+            JsonPathDeserializerOptions::default(),
+            JsonPathDeserializerOptions {
+                lossy: false,
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// The events one deserializer yields when fed `pieces` in turn, as frames.
+    fn parse_pieces<'a>(
+        config: &PathOperationConfig,
+        options: &JsonPathDeserializerOptions,
+        pieces: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Vec<(String, Value)> {
+        let mut deserializer = JsonPathDeserializer::new(config, options);
+        pieces
+            .into_iter()
+            .flat_map(|piece| {
+                deserializer
+                    .parse(Bytes::copy_from_slice(piece), LogNamespace::Vector)
+                    .unwrap()
+            })
+            .map(|event| {
+                let log = event.as_log();
+                (
+                    log["expr"].to_string_lossy().into_owned(),
+                    log["data"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trickle_input_parsed_whole_keeps_escapes_and_multibyte_characters() {
+        let config = wildcard_config(&[("meta.*", PathOperation::Identity, "*")]);
+        trickle_options().iter().for_each(|options| {
+            let events = parse_pieces(&config, options, [TRICKLE_INPUT.as_bytes()]);
+            assert_eq!(
+                events[..3],
+                [
+                    ev("meta.name", Value::from("h\u{e9}llo \"q\" \\ 😀")),
+                    ev("meta.raw", Value::from("héllo 😀 ü")),
+                    ev("meta.clé", Value::from("v")),
+                ],
+                "lossy: {}",
+                options.lossy
+            );
+        });
+    }
+
+    #[test]
+    fn frames_of_any_size_yield_the_same_events_as_the_whole_input() {
+        let input = TRICKLE_INPUT.as_bytes();
+        trickle_configs().iter().for_each(|(name, config)| {
+            trickle_options().iter().for_each(|options| {
+                let whole = parse_pieces(config, options, [input]);
+                assert!(!whole.is_empty(), "{name}");
+                [1, 2, 3, 4, 5, 7, 13, 64].into_iter().for_each(|size| {
+                    assert_eq!(
+                        parse_pieces(config, options, input.chunks(size)),
+                        whole,
+                        "{name}, lossy: {}, frames of {size} bytes",
+                        options.lossy
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn input_split_in_two_anywhere_yields_the_same_events_as_the_whole_input() {
+        let input = TRICKLE_INPUT.as_bytes();
+        trickle_configs().iter().for_each(|(name, config)| {
+            trickle_options().iter().for_each(|options| {
+                let whole = parse_pieces(config, options, [input]);
+                (0..=input.len()).for_each(|at| {
+                    let (head, tail) = input.split_at(at);
+                    assert_eq!(
+                        parse_pieces(config, options, [head, tail]),
+                        whole,
+                        "{name}, lossy: {}, split at byte {at}",
+                        options.lossy
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn multibyte_character_split_across_frames_is_kept_whole() {
+        let config = wildcard_config(&[("s", PathOperation::Identity, "*")]);
+        let input = r#"{"s": "é😀"}"#.as_bytes();
+        trickle_options().iter().for_each(|options| {
+            (8..input.len() - 2).for_each(|at| {
+                let (head, tail) = input.split_at(at);
+                assert_eq!(
+                    parse_pieces(&config, options, [head, tail]),
+                    [ev("s", Value::from("é😀"))],
+                    "lossy: {}, split at byte {at}",
+                    options.lossy
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn lossy_replaces_invalid_utf8_the_same_however_the_input_is_split() {
+        let config = wildcard_config(&[("s", PathOperation::Identity, "*")]);
+        let input: &[u8] = b"{\"s\": \"a\xc3b\xff\xe2\x82c\"}";
+        let expected = [ev("s", Value::from("a\u{fffd}b\u{fffd}\u{fffd}c"))];
+        let options = JsonPathDeserializerOptions::default();
+        assert_eq!(parse_pieces(&config, &options, [input]), expected);
+        (0..=input.len()).for_each(|at| {
+            let (head, tail) = input.split_at(at);
+            assert_eq!(
+                parse_pieces(&config, &options, [head, tail]),
+                expected,
+                "split at byte {at}"
+            );
+        });
     }
 }
