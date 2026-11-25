@@ -244,7 +244,7 @@ impl Capture {
     }
 
     pub(super) const fn max_session_bytes(&self) -> u64 {
-        self.limits.max_session_bytes
+        self.limits.max_session_bytes.get()
     }
 
     /// A slot for a new captured session, if capture is armed, the budget isn't spent and
@@ -268,11 +268,11 @@ impl Capture {
         let bytes = bytes as u64;
         self.metrics.capture_bytes.increment(bytes);
         let spent = self.spent.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        if spent >= self.limits.max_bytes && !self.exhausted.send_replace(true) {
+        if spent >= self.limits.max_bytes.get() && !self.exhausted.send_replace(true) {
             self.metrics.capture_budget_exhausted.set(1.0);
             info!(
                 message = "Capture budget exhausted.",
-                max_bytes = self.limits.max_bytes
+                max_bytes = self.limits.max_bytes.get()
             );
         }
     }

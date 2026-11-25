@@ -22,7 +22,7 @@ pub(super) struct Metrics {
 
 impl Metrics {
     pub(super) fn new() -> Self {
-        Self {
+        let metrics = Self {
             sessions_active_captured: gauge!("bsp_sessions_active", "captured" => "true"),
             sessions_active_uncaptured: gauge!("bsp_sessions_active", "captured" => "false"),
             sessions_closed: counter!("bsp_sessions_total", "outcome" => "closed"),
@@ -48,7 +48,12 @@ impl Metrics {
             control_stream_connected: gauge!("bsp_control_stream_connected"),
             datagrams_truncated: counter!("bsp_datagrams_truncated_total"),
             ignored_responses: counter!("bsp_ignored_responses_total"),
-        }
+        };
+        // A reload's new instance shares these series; don't let it inherit the old state.
+        metrics.capture_stopped.set(0.0);
+        metrics.capture_budget_exhausted.set(0.0);
+        metrics.control_stream_connected.set(0.0);
+        metrics
     }
 
     pub(super) fn active(&self, captured: bool) -> ActiveSession {

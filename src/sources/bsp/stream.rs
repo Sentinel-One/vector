@@ -320,9 +320,10 @@ impl StreamCtx {
                 Some((Ok(client), permit)) => {
                     let ctx = Arc::clone(&self);
                     let tripwire = tripwire.clone();
+                    // A duration too large to add means no deadline.
                     let deadline = self
                         .max_connection_duration
-                        .map(|duration| Instant::now() + duration);
+                        .and_then(|duration| Instant::now().checked_add(duration));
                     // Connections outlive `serve`, so shutdown never waits on them; the tripwire
                     // drops them.
                     tokio::spawn(
@@ -444,7 +445,7 @@ impl StreamCtx {
                 match read {
                     None => {
                         if let Some(tee) = tee.take() {
-                            tee.abort();
+                            tee.finish();
                         }
                     }
                     Some(0) => {

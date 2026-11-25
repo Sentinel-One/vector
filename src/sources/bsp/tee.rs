@@ -60,11 +60,19 @@ enum Item {
 struct PendingGap(Option<(u64, u64)>);
 
 impl PendingGap {
-    fn extend(&mut self, offset: u64, length: u64) {
-        self.0 = match self.0 {
-            Some((start, len)) if start + len == offset => Some((start, len + length)),
-            Some(_) | None => Some((offset, length)),
-        };
+    /// Returns the pending gap it replaces when the new one isn't adjacent; the caller must
+    /// report it.
+    fn extend(&mut self, offset: u64, length: u64) -> Option<(u64, u64)> {
+        match self.0 {
+            Some((start, len)) if start + len == offset => {
+                self.0 = Some((start, len + length));
+                None
+            }
+            previous => {
+                self.0 = Some((offset, length));
+                previous
+            }
+        }
     }
 }
 
@@ -147,7 +155,9 @@ impl Tee {
                     .metrics
                     .capture_bytes_dropped_buffer_full
                     .increment(len as u64);
-                self.gap.extend(self.offset, advance);
+                if let Some((offset, length)) = self.gap.extend(self.offset, advance) {
+                    _ = self.queue.send(Item::Gap { offset, length });
+                }
             }
             (true, false) => {
                 self.flush_gap();
@@ -254,10 +264,11 @@ impl Drain {
     /// `Ok(false)` once `max_session_bytes` is reached.
     async fn handle(&mut self, tx: &SessionTx, item: Item) -> Result<bool, ()> {
         match item {
-            Item::Gap { offset, length } => {
-                self.gap.extend(offset, length);
-                Ok(true)
+            Item::Gap { offset, length } => match self.gap.extend(offset, length) {
+                Some(previous) => self.send_gap(tx, previous).await,
+                None => Ok(()),
             }
+            .map(|()| true),
             Item::HalfClose => {
                 self.flush_gap(tx).await?;
                 tx.half_close().await.map(|()| true)
@@ -276,8 +287,11 @@ impl Drain {
                         .metrics
                         .capture_bytes_dropped_rate_limited
                         .increment(len as u64);
-                    self.gap.extend(offset, self.unit.advance(len));
-                    Ok(true)
+                    match self.gap.extend(offset, self.unit.advance(len)) {
+                        Some(previous) => self.send_gap(tx, previous).await,
+                        None => Ok(()),
+                    }
+                    .map(|()| true)
                 } else {
                     self.flush_gap(tx).await?;
                     self.capture.charge(len);
@@ -293,11 +307,29 @@ impl Drain {
 
     async fn flush_gap(&mut self, tx: &SessionTx) -> Result<(), ()> {
         match self.gap.0.take() {
-            Some((offset, length)) => {
-                self.capture.metrics.capture_gaps.increment(1);
-                tx.gap(offset, length).await
-            }
+            Some(gap) => self.send_gap(tx, gap).await,
             None => Ok(()),
         }
+    }
+
+    async fn send_gap(&self, tx: &SessionTx, (offset, length): (u64, u64)) -> Result<(), ()> {
+        self.capture.metrics.capture_gaps.increment(1);
+        tx.gap(offset, length).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingGap;
+
+    #[test]
+    fn test_pending_gap_extend_merges_adjacent_gaps_and_returns_the_one_it_replaces() {
+        let mut gap = PendingGap::default();
+
+        assert_eq!(gap.extend(5, 1), None);
+        assert_eq!(gap.extend(6, 2), None);
+        assert_eq!(gap.0, Some((5, 3)));
+        assert_eq!(gap.extend(10, 1), Some((5, 3)));
+        assert_eq!(gap.0, Some((10, 1)));
     }
 }

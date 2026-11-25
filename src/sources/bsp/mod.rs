@@ -93,7 +93,7 @@ impl UpstreamCapture {
     fn validated(&self) -> crate::Result<Sampled> {
         self.sampling.validated().map(|rate| Sampled {
             rate,
-            buffer_bytes: self.buffer_bytes,
+            buffer_bytes: self.buffer_bytes.get(),
         })
     }
 }
@@ -146,10 +146,44 @@ impl InputConfig {
             {
                 Err("input.tls.client_metadata_key is not supported: bsp emits no events".into())
             }
+            Self::Tcp(input) if input.max_connection_duration.is_some_and(|d| d.is_zero()) => {
+                Err("input.max_connection_duration must be positive".into())
+            }
+            Self::Udp(input) if input.session_idle_timeout.is_zero() => {
+                Err("input.session_idle_timeout must be positive".into())
+            }
+            Self::UnixDatagram(input) if input.session_idle_timeout.is_zero() => {
+                Err("input.session_idle_timeout must be positive".into())
+            }
+            Self::UnixStream(input)
+                if input
+                    .upstream
+                    .as_ref()
+                    .is_some_and(|upstream| upstream.path == input.path) =>
+            {
+                Err(Self::same_path(&input.path))
+            }
+            Self::UnixDatagram(input)
+                if input
+                    .upstream
+                    .as_ref()
+                    .is_some_and(|upstream| upstream.path == input.path) =>
+            {
+                Err(Self::same_path(&input.path))
+            }
             Self::UnixStream(input) => SocketFile::stale(&input.path).map(|_| ()),
             Self::UnixDatagram(input) => SocketFile::stale(&input.path).map(|_| ()),
             Self::Tcp(_) | Self::Udp(_) => Ok(()),
         }
+    }
+
+    /// Claiming the path would delete the old source's socket and make BSP dial itself.
+    fn same_path(path: &std::path::Path) -> crate::Error {
+        format!(
+            "input.upstream.path must differ from input.path, got `{}` for both",
+            path.display()
+        )
+        .into()
     }
 
     const fn transport(&self) -> Transport {
@@ -355,6 +389,16 @@ impl Drop for SocketFile {
 
 /// Keeps the source alive until shutdown once its listener is gone, so a new-mode `Stop` doesn't
 /// look like the source finishing.
+/// Aborts the control loop when the source future ends or is dropped: a force shutdown drops it
+/// without letting it finish.
+struct ControlTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ControlTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn until_shutdown(
     listening: impl Future<Output = crate::Result<()>>,
     shutdown: ShutdownSignal,
@@ -388,7 +432,7 @@ impl SourceConfig for BspConfig {
         let shutdown = cx.shutdown;
 
         Ok(async move {
-            let control = tokio::spawn(control.run().in_current_span());
+            let _control = ControlTask(tokio::spawn(control.run().in_current_span()));
             // New mode binds only once control-agent is ready to supply replies.
             let armed = match mode {
                 Mode::New => {
@@ -409,7 +453,6 @@ impl SourceConfig for BspConfig {
                 shutdown.await;
                 Ok(())
             };
-            control.abort();
             result
         }
         .boxed())

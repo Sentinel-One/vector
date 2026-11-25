@@ -447,7 +447,7 @@ fn test_config_yaml_without_upstream_parses_as_new_mode() {
     )
     .unwrap();
     assert_eq!(config.input.mode(), Mode::New);
-    assert_eq!(config.capture.limits.max_bytes, 1073741824);
+    assert_eq!(config.capture.limits.max_bytes.get(), 1073741824);
 }
 
 #[test]
@@ -647,7 +647,7 @@ async fn test_update_tcp_reports_gap_when_capture_stalls_and_upstream_gets_every
     let (upstream, received) = upstream_tcp().await;
     let addr = next_addr();
     let mut upstream_config = tcp_upstream(upstream);
-    upstream_config.capture.buffer_bytes = 64 * 1024;
+    upstream_config.capture.buffer_bytes = NonZeroUsize::new(64 * 1024).unwrap();
     let _bsp = start_bsp(
         InputConfig::Tcp(tcp_input(addr, Some(upstream_config))),
         beam.capture(),
@@ -744,7 +744,7 @@ async fn test_update_tcp_reports_budget_exhausted_status_once_max_bytes_is_spent
     let (upstream, _received) = upstream_tcp().await;
     let addr = next_addr();
     let mut capture = beam.capture();
-    capture.limits.max_bytes = 10;
+    capture.limits.max_bytes = NonZeroU64::new(10).unwrap();
     let _bsp = start_bsp(
         InputConfig::Tcp(tcp_input(addr, Some(tcp_upstream(upstream)))),
         capture,
@@ -2133,4 +2133,243 @@ async fn test_update_tcp_shutdown_returns_at_once_and_keeps_proxying_until_shutd
     assert!(began.elapsed() >= Duration::from_secs(1));
     let finished = beam.half_closed_session(0).await;
     assert_eq!(captured(&finished).bytes, b"hello after shutdown");
+}
+
+fn gauge_value(name: &str, tags: &[(&str, &str)]) -> f64 {
+    vector_lib::metrics::Controller::get()
+        .unwrap()
+        .capture_metrics()
+        .into_iter()
+        .filter(|metric| {
+            metric.name() == name
+                && tags
+                    .iter()
+                    .all(|(tag, value)| metric.tag_matches(tag, value))
+        })
+        .map(|metric| match metric.value() {
+            MetricValue::Gauge { value } => *value,
+            _ => 0.0,
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn test_update_tcp_max_connection_duration_still_delivers_bytes_queued_before_the_cut() {
+    let beam = Harness::start(OnHello::Ready, OnSession::Stall(Duration::from_secs(1))).await;
+    let upstream = upstream_tcp_many().await;
+    let addr = next_addr();
+    let mut upstream_config = tcp_upstream(upstream);
+    upstream_config.capture.buffer_bytes = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+    let mut input = tcp_input(addr, Some(upstream_config));
+    input.max_connection_duration = Some(Duration::from_millis(300));
+    let mut capture = beam.capture();
+    capture.limits.max_bytes_per_sec = NonZeroU64::new(64 * 1024 * 1024).unwrap();
+    let _bsp = start_bsp(InputConfig::Tcp(input), capture).await;
+    beam.wait(hello_mode).await;
+    let mut client = connect_tcp(addr).await;
+    // Far more than the HTTP/2 windows and the session queue hold, so most of it is still in the
+    // tee queue at the cut.
+    let payload = vec![7u8; 6 * 1024 * 1024];
+
+    client.write_all(&payload).await.unwrap();
+
+    let delivered = beam
+        .wait(|recorded| {
+            session_messages(recorded, 0)
+                .map(|messages| captured(&messages))
+                .filter(|captured| captured.bytes.len() >= payload.len())
+        })
+        .await;
+    assert_eq!(delivered.bytes, payload);
+}
+
+#[tokio::test]
+async fn test_dropping_the_source_future_stops_the_control_stream_reconnecting() {
+    let beam = Harness::start(OnHello::End, OnSession::Record).await;
+    let bsp = start_bsp(
+        InputConfig::Tcp(tcp_input(next_addr(), None)),
+        beam.capture(),
+    )
+    .await;
+    beam.wait(|recorded| (recorded.control.len() >= 2).then_some(()))
+        .await;
+
+    bsp.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let attempts = beam.recorded.lock().unwrap().control.len();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert_eq!(beam.recorded.lock().unwrap().control.len(), attempts);
+}
+
+#[tokio::test]
+async fn test_update_udp_session_counts_as_captured_once_its_tee_opens() {
+    vector_lib::metrics::init_test();
+    let beam = Harness::start(OnHello::Ready, OnSession::Record).await;
+    let upstream = upstream_udp().await;
+    let addr = next_addr();
+    let _bsp = start_bsp(
+        InputConfig::Udp(udp_update_input(addr, upstream, 16)),
+        beam.capture(),
+    )
+    .await;
+    beam.wait(hello_mode).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    assert_eq!(udp_roundtrip(&client, addr, b"a").await, b"re:a");
+
+    assert_eq!(
+        gauge_value("bsp_sessions_active", &[("captured", "true")]),
+        1.0
+    );
+    assert_eq!(
+        gauge_value("bsp_sessions_active", &[("captured", "false")]),
+        0.0
+    );
+}
+
+#[test]
+fn test_new_metrics_reset_the_state_gauges_left_by_a_previous_instance() {
+    vector_lib::metrics::init_test();
+    let previous = super::metrics::Metrics::new();
+    previous.capture_stopped.set(1.0);
+    previous.capture_budget_exhausted.set(1.0);
+    previous.control_stream_connected.set(1.0);
+
+    let _metrics = super::metrics::Metrics::new();
+
+    assert_eq!(gauge_value("bsp_capture_stopped", &[]), 0.0);
+    assert_eq!(gauge_value("bsp_capture_budget_exhausted", &[]), 0.0);
+    assert_eq!(gauge_value("bsp_control_stream_connected", &[]), 0.0);
+}
+
+#[tokio::test]
+async fn test_build_rejects_unix_stream_upstream_at_the_listener_path() {
+    let path = socket_path("same-path-stream");
+    let mut input = unix_stream_input(path.clone());
+    input.upstream = Some(UnixStreamUpstream {
+        path: path.clone(),
+        connect_timeout: Duration::from_secs(1),
+        capture: UpstreamCapture::default(),
+    });
+    let error = build_error(BspConfig {
+        input: InputConfig::UnixStream(input),
+        capture: Harness::start(OnHello::Ready, OnSession::Record)
+            .await
+            .capture(),
+    })
+    .await;
+    assert!(error.contains("must differ from input.path"), "{error}");
+}
+
+#[tokio::test]
+async fn test_build_rejects_unix_datagram_upstream_at_the_listener_path() {
+    let path = socket_path("same-path-dgram");
+    let input = unix_datagram_input(
+        path.clone(),
+        Some(UnixDatagramUpstream {
+            path: path.clone(),
+            max_peers: NonZeroUsize::new(16).unwrap(),
+            capture: UpstreamCapture::default(),
+        }),
+    );
+    let error = build_error(BspConfig {
+        input: InputConfig::UnixDatagram(input),
+        capture: Harness::start(OnHello::Ready, OnSession::Record)
+            .await
+            .capture(),
+    })
+    .await;
+    assert!(error.contains("must differ from input.path"), "{error}");
+}
+
+#[tokio::test]
+async fn test_update_tcp_proxies_when_max_connection_duration_overflows_the_clock() {
+    let beam = Harness::start(OnHello::Ready, OnSession::Record).await;
+    let upstream = upstream_tcp_many().await;
+    let addr = next_addr();
+    let mut input = tcp_input(addr, Some(tcp_upstream(upstream)));
+    input.max_connection_duration = Some(Duration::from_secs(u64::MAX));
+    let _bsp = start_bsp(InputConfig::Tcp(input), beam.capture()).await;
+    beam.wait(hello_mode).await;
+
+    let reply = exchange(connect_tcp(addr).await, b"hello").await.unwrap();
+
+    assert_eq!(reply, b"ack");
+}
+
+#[test]
+fn test_config_rejects_zero_buffer_bytes() {
+    let error = yaml_error(
+        "{ mode: tcp, address: 0.0.0.0:9000, upstream: { address: 127.0.0.1:9001, capture: { buffer_bytes: 0 } } }",
+        "",
+    );
+    assert!(error.contains("nonzero"), "{error}");
+}
+
+#[test]
+fn test_config_rejects_zero_max_bytes() {
+    let error = yaml_error("{ mode: tcp, address: 0.0.0.0:9000 }", "max_bytes: 0");
+    assert!(error.contains("nonzero"), "{error}");
+}
+
+#[test]
+fn test_config_rejects_zero_max_session_bytes() {
+    let error = yaml_error(
+        "{ mode: tcp, address: 0.0.0.0:9000 }",
+        "max_session_bytes: 0",
+    );
+    assert!(error.contains("nonzero"), "{error}");
+}
+
+#[tokio::test]
+async fn test_build_rejects_zero_max_connection_duration() {
+    let mut input = tcp_input(next_addr(), None);
+    input.max_connection_duration = Some(Duration::ZERO);
+    let error = build_error(BspConfig {
+        input: InputConfig::Tcp(input),
+        capture: Harness::start(OnHello::Ready, OnSession::Record)
+            .await
+            .capture(),
+    })
+    .await;
+    assert!(
+        error.contains("max_connection_duration must be positive"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_build_rejects_zero_udp_session_idle_timeout() {
+    let mut input = udp_input(next_addr(), None);
+    input.session_idle_timeout = Duration::ZERO;
+    let error = build_error(BspConfig {
+        input: InputConfig::Udp(input),
+        capture: Harness::start(OnHello::Ready, OnSession::Record)
+            .await
+            .capture(),
+    })
+    .await;
+    assert!(
+        error.contains("session_idle_timeout must be positive"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_build_rejects_zero_unix_datagram_session_idle_timeout() {
+    let mut input = unix_datagram_input(socket_path("zero-idle"), None);
+    input.session_idle_timeout = Duration::ZERO;
+    let error = build_error(BspConfig {
+        input: InputConfig::UnixDatagram(input),
+        capture: Harness::start(OnHello::Ready, OnSession::Record)
+            .await
+            .capture(),
+    })
+    .await;
+    assert!(
+        error.contains("session_idle_timeout must be positive"),
+        "{error}"
+    );
 }

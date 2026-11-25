@@ -506,7 +506,7 @@ impl DgramCtx {
                 tee,
                 index,
                 sampled,
-                ..
+                _active,
             } => {
                 let picked = sampled.pick();
                 if picked && tee.is_none() {
@@ -521,6 +521,9 @@ impl DgramCtx {
                             *index,
                         )
                     });
+                    if tee.is_some() {
+                        *_active = self.capture.metrics.active(true);
+                    }
                 }
                 match (tee.as_mut(), picked) {
                     (Some(tee), true) => tee.push(&payload),

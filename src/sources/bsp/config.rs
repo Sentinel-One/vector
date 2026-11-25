@@ -330,14 +330,14 @@ pub struct UpstreamCapture {
     /// Per-session tee queue. When it overflows the excess is dropped and a `Gap` is sent; the
     /// upstream is never slowed down.
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub buffer_bytes: usize,
+    pub buffer_bytes: NonZeroUsize,
 }
 
 impl Default for UpstreamCapture {
     fn default() -> Self {
         Self {
             sampling: CaptureSampling::default(),
-            buffer_bytes: 4 * 1024 * 1024,
+            buffer_bytes: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
         }
     }
 }
@@ -438,24 +438,25 @@ pub struct CaptureLimits {
     /// Capture budget for this instance. Once spent, no new sessions are captured, and BSP reports
     /// it to control-agent.
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub max_bytes: u64,
+    pub max_bytes: NonZeroU64,
 
     /// Capture rate across all sessions.
     #[configurable(metadata(docs::type_unit = "bytes"))]
     pub max_bytes_per_sec: NonZeroU64,
 
-    /// Per-session capture cap.
+    /// Per-session capture cap. For datagram transports, a peer's next datagram after the cap
+    /// starts a new session.
     #[configurable(metadata(docs::type_unit = "bytes"))]
-    pub max_session_bytes: u64,
+    pub max_session_bytes: NonZeroU64,
 }
 
 impl Default for CaptureLimits {
     fn default() -> Self {
         Self {
             max_sessions: NonZeroUsize::new(200).unwrap(),
-            max_bytes: 2 * 1024 * 1024 * 1024,
+            max_bytes: NonZeroU64::new(2 * 1024 * 1024 * 1024).unwrap(),
             max_bytes_per_sec: NonZeroU64::new(10 * 1024 * 1024).unwrap(),
-            max_session_bytes: 256 * 1024 * 1024,
+            max_session_bytes: NonZeroU64::new(256 * 1024 * 1024).unwrap(),
         }
     }
 }
