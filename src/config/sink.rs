@@ -261,6 +261,10 @@ pub struct SinkContext {
     /// Extra context data provided by the running app and shared across all components. This can be
     /// used to pass shared settings or other data from outside the components.
     pub extra_context: ExtraContext,
+
+    /// Counts this sink's `component_sent_bytes_total`. The topology builder creates it and keeps it
+    /// for the sink's lifetime; a sink gets it from `bytes_sent()`.
+    pub bytes_sent: Registered<BytesSent>,
 }
 
 impl Default for SinkContext {
@@ -273,6 +277,7 @@ impl Default for SinkContext {
             app_name: crate::get_app_name().to_string(),
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: Default::default(),
+            bytes_sent: register!(BytesSent),
         }
     }
 }
@@ -280,12 +285,11 @@ impl Default for SinkContext {
 impl SinkContext {
     /// Handle that counts the bytes a sink sent into `component_sent_bytes_total`.
     ///
-    /// Call it from `SinkConfig::build`, which runs inside the sink's span, so the series carries
-    /// `component_id`, `component_kind` and `component_type`. Keep the handle for the life of the
-    /// sink: holding it keeps the series present from startup and stops it expiring while the sink
-    /// is idle. A sink that does not call this gets no series.
+    /// Call it from `SinkConfig::build` and count into it where a send succeeds. Every call returns
+    /// a clone of the same handle, which the topology builder created inside the sink's span, so the
+    /// series carries `component_id`, `component_kind` and `component_type`.
     pub fn bytes_sent(&self) -> Registered<BytesSent> {
-        register!(BytesSent)
+        self.bytes_sent.clone()
     }
 
     pub const fn globals(&self) -> &GlobalOptions {

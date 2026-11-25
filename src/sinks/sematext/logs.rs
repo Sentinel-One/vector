@@ -184,14 +184,14 @@ mod tests {
         .unwrap();
 
         // Make sure we can build the config
-        _ = config.build(cx.clone()).await.unwrap();
+        _ = config.build(cx).await.unwrap();
 
         let addr = next_addr();
         // Swap out the host so we can force send it
         // to our local server
         config.endpoint = Some(format!("http://{}", addr));
 
-        let sink_future = async { config.build(cx).await.unwrap().0 };
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
         let (mut rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);

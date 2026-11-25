@@ -799,7 +799,7 @@ mod tests {
 
         if batch_status == BatchStatus::Delivered {
             // Built inside the compliance wrapper, after it installs the metrics recorder.
-            let sink_future = async { config.build(cx).await.unwrap().0 };
+            let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
             build_run_and_assert_sink_compliance(
                 sink_future,
                 stream::iter(events),

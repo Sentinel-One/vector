@@ -35,8 +35,7 @@ async fn sink() -> (impl Future<Output = VectorSink>, Event) {
         .expect("config should be valid");
     config.override_uri = Some(mock_endpoint);
 
-    let context = SinkContext::default();
-    let sink_future = async move { config.build(context).await.unwrap().0 };
+    let sink_future = async move { config.build(SinkContext::default()).await.unwrap().0 };
 
     let event = Event::Log(LogEvent::from("simple message"));
 

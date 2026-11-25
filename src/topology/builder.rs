@@ -17,7 +17,7 @@ use vector_config::NamedComponent;
 use vector_lib::config::GlobalOptions;
 use vector_lib::config::LogNamespace;
 use vector_lib::internal_event::{
-    self, CountByteSize, EventsSent, InternalEventHandle as _, Registered,
+    self, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Registered,
 };
 use vector_lib::transform::update_runtime_schema_definition;
 use vector_lib::{
@@ -643,7 +643,13 @@ impl<'a> Builder<'a> {
                 app_name: crate::get_app_name().to_string(),
                 app_name_slug: crate::get_slugified_app_name(),
                 extra_context: self.extra_context.clone(),
+                // Created here, inside the sink span and before the sink is built.
+                bytes_sent: register!(BytesSent),
             };
+
+            // Keep a copy for as long as the sink runs. The series then exists from startup for every
+            // sink, and cannot expire while the sink is idle, whether or not the sink uses the handle.
+            let bytes_sent_guard = cx.bytes_sent();
 
             let (sink, healthcheck) = match sink.inner.build(cx).await {
                 Err(error) => {
@@ -654,6 +660,7 @@ impl<'a> Builder<'a> {
             };
 
             let sink = async move {
+                let _bytes_sent_guard = bytes_sent_guard;
                 debug!("Sink starting.");
 
                 // Why is this Arc<Mutex<Option<_>>> needed you ask.

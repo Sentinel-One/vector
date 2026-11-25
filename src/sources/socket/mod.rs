@@ -889,7 +889,13 @@ mod test {
         let encoder = Serializer {
             bytes: message_bytes,
         };
-        let (sink, _healthcheck) = sink_config.build(Default::default(), encoder).unwrap();
+        let (sink, _healthcheck) = sink_config
+            .build(
+                Default::default(),
+                encoder,
+                crate::config::SinkContext::default().bytes_sent(),
+            )
+            .unwrap();
 
         tokio::spawn(async move {
             let input = stream::repeat_with(|| LogEvent::default().into()).boxed();

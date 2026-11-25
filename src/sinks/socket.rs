@@ -125,14 +125,14 @@ impl SocketSinkConfig {
 impl SinkConfig for SocketSinkConfig {
     async fn build(
         &self,
-        _cx: SinkContext,
+        cx: SinkContext,
     ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
         match &self.mode {
             Mode::Tcp(TcpMode { config, encoding }) => {
                 let transformer = encoding.transformer();
                 let (framer, serializer) = encoding.build(SinkType::StreamBased)?;
                 let encoder = Encoder::<Framer>::new(framer, serializer);
-                config.build(transformer, encoder)
+                config.build(transformer, encoder, cx.bytes_sent())
             }
             Mode::Udp(UdpMode { config, encoding }) => {
                 let transformer = encoding.transformer();
@@ -149,6 +149,7 @@ impl SinkConfig for SocketSinkConfig {
                     transformer,
                     encoder,
                     super::util::service::net::UnixMode::Stream,
+                    cx.bytes_sent(),
                 )
             }
             #[cfg(unix)]
@@ -160,6 +161,7 @@ impl SinkConfig for SocketSinkConfig {
                     transformer,
                     encoder,
                     super::util::service::net::UnixMode::Datagram,
+                    cx.bytes_sent(),
                 )
             }
         }
@@ -211,7 +213,9 @@ mod test {
         config::SinkContext,
         event::{Event, LogEvent},
         test_util::{
-            components::{assert_sink_compliance, run_and_assert_sink_compliance, SINK_TAGS},
+            components::{
+                assert_sink_compliance, build_run_and_assert_sink_compliance, SINK_TAGS,
+            },
             next_addr, next_addr_v6, random_lines_with_stream, trace_init, CountReceiver,
         },
     };
@@ -307,6 +311,63 @@ mod test {
             "unix_datagram_socket_test",
         )))
         .await;
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build_tcp() {
+        let config = SocketSinkConfig::make_basic_tcp_config("127.0.0.1:1".to_string(), Default::default());
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build_unix_stream() {
+        let config = SocketSinkConfig {
+            mode: Mode::UnixStream(UnixMode {
+                config: UnixSinkConfig::new(temp_uds_path("sent_bytes_series_unix_stream")),
+                encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+            }),
+            acknowledgements: Default::default(),
+        };
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_stream_counts_the_bytes_it_sends() {
+        trace_init();
+
+        let addr = next_addr();
+        let config = SocketSinkConfig {
+            mode: Mode::Tcp(TcpMode {
+                config: TcpSinkConfig::from_address(addr.to_string()),
+                encoding: (None::<FramingConfig>, JsonSerializerConfig::default()).into(),
+            }),
+            acknowledgements: Default::default(),
+        };
+
+        let mut receiver = CountReceiver::receive_lines(addr);
+        let (_lines, events) = random_lines_with_stream(10, 100, None);
+
+        assert_sink_compliance(&SINK_TAGS, async move {
+            let context = SinkContext::default();
+            let (sink, _healthcheck) = config.build(context).await.unwrap();
+
+            sink.run(events).await
+        })
+        .await
+        .expect("Running sink failed");
+
+        receiver.connected().await;
+        let output = receiver.await;
+
+        // Each event is one line plus the newline that frames it. The counter has no
+        // `protocol` tag and equals the bytes the receiver got.
+        let received_bytes: usize = output.iter().map(|line| line.len() + 1).sum();
+        assert!(received_bytes > 0);
+        assert_eq!(
+            crate::test_util::components::sent_bytes_total(),
+            Some(received_bytes as f64)
+        );
     }
 
     #[tokio::test]
@@ -444,15 +505,14 @@ mod test {
             }),
             acknowledgements: Default::default(),
         };
-        let context = SinkContext::default();
-        let (sink, _healthcheck) = config.build(context).await.unwrap();
+        let sink_future = async move { config.build(SinkContext::default()).await.unwrap().0 };
         let (mut sender, receiver) = mpsc::channel::<Option<EventArray>>(0);
         let jh1 = tokio::spawn(async move {
             let stream = receiver
                 .take_while(|event| ready(event.is_some()))
                 .map(|event| event.unwrap())
                 .boxed();
-            run_and_assert_sink_compliance(sink, stream, &SINK_TAGS).await
+            build_run_and_assert_sink_compliance(sink_future, stream, &SINK_TAGS).await
         });
 
         let msg_counter = Arc::new(AtomicUsize::new(0));
@@ -564,11 +624,14 @@ mod test {
             acknowledgements: Default::default(),
         };
 
-        let context = SinkContext::default();
-        let (sink, _healthcheck) = config.build(context).await.unwrap();
+        let sink_future = async move { config.build(SinkContext::default()).await.unwrap().0 };
 
         let (_, events) = random_lines_with_stream(1000, 10000, None);
-        let sink_handle = tokio::spawn(run_and_assert_sink_compliance(sink, events, &SINK_TAGS));
+        let sink_handle = tokio::spawn(build_run_and_assert_sink_compliance(
+            sink_future,
+            events,
+            &SINK_TAGS,
+        ));
 
         // First listener
         let mut count = 20usize;

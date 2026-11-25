@@ -276,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_json() {
-        let (mut config, cx) = load_sink::<HumioMetricsConfig>(indoc! {r#"
+        let (mut config, _) = load_sink::<HumioMetricsConfig>(indoc! {r#"
             token = "atoken"
             batch.max_events = 1
         "#})
@@ -287,7 +287,7 @@ mod tests {
         // to our local server
         config.endpoint = format!("http://{}", addr);
 
-        let sink_future = async { config.build(cx).await.unwrap().0 };
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
         let (rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);
@@ -342,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_value_tags() {
-        let (mut config, cx) = load_sink::<HumioMetricsConfig>(indoc! {r#"
+        let (mut config, _) = load_sink::<HumioMetricsConfig>(indoc! {r#"
             token = "atoken"
             batch.max_events = 1
             metric_tag_values = "full"
@@ -354,7 +354,7 @@ mod tests {
         // to our local server
         config.endpoint = format!("http://{}", addr);
 
-        let sink_future = async { config.build(cx).await.unwrap().0 };
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
         let (rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);

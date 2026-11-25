@@ -34,8 +34,7 @@ async fn component_spec_compliance() {
     config.auth.api_key = Some("fake".to_string().into());
     config.endpoint = mock_endpoint.to_string();
 
-    let context = SinkContext::default();
-    let sink_future = async { config.build(context).await.unwrap().0 };
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let event = Event::Metric(Metric::new(
         "gauge-test",
@@ -60,8 +59,7 @@ async fn sends_metric() {
     let (rx, trigger, server) = build_test_server(in_addr);
     tokio::spawn(server);
 
-    let context = SinkContext::default();
-    let sink_future = async { config.build(context).await.unwrap().0 };
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
     let timestamp = Utc::now();
 
     let event = Event::Metric(
@@ -121,8 +119,7 @@ async fn sends_multiple_metrics() {
     let (rx, trigger, server) = build_test_server(in_addr);
     tokio::spawn(server);
 
-    let context = SinkContext::default();
-    let sink_future = async { config.build(context).await.unwrap().0 };
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let timestamp1 = Utc::now();
     let timestamp2 = Utc::now();
@@ -208,8 +205,7 @@ async fn does_not_aggregate_metrics() {
     let (rx, trigger, server) = build_test_server(in_addr);
     tokio::spawn(server);
 
-    let context = SinkContext::default();
-    let sink_future = async { config.build(context).await.unwrap().0 };
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let timestamp1 = Utc::now();
     let timestamp2 = Utc::now();

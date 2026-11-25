@@ -144,9 +144,7 @@ mod tests {
         let config = format!(r#"address = "http://{}/""#, in_addr);
         let config: VectorConfig = toml::from_str(&config).unwrap();
 
-        let cx = SinkContext::default();
-
-        let sink_future = async { config.build(cx).await.unwrap().0 };
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
         let (rx, trigger, server) = build_test_server_generic(in_addr, move || {
             hyper::Response::builder()
                 .header("grpc-status", "0") // OK

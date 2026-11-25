@@ -172,6 +172,40 @@ async fn topology_source_and_sink() {
     assert_eq!(vec![event], res);
 }
 
+/// The topology builder creates every sink's `component_sent_bytes_total` handle and holds it for the
+/// sink's lifetime. The basic test sink never asks for the handle, and still has the series from
+/// startup, with the three component tags.
+#[tokio::test]
+async fn sink_has_the_sent_bytes_series_from_startup() {
+    trace_init();
+
+    let (_in1, source1) = basic_source();
+    let (_out1, sink1) = basic_sink(10);
+
+    let mut config = Config::builder();
+    config.add_source("in1", source1);
+    config.add_sink("out1", &["in1"], sink1);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    let series = Controller::get()
+        .unwrap()
+        .capture_metrics()
+        .into_iter()
+        .find(|metric| {
+            metric.name() == "component_sent_bytes_total"
+                && metric.tag_value("component_id").as_deref() == Some("out1")
+        })
+        .expect("the sink has a component_sent_bytes_total series");
+
+    assert!(matches!(series.value(), MetricValue::Counter { value } if *value == 0.0));
+    assert_eq!(series.tag_value("component_kind").as_deref(), Some("sink"));
+    assert!(series.tag_value("component_type").is_some());
+    assert!(series.tag_value("protocol").is_none());
+
+    topology.stop().await;
+}
+
 #[tokio::test]
 async fn topology_multiple_sources() {
     trace_init();

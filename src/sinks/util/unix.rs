@@ -19,7 +19,7 @@ use tokio_util::codec::Encoder;
 use vector_lib::json_size::JsonSize;
 use vector_lib::{
     configurable::configurable_component,
-    internal_event::BytesSent,
+    internal_event::{BytesSent, Registered},
 };
 use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
@@ -81,9 +81,10 @@ impl UnixSinkConfig {
             + Sync
             + 'static,
         unix_mode: UnixMode,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let connector = UnixConnector::new(self.path.clone(), unix_mode);
-        let sink = UnixSink::new(connector.clone(), transformer, encoder);
+        let sink = UnixSink::new(connector.clone(), transformer, encoder, bytes_sent);
         Ok((
             VectorSink::from_event_streamsink(sink),
             Box::pin(async move { connector.healthcheck().await }),
@@ -183,17 +184,25 @@ where
     connector: UnixConnector,
     transformer: Transformer,
     encoder: E,
+    /// Counts `component_sent_bytes_total` in stream mode; each (re)connection gets a clone.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl<E> UnixSink<E>
 where
     E: Encoder<Event, Error = vector_lib::codecs::encoding::Error> + Clone + Send + Sync,
 {
-    pub const fn new(connector: UnixConnector, transformer: Transformer, encoder: E) -> Self {
+    pub fn new(
+        connector: UnixConnector,
+        transformer: Transformer,
+        encoder: E,
+        bytes_sent: Registered<BytesSent>,
+    ) -> Self {
         Self {
             connector,
             transformer,
             encoder,
+            bytes_sent,
         }
     }
 
@@ -202,7 +211,12 @@ where
             UnixEither::Stream(stream) => stream,
             UnixEither::Datagram(_) => unreachable!("connect is only called with Stream mode"),
         };
-        BytesSink::new(stream, |_| ShutdownCheck::Alive, SocketMode::Unix)
+        BytesSink::new(
+            stream,
+            |_| ShutdownCheck::Alive,
+            SocketMode::Unix,
+            self.bytes_sent.clone(),
+        )
     }
 
     async fn run_internal(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
@@ -326,7 +340,8 @@ mod tests {
             .build(
                 Default::default(),
                 Encoder::<()>::new(TextSerializerConfig::default().build().into()),
-                UnixMode::Stream
+                UnixMode::Stream,
+                crate::config::SinkContext::default().bytes_sent()
             )
             .unwrap()
             .1
@@ -337,7 +352,8 @@ mod tests {
                 .build(
                     Default::default(),
                     Encoder::<()>::new(TextSerializerConfig::default().build().into()),
-                    UnixMode::Datagram
+                    UnixMode::Datagram,
+                crate::config::SinkContext::default().bytes_sent()
                 )
                 .unwrap()
                 .1
@@ -351,7 +367,8 @@ mod tests {
             .build(
                 Default::default(),
                 Encoder::<()>::new(TextSerializerConfig::default().build().into()),
-                UnixMode::Stream
+                UnixMode::Stream,
+                crate::config::SinkContext::default().bytes_sent()
             )
             .unwrap()
             .1
@@ -361,7 +378,8 @@ mod tests {
             .build(
                 Default::default(),
                 Encoder::<()>::new(TextSerializerConfig::default().build().into()),
-                UnixMode::Datagram
+                UnixMode::Datagram,
+                crate::config::SinkContext::default().bytes_sent()
             )
             .unwrap()
             .1
@@ -379,23 +397,27 @@ mod tests {
 
         // Set up Sink
         let config = UnixSinkConfig::new(out_path);
-        let (sink, _healthcheck) = config
-            .build(
-                Default::default(),
-                Encoder::<Framer>::new(
-                    NewlineDelimitedEncoder::default().into(),
-                    TextSerializerConfig::default().build().into(),
-                ),
-                UnixMode::Stream,
-            )
-            .unwrap();
 
         // Send the test data
         let (input_lines, events) = random_lines_with_stream(100, num_lines, None);
 
-        assert_sink_compliance(&SINK_TAGS, async move { sink.run(events).await })
-            .await
-            .expect("Running sink failed");
+        // The sink is built inside the wrapper, after it has set up the metrics recorder.
+        assert_sink_compliance(&SINK_TAGS, async move {
+            let (sink, _healthcheck) = config
+                .build(
+                    Default::default(),
+                    Encoder::<Framer>::new(
+                        NewlineDelimitedEncoder::default().into(),
+                        TextSerializerConfig::default().build().into(),
+                    ),
+                    UnixMode::Stream,
+                    crate::config::SinkContext::default().bytes_sent(),
+                )
+                .unwrap();
+            sink.run(events).await
+        })
+        .await
+        .expect("Running sink failed");
 
         // Wait for output to connect
         receiver.connected().await;
@@ -442,6 +464,7 @@ mod tests {
                     TextSerializerConfig::default().build().into(),
                 ),
                 UnixMode::Datagram,
+                crate::config::SinkContext::default().bytes_sent()
             )
             .unwrap();
 

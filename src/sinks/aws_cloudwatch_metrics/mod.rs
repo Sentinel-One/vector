@@ -14,11 +14,13 @@ use futures_util::{future, future::BoxFuture};
 use std::task::{Context, Poll};
 use tower::Service;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::{sink::VectorSink, ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
 use crate::{
     aws::{
-        auth::AwsAuthentication, create_client, is_retriable_error, ClientBuilder, RegionOrEndpoint,
+        auth::AwsAuthentication, create_sink_client, is_retriable_error, ClientBuilder,
+        RegionOrEndpoint,
     },
     config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},
     event::{
@@ -131,7 +133,7 @@ impl SinkConfig for CloudWatchMetricsSinkConfig {
         &self,
         cx: SinkContext,
     ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
-        let client = self.create_client(&cx.proxy).await?;
+        let client = self.create_client(&cx.proxy, cx.bytes_sent()).await?;
         let healthcheck = self.clone().healthcheck(client.clone()).boxed();
         let sink = CloudWatchMetricsSvc::new(self.clone(), client)?;
         Ok((sink, healthcheck))
@@ -163,7 +165,11 @@ impl CloudWatchMetricsSinkConfig {
         Ok(())
     }
 
-    async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<CloudwatchClient> {
+    async fn create_client(
+        &self,
+        proxy: &ProxyConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<CloudwatchClient> {
         let region = if cfg!(test) {
             // Moto (used for mocking AWS) doesn't recognize 'custom' as valid region name
             Some(Region::new("us-east-1"))
@@ -171,7 +177,7 @@ impl CloudWatchMetricsSinkConfig {
             self.region.region()
         };
 
-        create_client::<CloudwatchMetricsClientBuilder>(
+        create_sink_client::<CloudwatchMetricsClientBuilder>(
             &CloudwatchMetricsClientBuilder {},
             &self.auth,
             region,
@@ -179,6 +185,7 @@ impl CloudWatchMetricsSinkConfig {
             proxy,
             self.tls.as_ref(),
             None,
+            bytes_sent,
         )
         .await
     }
@@ -342,5 +349,25 @@ impl Service<PartitionInnerBuffer<Vec<Metric>, String>> for CloudWatchMetricsSvc
                 .await?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: CloudWatchMetricsSinkConfig = toml::from_str(
+            r#"
+            default_namespace = "n"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:1"
+            auth.access_key_id = "x"
+            auth.secret_access_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

@@ -30,6 +30,19 @@ impl Registry {
         self.registry.clear();
     }
 
+    /// How many handles, held outside the registry, point at the counters called `name`.
+    ///
+    /// The registry holds one reference to each counter and `get_counter_handles` clones one more,
+    /// so those two are not counted: the rest are the handles components keep.
+    pub(super) fn outstanding_counter_handles(&self, name: &str) -> usize {
+        self.registry
+            .get_counter_handles()
+            .iter()
+            .filter(|(key, _)| key.name() == name)
+            .map(|(_, counter)| Arc::strong_count(counter.get_inner()).saturating_sub(2))
+            .sum()
+    }
+
     pub(super) fn set_expiry(&self, timeout: Option<Duration>) {
         let recency = timeout.map(|_| Recency::new(Clock::new(), MetricKindMask::ALL, timeout));
         *(self.recency.write()).expect("Failed to acquire write lock on recency map") = recency;

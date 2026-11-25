@@ -545,7 +545,7 @@ mod tests {
             default_config(stack_encoding_config(JsonSerializerConfig::default().into()));
         let sink_future = async {
             config
-                .build_sink(client, mock_endpoint, GcpAuthenticator::None, context)
+                .build_sink(client, mock_endpoint, GcpAuthenticator::None, SinkContext::default())
                 .expect("failed to build sink")
         };
 

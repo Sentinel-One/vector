@@ -365,9 +365,6 @@ pub struct HttpBatchService<F, B = Bytes> {
     /// Counts `component_sent_bytes_total`. The sink gets it from `SinkContext::bytes_sent()` in
     /// `build()` and passes it in; the service holds it for its whole life, which keeps the series
     /// present from startup and stops it expiring while the sink is idle.
-    ///
-    /// Do not also call `.protocol(..)` on the driver of a sink that sends through this service when
-    /// its response returns `Some` from `bytes_sent()`: the bytes would be counted twice.
     bytes_sent: Registered<BytesSent>,
 }
 

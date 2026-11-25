@@ -27,6 +27,7 @@ async fn global_options() {
         ..SinkContext::default()
     };
     let (mut config, cx) = load_sink_with_context::<DatadogMetricsConfig>(config, cx).unwrap();
+    let extra_context = cx.extra_context.clone();
 
     let addr = next_addr();
     // Swap out the endpoint so we can force send it
@@ -34,7 +35,13 @@ async fn global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let sink_future = async { config.build(cx).await.unwrap().0 };
+    let sink_future = async move {
+        let cx = SinkContext {
+            extra_context,
+            ..SinkContext::default()
+        };
+        config.build(cx).await.unwrap().0
+    };
 
     let (rx, _trigger, server) = test_server(addr, ApiStatus::OKv1);
     tokio::spawn(server);
@@ -72,6 +79,7 @@ async fn override_global_options() {
         ..SinkContext::default()
     };
     let (mut config, cx) = load_sink_with_context::<DatadogMetricsConfig>(config, cx).unwrap();
+    let extra_context = cx.extra_context.clone();
 
     let addr = next_addr();
     // Swap out the endpoint so we can force send it
@@ -79,7 +87,13 @@ async fn override_global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let sink_future = async { config.build(cx).await.unwrap().0 };
+    let sink_future = async move {
+        let cx = SinkContext {
+            extra_context,
+            ..SinkContext::default()
+        };
+        config.build(cx).await.unwrap().0
+    };
 
     let (rx, _trigger, server) = test_server(addr, ApiStatus::OKv1);
     tokio::spawn(server);

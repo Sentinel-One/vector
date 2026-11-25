@@ -1,6 +1,7 @@
 use aws_sdk_sns::Client as SnsClient;
 
 use crate::aws::RegionOrEndpoint;
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use crate::config::{
     AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext,
@@ -11,7 +12,7 @@ use super::{
     client::SnsMessagePublisher, message_deduplication_id, message_group_id, BaseSSSinkConfig,
     SSRequestBuilder, SSSink,
 };
-use crate::aws::create_client;
+use crate::aws::create_sink_client;
 use crate::aws::ClientBuilder;
 
 /// Configuration for the `aws_sns` sink.
@@ -46,8 +47,12 @@ impl GenerateConfig for SnsSinkConfig {
 }
 
 impl SnsSinkConfig {
-    pub(super) async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<SnsClient> {
-        create_client::<SnsClientBuilder>(
+    pub(super) async fn create_client(
+        &self,
+        proxy: &ProxyConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<SnsClient> {
+        create_sink_client::<SnsClientBuilder>(
             &SnsClientBuilder {},
             &self.base_config.auth,
             self.region.region(),
@@ -55,6 +60,7 @@ impl SnsSinkConfig {
             proxy,
             self.base_config.tls.as_ref(),
             None,
+            bytes_sent,
         )
         .await
     }
@@ -67,7 +73,7 @@ impl SinkConfig for SnsSinkConfig {
         &self,
         cx: SinkContext,
     ) -> crate::Result<(crate::sinks::VectorSink, crate::sinks::Healthcheck)> {
-        let client = self.create_client(&cx.proxy).await?;
+        let client = self.create_client(&cx.proxy, cx.bytes_sent()).await?;
 
         let publisher = SnsMessagePublisher::new(client.clone(), self.topic_arn.clone());
 
@@ -122,4 +128,25 @@ pub(super) async fn healthcheck(client: SnsClient, topic_arn: String) -> crate::
         .await
         .map(|_| ())
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: SnsSinkConfig = toml::from_str(
+            r#"
+            topic_arn = "arn:aws:sns:us-east-1:000000000000:t"
+            encoding.codec = "json"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:1"
+            auth.access_key_id = "x"
+            auth.secret_access_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
+    }
 }

@@ -47,8 +47,8 @@ pub use timeout::AwsTimeout;
 
 use crate::config::ProxyConfig;
 use crate::http::{build_proxy_connector, build_tls_connector, status};
-use crate::internal_events::AwsBytesSent;
 use crate::tls::{MaybeTlsSettings, TlsConfig};
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 static RETRIABLE_CODES: OnceLock<RegexSet> = OnceLock::new();
 
@@ -161,6 +161,9 @@ async fn resolve_region(
 }
 
 /// Create the SDK client using the provided settings.
+///
+/// The client does not count the bytes it sends. Sources and the secrets backend use this, so they
+/// never expose `component_sent_bytes_total`. A sink uses `create_sink_client` instead.
 pub async fn create_client<T>(
     builder: &T,
     auth: &AwsAuthentication,
@@ -178,7 +181,7 @@ where
         .map(|(client, _)| client)
 }
 
-/// Create the SDK client and resolve the region using the provided settings.
+/// Create the SDK client and resolve the region using the provided settings. Does not count bytes.
 pub async fn create_client_and_region<T>(
     builder: &T,
     auth: &AwsAuthentication,
@@ -191,6 +194,70 @@ pub async fn create_client_and_region<T>(
 where
     T: ClientBuilder,
 {
+    let http_client = connector(proxy, tls_options)?;
+    build_client::<T, _>(
+        builder,
+        auth,
+        region,
+        endpoint,
+        proxy,
+        tls_options,
+        timeout,
+        http_client,
+    )
+    .await
+}
+
+/// Create the SDK client for a sink. Every successful request it sends is counted into `bytes_sent`,
+/// the sink's `SinkContext::bytes_sent` handle, which is why the handle is required here.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_sink_client<T>(
+    builder: &T,
+    auth: &AwsAuthentication,
+    region: Option<Region>,
+    endpoint: Option<String>,
+    proxy: &ProxyConfig,
+    tls_options: Option<&TlsConfig>,
+    timeout: Option<&AwsTimeout>,
+    bytes_sent: Registered<BytesSent>,
+) -> crate::Result<T::Client>
+where
+    T: ClientBuilder,
+{
+    // Wrap the HTTP client so that the bytes of successful requests are counted.
+    let http_client = AwsHttpClient {
+        http: connector(proxy, tls_options)?,
+        bytes_sent,
+    };
+    build_client::<T, _>(
+        builder,
+        auth,
+        region,
+        endpoint,
+        proxy,
+        tls_options,
+        timeout,
+        http_client,
+    )
+    .await
+    .map(|(client, _)| client)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_client<T, H>(
+    builder: &T,
+    auth: &AwsAuthentication,
+    region: Option<Region>,
+    endpoint: Option<String>,
+    proxy: &ProxyConfig,
+    tls_options: Option<&TlsConfig>,
+    timeout: Option<&AwsTimeout>,
+    http_client: H,
+) -> crate::Result<(T::Client, Region)>
+where
+    T: ClientBuilder,
+    H: HttpClient + 'static,
+{
     let retry_config = RetryConfig::standard();
 
     // The default credentials chains will look for a region if not given but we'd like to
@@ -200,17 +267,9 @@ where
     let provider_config =
         aws_config::provider_config::ProviderConfig::empty().with_region(Some(region.clone()));
 
-    let connector = connector(proxy, tls_options)?;
-
-    // Create a custom http connector that will emit the required metrics for us.
-    let connector = AwsHttpClient {
-        http: connector,
-        region: region.clone(),
-    };
-
     // Build the configuration first.
     let mut config_builder = SdkConfig::builder()
-        .http_client(connector)
+        .http_client(http_client)
         .sleep_impl(Arc::new(TokioSleep::new()))
         .identity_cache(auth.credentials_cache().await?)
         .credentials_provider(
@@ -315,7 +374,7 @@ pub async fn sign_request(
 #[derive(Debug)]
 struct AwsHttpClient<T> {
     http: T,
-    region: Region,
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl<T> HttpClient for AwsHttpClient<T>
@@ -330,7 +389,7 @@ where
         let http_connector = self.http.http_connector(settings, components);
 
         SharedHttpConnector::new(AwsConnector {
-            region: self.region.clone(),
+            bytes_sent: self.bytes_sent.clone(),
             http: http_connector,
         })
     }
@@ -339,7 +398,7 @@ where
 #[derive(Clone, Debug)]
 struct AwsConnector<T> {
     http: T,
-    region: Region,
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl<T> HttpConnector for AwsConnector<T>
@@ -347,26 +406,23 @@ where
     T: HttpConnector,
 {
     fn call(&self, req: HttpRequest) -> HttpConnectorFuture {
-        let bytes_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let measured_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let req = req.map(|body| {
-            let bytes_sent = Arc::clone(&bytes_sent);
+            let measured_bytes = Arc::clone(&measured_bytes);
             body.map_preserve_contents(move |body| {
-                let body = MeasuredBody::new(body, Arc::clone(&bytes_sent));
+                let body = MeasuredBody::new(body, Arc::clone(&measured_bytes));
                 SdkBody::from_body_0_4(BoxBody::new(body))
             })
         });
 
         let fut = self.http.call(req);
-        let region = self.region.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         HttpConnectorFuture::new(fut.inspect(move |result| {
-            let byte_size = bytes_sent.load(Ordering::Relaxed);
+            let byte_size = measured_bytes.load(Ordering::Relaxed);
             if let Ok(result) = result {
                 if result.status().is_success() {
-                    emit!(AwsBytesSent {
-                        byte_size,
-                        region: Some(region),
-                    });
+                    bytes_sent.emit(ByteSize(byte_size));
                 }
             }
         }))
@@ -416,5 +472,102 @@ impl Body for MeasuredBody {
         _cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
         Poll::Ready(Ok(None))
+    }
+}
+
+#[cfg(test)]
+mod byte_counting_tests {
+    use aws_types::region::Region;
+    use http::StatusCode;
+
+    use super::*;
+    use crate::{
+        common::sqs::SqsClientBuilder,
+        config::SinkContext,
+        sinks::util::test::build_test_server_status,
+        test_util::{
+            components::{init_test, sent_bytes_total},
+            next_addr,
+        },
+    };
+
+    /// Sends one SQS request to a local server that answers with `status`, with a sink client when
+    /// `bytes_sent` is given and a plain client otherwise, and waits for the SDK to finish with it.
+    /// The SDK may not parse the empty answer, which is fine: only the request bytes matter here.
+    async fn send_one_request(status: StatusCode, bytes_sent: Option<Registered<BytesSent>>) {
+        let addr = next_addr();
+        let (_requests, trigger, server) = build_test_server_status(addr, status);
+        tokio::spawn(server);
+
+        let auth = AwsAuthentication::test_auth();
+        let endpoint = Some(format!("http://{addr}"));
+        let region = Some(Region::new("us-east-1"));
+        let proxy = ProxyConfig::default();
+        let client = match bytes_sent {
+            Some(bytes_sent) => {
+                create_sink_client::<SqsClientBuilder>(
+                    &SqsClientBuilder {},
+                    &auth,
+                    region,
+                    endpoint,
+                    &proxy,
+                    None,
+                    None,
+                    bytes_sent,
+                )
+                .await
+            }
+            None => {
+                create_client::<SqsClientBuilder>(
+                    &SqsClientBuilder {},
+                    &auth,
+                    region,
+                    endpoint,
+                    &proxy,
+                    None,
+                    None,
+                )
+                .await
+            }
+        }
+        .unwrap();
+
+        let _ = client
+            .send_message()
+            .queue_url(format!("http://{addr}/000000000000/q"))
+            .message_body("hello")
+            .send()
+            .await;
+        drop(trigger);
+    }
+
+    #[tokio::test]
+    async fn sink_client_exists_at_zero_then_counts_successful_requests() {
+        init_test();
+
+        // The handle is created before the client sends anything.
+        let handle = SinkContext::default().bytes_sent();
+        assert_eq!(sent_bytes_total(), Some(0.0));
+
+        send_one_request(StatusCode::OK, Some(handle)).await;
+        assert!(sent_bytes_total().unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn sink_client_does_not_count_failed_requests() {
+        init_test();
+
+        let handle = SinkContext::default().bytes_sent();
+        // 400 is not retried by the SDK, so exactly one failed request is sent.
+        send_one_request(StatusCode::BAD_REQUEST, Some(handle)).await;
+        assert_eq!(sent_bytes_total(), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn plain_client_never_creates_the_series() {
+        init_test();
+
+        send_one_request(StatusCode::OK, None).await;
+        assert_eq!(sent_bytes_total(), None);
     }
 }

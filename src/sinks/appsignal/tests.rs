@@ -22,8 +22,7 @@ async fn component_spec_compliance() {
         .expect("config should be valid");
     config.endpoint = mock_endpoint.to_string();
 
-    let context = SinkContext::default();
-    let sink_future = async { config.build(context).await.unwrap().0 };
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let event = Event::Log(LogEvent::from("simple message"));
     build_run_and_assert_sink_compliance(sink_future, stream::once(ready(event)), &HTTP_SINK_TAGS)
