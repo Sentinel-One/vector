@@ -20,6 +20,7 @@ use tracing::{Event, Subscriber};
 use tracing_limit::RateLimitedLayer;
 use tracing_subscriber::{
     filter::LevelFilter,
+    fmt::writer::MakeWriterExt,
     layer::{Context, SubscriberExt},
     registry::LookupSpan,
     util::SubscriberInitExt,
@@ -56,7 +57,38 @@ fn metrics_layer_enabled() -> bool {
     !matches!(std::env::var("DISABLE_INTERNAL_METRICS_TRACING_INTEGRATION"), Ok(x) if x == "true")
 }
 
-pub fn init(color: bool, json: bool, levels: &str, internal_log_rate_limit: u64) {
+/// Controls whether the console log output is written.
+///
+/// Initialized from the `--disable-console-logs` flag and re-enabled via
+/// [`enable_console_output`] once topology shutdown begins, so shutdown-phase
+/// logs — which the `internal_logs` source can no longer capture after it stops
+/// reading — remain visible on the console.
+static CONSOLE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Returns whether console log output is currently enabled.
+///
+/// Used as the console writer's per-event predicate (see [`init`]): when it
+/// returns `false`, the writer discards the event.
+fn console_enabled() -> bool {
+    CONSOLE_ENABLED.load(Ordering::Acquire)
+}
+
+/// Re-enables console log output at runtime.
+///
+/// Called when the topology begins shutting down. When console logging was
+/// disabled via `--disable-console-logs`, this restores stderr output for the
+/// shutdown phase; when it was already enabled, this is a no-op.
+pub fn enable_console_output() {
+    CONSOLE_ENABLED.store(true, Ordering::Release);
+}
+
+pub fn init(
+    color: bool,
+    json: bool,
+    levels: &str,
+    internal_log_rate_limit: u64,
+    disable_console: bool,
+) {
     let fmt_filter = tracing_subscriber::filter::Targets::from_str(levels).expect(
         "logging filter targets were not formatted correctly or did not specify a valid level",
     );
@@ -89,8 +121,21 @@ pub fn init(color: bool, json: bool, levels: &str, internal_log_rate_limit: u64)
         subscriber.with(allocation_layer)
     };
 
+    // The console formatter is an independent layer from the `BroadcastLayer`
+    // that feeds the `internal_logs` source, so toggling it never affects
+    // `internal_logs`. Both formats write to stderr (stdout is reserved for
+    // pipeline output such as the `console` sink). The writer is gated on
+    // `console_enabled()`: while console logging is disabled it discards events
+    // (`OptionalWriter::none()`), and the gate is re-enabled at shutdown via
+    // `enable_console_output()` so shutdown-phase logs stay visible.
+    CONSOLE_ENABLED.store(!disable_console, Ordering::Release);
+    let console_writer = std::io::stderr.with_filter(|_meta| console_enabled());
+
     if json {
-        let formatter = tracing_subscriber::fmt::layer().json().flatten_event(true);
+        let formatter = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(console_writer);
 
         #[cfg(test)]
         let formatter = formatter.with_test_writer();
@@ -103,7 +148,7 @@ pub fn init(color: bool, json: bool, levels: &str, internal_log_rate_limit: u64)
     } else {
         let formatter = tracing_subscriber::fmt::layer()
             .with_ansi(color)
-            .with_writer(std::io::stderr);
+            .with_writer(console_writer);
 
         #[cfg(test)]
         let formatter = formatter.with_test_writer();
@@ -372,5 +417,204 @@ impl tracing::field::Visit for SpanFields {
 
     fn record_debug(&mut self, field: &tracing_core::Field, value: &dyn std::fmt::Debug) {
         self.record(field, format!("{:?}", value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+    use std::thread;
+
+    use super::{console_enabled, enable_console_output, CONSOLE_ENABLED};
+
+    // `CONSOLE_ENABLED` is a process-global. These tests both read and write it,
+    // so when several of them share a process (as under plain `cargo test`) they
+    // must not run concurrently or they would clobber each other's assertions.
+    // This lock serializes them; each test also restores the flag on exit via
+    // `save_gate`. (Under `cargo-nextest`, the fork's runner, every test gets its
+    // own process, so this is simply a no-op safety net.)
+    static GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn gate_guard() -> MutexGuard<'static, ()> {
+        // Tolerate poisoning: a panic in one test must not wedge the others.
+        GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Restores `CONSOLE_ENABLED` to its captured value when dropped, even if the
+    /// test panics.
+    struct RestoreGate(bool);
+
+    impl Drop for RestoreGate {
+        fn drop(&mut self) {
+            CONSOLE_ENABLED.store(self.0, Ordering::Release);
+        }
+    }
+
+    fn save_gate() -> RestoreGate {
+        RestoreGate(CONSOLE_ENABLED.load(Ordering::Acquire))
+    }
+
+    /// `enable_console_output` flips the gate on, and it is idempotent.
+    #[test]
+    fn enable_console_output_sets_the_gate() {
+        let _lock = gate_guard();
+        let _restore = save_gate();
+
+        // Simulate `--disable-console-logs`.
+        CONSOLE_ENABLED.store(false, Ordering::Release);
+        assert!(!console_enabled(), "gate should start disabled");
+
+        enable_console_output();
+        assert!(
+            console_enabled(),
+            "gate should be enabled after shutdown hook"
+        );
+
+        // Idempotent: calling again keeps it enabled.
+        enable_console_output();
+        assert!(console_enabled());
+    }
+
+    /// End-to-end at the layer level: the console writer discards output while the
+    /// gate is disabled, then emits once it is re-enabled (the shutdown path).
+    /// Wired exactly like `init` — `writer.with_filter(|_| console_enabled())` —
+    /// but capturing into a buffer instead of writing to stderr.
+    #[test]
+    fn console_writer_suppresses_while_disabled_then_emits_after_enable() {
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::fmt::writer::{MakeWriter, MakeWriterExt};
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+
+        // Captures everything the console layer writes so we can assert on it.
+        #[derive(Clone)]
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let _lock = gate_guard();
+        let _restore = save_gate();
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        // Same wiring as `init`: the writer is gated on `console_enabled()`.
+        let writer = CaptureWriter(Arc::clone(&buf)).with_filter(|_meta| console_enabled());
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_filter(LevelFilter::INFO);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            CONSOLE_ENABLED.store(false, Ordering::Release);
+            tracing::info!("while-disabled");
+            enable_console_output(); // the shutdown hook
+            tracing::info!("after-enable");
+        });
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !out.contains("while-disabled"),
+            "the writer must discard output while the gate is disabled; got: {out:?}"
+        );
+        assert!(
+            out.contains("after-enable"),
+            "the writer must emit once the gate is re-enabled; got: {out:?}"
+        );
+    }
+
+    /// Race coverage: many threads concurrently read the gate (`console_enabled`,
+    /// the per-event filter path) while others flip it in both directions —
+    /// including the shutdown hook. No thread may panic, and the atomic must never
+    /// tear, regardless of how reads and writes interleave.
+    #[test]
+    fn concurrent_gate_access_never_panics() {
+        let _lock = gate_guard();
+        let _restore = save_gate();
+
+        const THREADS: usize = 16;
+        const ITERS: usize = 5_000;
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait(); // maximize overlap
+                    for i in 0..ITERS {
+                        match t % 3 {
+                            // Readers: the hot per-event filter check. `black_box`
+                            // keeps the read from being optimized away.
+                            0 => {
+                                std::hint::black_box(console_enabled());
+                            }
+                            // Writers: flip the gate both ways for maximum contention.
+                            1 => CONSOLE_ENABLED.store(i % 2 == 0, Ordering::Release),
+                            // The shutdown hook, racing everything else.
+                            _ => enable_console_output(),
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("no thread may panic under concurrent gate access");
+        }
+
+        // With all threads joined and no concurrent writers, the shutdown hook
+        // leaves the gate enabled.
+        enable_console_output();
+        assert!(console_enabled());
+    }
+
+    /// Visibility/idempotency under concurrency: many threads calling the shutdown
+    /// hook at once converge to "enabled", and the final `Release` store is observed
+    /// by a subsequent `Acquire` read.
+    #[test]
+    fn concurrent_enable_converges_to_enabled() {
+        let _lock = gate_guard();
+        let _restore = save_gate();
+
+        CONSOLE_ENABLED.store(false, Ordering::Release);
+
+        const THREADS: usize = 32;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    enable_console_output();
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("enable_console_output must not panic");
+        }
+
+        assert!(
+            console_enabled(),
+            "concurrent enable calls must leave the gate enabled"
+        );
     }
 }
