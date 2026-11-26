@@ -6,6 +6,7 @@ use rdkafka::{
 use snafu::{ResultExt, Snafu};
 use tokio::time::Duration;
 use tracing::Span;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vrl::path::OwnedTargetPath;
 
 use super::config::KafkaSinkConfig;
@@ -44,7 +45,10 @@ pub(crate) fn create_producer(
 }
 
 impl KafkaSink {
-    pub(crate) fn new(config: KafkaSinkConfig) -> crate::Result<Self> {
+    pub(crate) fn new(
+        config: KafkaSinkConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<Self> {
         let producer_config = config.to_rdkafka()?;
         let producer = create_producer(producer_config)?;
         let transformer = config.encoding.transformer();
@@ -55,7 +59,7 @@ impl KafkaSink {
             headers_key: config.headers_key.map(|key| key.0),
             transformer,
             encoder,
-            service: KafkaService::new(producer),
+            service: KafkaService::new(producer, bytes_sent),
             topic: config.topic,
             key_field: config.key_field.map(|key| key.0),
         })
@@ -96,7 +100,6 @@ impl KafkaSink {
                 }
             })
             .into_driver(self.service)
-            .protocol("kafka")
             .run()
             .await
     }

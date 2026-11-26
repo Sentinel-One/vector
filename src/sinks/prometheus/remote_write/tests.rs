@@ -10,7 +10,10 @@ use super::*;
 use crate::{
     config::SinkContext,
     event::{MetricKind, MetricValue},
-    sinks::{prometheus::remote_write::config::RemoteWriteConfig, util::test::build_test_server},
+    sinks::{
+        prometheus::remote_write::config::RemoteWriteConfig,
+        util::test::{build_test_server, build_test_server_status},
+    },
     test_util::{
         self,
         components::{assert_sink_compliance, HTTP_SINK_TAGS},
@@ -227,6 +230,47 @@ async fn doesnt_aggregate_batches() {
     assert_eq!(req.timeseries[0].labels, labels!("__name__" => "counter-2"));
     assert_eq!(req.timeseries[0].samples.len(), 1);
     assert_eq!(req.timeseries[0].samples[0].value, 27.0);
+}
+
+#[tokio::test]
+async fn sent_bytes_series_exists_before_any_request() {
+    test_util::components::init_test();
+
+    // Nothing listens on this address, and no event is sent.
+    let addr = test_util::next_addr();
+    let config = format!("endpoint = \"http://{addr}/write\"");
+    let config: RemoteWriteConfig = toml::from_str(&config).unwrap();
+    let (_sink, _) = config.build(SinkContext::default()).await.unwrap();
+
+    // The series is there, at zero, as soon as the sink is built.
+    assert_eq!(test_util::components::sent_bytes_total(), Some(0.0));
+}
+
+#[tokio::test]
+async fn sent_bytes_counts_only_successful_requests() {
+    test_util::components::init_test();
+
+    // Builds a sink that sends one event to a server answering with `status`.
+    let send_one = |status: http::StatusCode| async move {
+        let addr = test_util::next_addr();
+        let (_rx, trigger, server) = build_test_server_status(addr, status);
+        tokio::spawn(server);
+
+        let config = format!("endpoint = \"http://{addr}/write\"");
+        let config: RemoteWriteConfig = toml::from_str(&config).unwrap();
+        let (sink, _) = config.build(SinkContext::default()).await.unwrap();
+        sink.run_events(vec![create_event("gauge-1".into(), 1.0)])
+            .await
+            .unwrap();
+        drop(trigger);
+    };
+
+    // A rejected request adds nothing to the counter.
+    send_one(http::StatusCode::BAD_REQUEST).await;
+    assert_eq!(test_util::components::sent_bytes_total(), Some(0.0));
+
+    send_one(http::StatusCode::OK).await;
+    assert!(test_util::components::sent_bytes_total().unwrap() > 0.0);
 }
 
 async fn send_request(config: &str, events: Vec<Event>) -> Vec<(HeaderMap, proto::WriteRequest)> {

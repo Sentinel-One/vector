@@ -4,11 +4,12 @@ use serde::{de, Deserialize, Deserializer};
 use tower::ServiceBuilder;
 use vector_lib::codecs::JsonSerializerConfig;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::schema;
 use vrl::value::Kind;
 
 use crate::{
-    aws::{create_client, AwsAuthentication, ClientBuilder, RegionOrEndpoint},
+    aws::{create_sink_client, AwsAuthentication, ClientBuilder, RegionOrEndpoint},
     codecs::{Encoder, EncodingConfig},
     config::{
         AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig,
@@ -167,8 +168,12 @@ pub struct CloudwatchLogsSinkConfig {
 }
 
 impl CloudwatchLogsSinkConfig {
-    pub async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<CloudwatchLogsClient> {
-        create_client::<CloudwatchLogsClientBuilder>(
+    pub async fn create_client(
+        &self,
+        proxy: &ProxyConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<CloudwatchLogsClient> {
+        create_sink_client::<CloudwatchLogsClientBuilder>(
             &CloudwatchLogsClientBuilder {},
             &self.auth,
             self.region.region(),
@@ -176,6 +181,7 @@ impl CloudwatchLogsSinkConfig {
             proxy,
             self.tls.as_ref(),
             None,
+            bytes_sent,
         )
         .await
     }
@@ -187,7 +193,7 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let batcher_settings = self.batch.into_batcher_settings()?;
         let request_settings = self.request.tower.into_settings();
-        let client = self.create_client(cx.proxy()).await?;
+        let client = self.create_client(cx.proxy(), cx.bytes_sent()).await?;
         let svc = ServiceBuilder::new()
             .settings(request_settings, CloudwatchRetryLogic::new())
             .service(CloudwatchLogsPartitionSvc::new(
@@ -267,5 +273,27 @@ mod tests {
     #[test]
     fn test_generate_config() {
         crate::test_util::test_generate_config::<CloudwatchLogsSinkConfig>();
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: CloudwatchLogsSinkConfig = toml::from_str(
+            r#"
+            group_name = "g"
+            stream_name = "s"
+            encoding.codec = "json"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:1"
+            auth.access_key_id = "x"
+            auth.secret_access_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

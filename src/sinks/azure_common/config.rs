@@ -69,7 +69,6 @@ impl RetryLogic for AzureBlobRetryLogic {
 pub struct AzureBlobResponse {
     pub inner: PutBlockBlobResponse,
     pub events_byte_size: GroupedCountByteSize,
-    pub byte_size: usize,
 }
 
 impl DriverResponse for AzureBlobResponse {
@@ -79,10 +78,6 @@ impl DriverResponse for AzureBlobResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.events_byte_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.byte_size)
     }
 }
 

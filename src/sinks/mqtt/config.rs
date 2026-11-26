@@ -145,9 +145,9 @@ impl_generate_config_from_default!(MqttSinkConfig);
 #[async_trait::async_trait]
 #[typetag::serde(name = "mqtt")]
 impl SinkConfig for MqttSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let connector = self.build_connector()?;
-        let sink = MqttSink::new(self, connector.clone())?;
+        let sink = MqttSink::new(self, connector.clone(), cx.bytes_sent())?;
 
         Ok((
             VectorSink::from_event_streamsink(sink),
@@ -222,5 +222,18 @@ mod test {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<MqttSinkConfig>();
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: MqttSinkConfig = toml::from_str(
+            r#"
+            host = "127.0.0.1"
+            topic = "t"
+            encoding.codec = "json"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

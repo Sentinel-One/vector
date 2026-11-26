@@ -108,9 +108,12 @@ pub static TRANSFORM_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| Componen
 /// The component test specification for sinks that are push-based.
 pub static SINK_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| {
     ComponentTests {
-        events: &["BytesSent", "EventsSent"], // EventsReceived is emitted in the topology
-        tagged_counters: &["component_sent_bytes_total"],
+        // EventsReceived is emitted in the topology. The bytes counter is held by the sink's
+        // service and has no `BytesSent` event or `protocol`/`endpoint` tags.
+        events: &["EventsSent"],
+        tagged_counters: &[],
         untagged_counters: &[
+            "component_sent_bytes_total",
             "component_sent_events_total",
             "component_sent_event_bytes_total",
         ],
@@ -120,7 +123,10 @@ pub static SINK_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| {
 /// The component test specification for sinks with source and service identification.
 pub static DATA_VOLUME_SINK_TESTS: LazyLock<ComponentTests> = LazyLock::new(|| {
     ComponentTests {
-        events: &["BytesSent", "EventsSent"], // EventsReceived is emitted in the topology
+        // EventsReceived is emitted in the topology. `BytesSent` is no longer required: a sink
+        // that holds the handle from `SinkContext::bytes_sent` registers it at build time, before
+        // the compliance wrapper clears the recorded event names.
+        events: &["EventsSent"],
         tagged_counters: &[
             "component_sent_events_total",
             "component_sent_event_bytes_total",
@@ -171,6 +177,35 @@ impl ComponentTests {
 pub fn init_test() {
     super::trace_init();
     event_test_util::clear_recorded_events();
+}
+
+/// Value of `component_sent_bytes_total` in this test's metrics registry, or `None` if the series
+/// does not exist. Call `init_test()` first so the registry belongs to this test.
+pub fn sent_bytes_total() -> Option<f64> {
+    Controller::get()
+        .expect("metrics are initialized")
+        .capture_metrics()
+        .into_iter()
+        .find(|metric| metric.name() == "component_sent_bytes_total")
+        .map(|metric| match metric.value() {
+            MetricValue::Counter { value } => *value,
+            other => panic!("unexpected metric value {other:?}"),
+        })
+}
+
+/// Builds the sink from `config` and asserts that its `component_sent_bytes_total` series exists at
+/// zero as soon as it is built, before any event or connection.
+///
+/// The recorder is installed first, so the series is created in this test's registry.
+pub async fn assert_sent_bytes_series_after_build(config: impl crate::config::SinkConfig) {
+    init_test();
+
+    let (_sink, _healthcheck) = config
+        .build(crate::config::SinkContext::default())
+        .await
+        .expect("sink should build");
+
+    assert_eq!(sent_bytes_total(), Some(0.0));
 }
 
 /// Tests if the given metric contains all the given tag names
@@ -439,6 +474,41 @@ where
     I: Into<EventArray>,
 {
     assert_sink_compliance(tags, async move {
+        let events = events.map(Into::into);
+        sink.run(events).await.expect("Running sink failed")
+    })
+    .await;
+}
+
+/// Builds the sink inside the compliance wrapper, after it resets the metrics registry, so handles
+/// registered at build time (`SinkContext::bytes_sent`) are not wiped. Pass an unstarted `async`
+/// block, not an already built sink.
+pub async fn build_run_and_assert_sink_compliance<B, S, I>(build: B, events: S, tags: &[&str])
+where
+    B: Future<Output = VectorSink>,
+    S: Stream<Item = I> + Send,
+    I: Into<EventArray>,
+{
+    assert_sink_compliance(tags, async move {
+        let sink = build.await;
+        let events = events.map(Into::into);
+        sink.run(events).await.expect("Running sink failed")
+    })
+    .await;
+}
+
+/// Same as `build_run_and_assert_sink_compliance`, with the data volume assertions.
+pub async fn build_run_and_assert_data_volume_sink_compliance<B, S, I>(
+    build: B,
+    events: S,
+    tags: &[&str],
+) where
+    B: Future<Output = VectorSink>,
+    S: Stream<Item = I> + Send,
+    I: Into<EventArray>,
+{
+    assert_data_volume_sink_compliance(tags, async move {
+        let sink = build.await;
         let events = events.map(Into::into);
         sink.run(events).await.expect("Running sink failed")
     })

@@ -20,7 +20,6 @@ impl Client<SendMessageError> for SqsMessagePublisher {
     async fn send_message(
         &self,
         entry: SendMessageEntry,
-        byte_size: usize,
     ) -> Result<SendMessageResponse, SdkError<SendMessageError, HttpResponse>> {
         self.client
             .send_message()
@@ -30,7 +29,6 @@ impl Client<SendMessageError> for SqsMessagePublisher {
             .queue_url(self.queue_url.clone())
             .send()
             .map_ok(|_| SendMessageResponse {
-                byte_size,
                 json_byte_size: entry
                     .metadata
                     .events_estimated_json_encoded_byte_size()

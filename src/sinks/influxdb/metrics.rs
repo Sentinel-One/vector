@@ -4,6 +4,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, stream, SinkExt};
 use tower::Service;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::{
     event::metric::{MetricSketch, MetricTags, Quantile},
     ByteSizeOf, EstimatedJsonEncodedSizeOf,
@@ -128,7 +129,7 @@ impl SinkConfig for InfluxDbConfig {
             client.clone(),
         )?;
         validate_quantiles(&self.quantiles)?;
-        let sink = InfluxDbSvc::new(self.clone(), client)?;
+        let sink = InfluxDbSvc::new(self.clone(), client, cx.bytes_sent())?;
         Ok((sink, healthcheck))
     }
 
@@ -142,7 +143,11 @@ impl SinkConfig for InfluxDbConfig {
 }
 
 impl InfluxDbSvc {
-    pub fn new(config: InfluxDbConfig, client: HttpClient) -> crate::Result<VectorSink> {
+    pub fn new(
+        config: InfluxDbConfig,
+        client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<VectorSink> {
         let settings = influxdb_settings(
             config.influxdb1_settings.clone(),
             config.influxdb2_settings.clone(),
@@ -157,7 +162,8 @@ impl InfluxDbSvc {
 
         let uri = settings.write_uri(endpoint)?;
 
-        let http_service = HttpBatchService::new(client, create_build_request(uri, token.inner()));
+        let http_service =
+            HttpBatchService::new(client, create_build_request(uri, token.inner()), bytes_sent);
 
         let influxdb_http_service = InfluxDbSvc {
             config,
@@ -1121,7 +1127,7 @@ mod integration_tests {
             version: "0.1.0".to_string(),
         };
         let client = HttpClient::new(None, cx.proxy(), &app_info).unwrap();
-        let sink = InfluxDbSvc::new(config, client).unwrap();
+        let sink = InfluxDbSvc::new(config, client, cx.bytes_sent()).unwrap();
         run_and_assert_sink_compliance(sink, stream::iter(events), &HTTP_SINK_TAGS).await;
 
         let mut body = std::collections::HashMap::new();

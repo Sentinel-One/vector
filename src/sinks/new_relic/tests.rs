@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, num::NonZeroU32};
+use std::{convert::TryFrom, future::Future, num::NonZeroU32};
 
 use chrono::Utc;
 use futures::{future::ready, stream};
@@ -13,7 +13,7 @@ use crate::{
     event::{Event, LogEvent, Metric, MetricKind, MetricValue},
     test_util::{
         components::{
-            run_and_assert_data_volume_sink_compliance, run_and_assert_sink_compliance,
+            build_run_and_assert_data_volume_sink_compliance, build_run_and_assert_sink_compliance,
             DATA_VOLUME_SINK_TAGS, SINK_TAGS,
         },
         http::{always_200_response, spawn_blackhole_http_server},
@@ -25,7 +25,9 @@ fn generate_config() {
     crate::test_util::test_generate_config::<NewRelicConfig>();
 }
 
-async fn sink() -> (VectorSink, Event) {
+/// The sink is built by the returned future, which the compliance wrapper polls after it has set up
+/// the metrics recorder.
+async fn sink() -> (impl Future<Output = VectorSink>, Event) {
     let mock_endpoint = spawn_blackhole_http_server(always_200_response).await;
 
     let config = NewRelicConfig::generate_config().to_string();
@@ -33,18 +35,17 @@ async fn sink() -> (VectorSink, Event) {
         .expect("config should be valid");
     config.override_uri = Some(mock_endpoint);
 
-    let context = SinkContext::default();
-    let (sink, _healthcheck) = config.build(context).await.unwrap();
+    let sink_future = async move { config.build(SinkContext::default()).await.unwrap().0 };
 
     let event = Event::Log(LogEvent::from("simple message"));
 
-    (sink, event)
+    (sink_future, event)
 }
 
 #[tokio::test]
 async fn component_spec_compliance() {
-    let (sink, event) = sink().await;
-    run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+    let (sink_future, event) = sink().await;
+    build_run_and_assert_sink_compliance(sink_future, stream::once(ready(event)), &SINK_TAGS).await;
 }
 
 #[tokio::test]
@@ -61,9 +62,9 @@ async fn component_spec_compliance_data_volume() {
         true,
     );
 
-    let (sink, event) = sink().await;
-    run_and_assert_data_volume_sink_compliance(
-        sink,
+    let (sink_future, event) = sink().await;
+    build_run_and_assert_data_volume_sink_compliance(
+        sink_future,
         stream::once(ready(event)),
         &DATA_VOLUME_SINK_TAGS,
     )

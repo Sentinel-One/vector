@@ -3,6 +3,7 @@ use http::{header::AUTHORIZATION, Request, Uri};
 use hyper::Body;
 use tower::ServiceBuilder;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::sensitive_string::SensitiveString;
 use vector_lib::{
     config::{proxy::ProxyConfig, AcknowledgementsConfig, DataType, Input},
@@ -91,13 +92,18 @@ impl AppsignalConfig {
         Ok(client)
     }
 
-    pub(super) fn build_sink(&self, http_client: HttpClient) -> crate::Result<VectorSink> {
+    pub(super) fn build_sink(
+        &self,
+        http_client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<VectorSink> {
         let batch_settings = self.batch.into_batcher_settings()?;
 
         let endpoint = endpoint_uri(&self.endpoint, "vector/events")?;
         let push_api_key = self.push_api_key.clone();
         let compression = self.compression;
-        let service = AppsignalService::new(http_client, endpoint, push_api_key, compression);
+        let service =
+            AppsignalService::new(http_client, endpoint, push_api_key, compression, bytes_sent);
 
         let request_opts = self.request;
         let request_settings = request_opts.into_settings();
@@ -132,7 +138,7 @@ impl SinkConfig for AppsignalConfig {
             client.clone(),
         )
         .boxed();
-        let sink = self.build_sink(client)?;
+        let sink = self.build_sink(client, cx.bytes_sent())?;
 
         Ok((sink, healthcheck))
     }

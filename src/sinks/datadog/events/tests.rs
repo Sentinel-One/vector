@@ -13,7 +13,7 @@ use vector_lib::event::{BatchNotifier, BatchStatus};
 
 use super::*;
 use crate::{
-    config::SinkConfig,
+    config::{SinkConfig, SinkContext},
     event::EventArray,
     sinks::util::test::{build_test_server_status, load_sink},
     test_util::{
@@ -55,8 +55,6 @@ async fn start_test(
     let endpoint = format!("http://{}", addr);
     config.dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
-
     let (rx, _trigger, server) = build_test_server_status(addr, http_status);
     tokio::spawn(server);
 
@@ -64,8 +62,12 @@ async fn start_test(
     let (expected, events) = random_events_with_stream(100, 10, Some(batch));
 
     if batch_status == BatchStatus::Delivered {
-        components::run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+        // Built inside the compliance wrapper, after it installs the metrics recorder.
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
+        components::build_run_and_assert_sink_compliance(sink_future, events, &HTTP_SINK_TAGS)
+            .await;
     } else {
+        let (sink, _) = config.build(cx).await.unwrap();
         components::run_and_assert_sink_error(sink, events, &COMPONENT_ERROR_TAGS).await;
     }
 
@@ -109,7 +111,7 @@ async fn handles_failure() {
 
 #[tokio::test]
 async fn api_key_in_metadata() {
-    let (mut config, cx) = load_sink::<DatadogEventsConfig>(indoc! {r#"
+    let (mut config, _) = load_sink::<DatadogEventsConfig>(indoc! {r#"
             default_api_key = "atoken"
         "#})
     .unwrap();
@@ -120,7 +122,7 @@ async fn api_key_in_metadata() {
     let endpoint = format!("http://{}", addr);
     config.dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let (rx, _trigger, server) = build_test_server_status(addr, StatusCode::OK);
     tokio::spawn(server);
@@ -135,7 +137,7 @@ async fn api_key_in_metadata() {
         events
     });
 
-    components::run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+    components::build_run_and_assert_sink_compliance(sink_future, events, &HTTP_SINK_TAGS).await;
     let output = rx.take(expected.len()).collect::<Vec<_>>().await;
 
     for (i, val) in output.iter().enumerate() {

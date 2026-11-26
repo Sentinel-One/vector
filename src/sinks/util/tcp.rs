@@ -17,6 +17,7 @@ use tokio::{
 };
 use tokio_util::codec::Encoder;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::json_size::JsonSize;
 use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
@@ -110,13 +111,14 @@ impl TcpSinkConfig {
             + Send
             + Sync
             + 'static,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let uri = self.address.parse::<http::Uri>()?;
         let host = uri.host().ok_or(SinkBuildError::MissingHost)?.to_string();
         let port = uri.port_u16().ok_or(SinkBuildError::MissingPort)?;
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
         let connector = TcpConnector::new(host, port, self.keepalive, tls, self.send_buffer_bytes);
-        let sink = TcpSink::new(connector.clone(), transformer, encoder);
+        let sink = TcpSink::new(connector.clone(), transformer, encoder, bytes_sent);
 
         Ok((
             VectorSink::from_event_streamsink(sink),
@@ -223,23 +225,36 @@ where
     connector: TcpConnector,
     transformer: Transformer,
     encoder: E,
+    /// Counts `component_sent_bytes_total`; each (re)connection gets a clone.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl<E> TcpSink<E>
 where
     E: Encoder<Event, Error = vector_lib::codecs::encoding::Error> + Clone + Send + Sync + 'static,
 {
-    const fn new(connector: TcpConnector, transformer: Transformer, encoder: E) -> Self {
+    fn new(
+        connector: TcpConnector,
+        transformer: Transformer,
+        encoder: E,
+        bytes_sent: Registered<BytesSent>,
+    ) -> Self {
         Self {
             connector,
             transformer,
             encoder,
+            bytes_sent,
         }
     }
 
     async fn connect(&self) -> BytesSink<MaybeTlsStream<TcpStream>> {
         let stream = self.connector.connect_backoff().await;
-        BytesSink::new(stream, Self::shutdown_check, SocketMode::Tcp)
+        BytesSink::new(
+            stream,
+            Self::shutdown_check,
+            SocketMode::Tcp,
+            self.bytes_sent.clone(),
+        )
     }
 
     fn shutdown_check(stream: &mut MaybeTlsStream<TcpStream>) -> ShutdownCheck {

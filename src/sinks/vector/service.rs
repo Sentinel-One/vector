@@ -10,24 +10,24 @@ use prost::Message;
 use tonic::{body::BoxBody, IntoRequest};
 use tower::Service;
 use tracing::warn;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
 use super::{config::VectorSinkAuthConfig, VectorSinkError};
 use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
-    internal_events::EndpointBytesSent,
     proto::vector as proto_vector,
-    sinks::util::{uri, AuthState},
+    sinks::util::AuthState,
     Error,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VectorService {
     pub client: proto_vector::Client<HyperSvc>,
-    pub protocol: String,
-    pub endpoint: String,
     auth: Option<Arc<AuthState>>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 pub struct VectorResponse {
@@ -73,8 +73,8 @@ impl VectorService {
         uri: Uri,
         compression: bool,
         auth: Option<VectorSinkAuthConfig>,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<Self> {
-        let (protocol, endpoint) = uri::protocol_endpoint(uri.clone());
         let mut proto_client = proto_vector::Client::new(HyperSvc {
             uri,
             client: hyper_client,
@@ -94,9 +94,8 @@ impl VectorService {
 
         Ok(Self {
             client: proto_client,
-            protocol,
-            endpoint,
             auth,
+            bytes_sent,
         })
     }
 
@@ -126,6 +125,7 @@ impl Service<VectorRequest> for VectorService {
     // Emission of internal events for errors and dropped events is handled upstream by the caller.
     fn call(&mut self, mut list: VectorRequest) -> Self::Future {
         let mut service = self.clone();
+        let bytes_sent = self.bytes_sent.clone();
         let byte_size = list.request.encoded_len();
         let metadata = std::mem::take(list.metadata_mut());
         let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
@@ -145,11 +145,7 @@ impl Service<VectorRequest> for VectorService {
                 .client
                 .push_events(request)
                 .map_ok(|_response| {
-                    emit!(EndpointBytesSent {
-                        byte_size,
-                        protocol: &service.protocol,
-                        endpoint: &service.endpoint,
-                    });
+                    bytes_sent.emit(ByteSize(byte_size));
 
                     VectorResponse { events_byte_size }
                 })

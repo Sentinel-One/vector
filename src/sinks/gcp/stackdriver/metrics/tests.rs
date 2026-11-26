@@ -9,7 +9,7 @@ use crate::{
     gcp::GcpAuthConfig,
     sinks::{prelude::*, util::test::build_test_server},
     test_util::{
-        components::{run_and_assert_sink_compliance, SINK_TAGS},
+        components::{build_run_and_assert_sink_compliance, SINK_TAGS},
         http::{always_200_response, spawn_blackhole_http_server},
         next_addr,
     },
@@ -34,15 +34,14 @@ async fn component_spec_compliance() {
     config.auth.api_key = Some("fake".to_string().into());
     config.endpoint = mock_endpoint.to_string();
 
-    let context = SinkContext::default();
-    let (sink, _healthcheck) = config.build(context).await.unwrap();
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let event = Event::Metric(Metric::new(
         "gauge-test",
         MetricKind::Absolute,
         MetricValue::Gauge { value: 1_f64 },
     ));
-    run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, stream::once(ready(event)), &SINK_TAGS).await;
 }
 
 #[tokio::test]
@@ -60,8 +59,7 @@ async fn sends_metric() {
     let (rx, trigger, server) = build_test_server(in_addr);
     tokio::spawn(server);
 
-    let context = SinkContext::default();
-    let (sink, _healthcheck) = config.build(context).await.unwrap();
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
     let timestamp = Utc::now();
 
     let event = Event::Metric(
@@ -72,7 +70,7 @@ async fn sends_metric() {
         )
         .with_timestamp(Some(timestamp)),
     );
-    run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, stream::once(ready(event)), &SINK_TAGS).await;
 
     drop(trigger);
 
@@ -121,8 +119,7 @@ async fn sends_multiple_metrics() {
     let (rx, trigger, server) = build_test_server(in_addr);
     tokio::spawn(server);
 
-    let context = SinkContext::default();
-    let (sink, _healthcheck) = config.build(context).await.unwrap();
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let timestamp1 = Utc::now();
     let timestamp2 = Utc::now();
@@ -145,7 +142,7 @@ async fn sends_multiple_metrics() {
             .with_timestamp(Some(timestamp2)),
         ),
     ];
-    run_and_assert_sink_compliance(sink, stream::iter(event), &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, stream::iter(event), &SINK_TAGS).await;
 
     drop(trigger);
 
@@ -208,8 +205,7 @@ async fn does_not_aggregate_metrics() {
     let (rx, trigger, server) = build_test_server(in_addr);
     tokio::spawn(server);
 
-    let context = SinkContext::default();
-    let (sink, _healthcheck) = config.build(context).await.unwrap();
+    let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
     let timestamp1 = Utc::now();
     let timestamp2 = Utc::now();
@@ -232,7 +228,7 @@ async fn does_not_aggregate_metrics() {
             .with_timestamp(Some(timestamp2)),
         ),
     ];
-    run_and_assert_sink_compliance(sink, stream::iter(event), &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, stream::iter(event), &SINK_TAGS).await;
 
     drop(trigger);
 

@@ -11,6 +11,7 @@ use http::{
 };
 use hyper::Body;
 use tracing::Instrument;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use super::{NewRelicCredentials, NewRelicSinkError};
 use crate::sinks::prelude::*;
@@ -55,15 +56,13 @@ impl DriverResponse for NewRelicApiResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         self.metadata.events_estimated_json_encoded_byte_size()
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.metadata.request_encoded_size())
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct NewRelicApiService {
     pub client: HttpClient,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    pub bytes_sent: Registered<BytesSent>,
 }
 
 impl Service<NewRelicApiRequest> for NewRelicApiService {
@@ -77,6 +76,7 @@ impl Service<NewRelicApiRequest> for NewRelicApiService {
 
     fn call(&mut self, request: NewRelicApiRequest) -> Self::Future {
         let mut client = self.client.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         let uri = request.credentials.get_uri();
 
@@ -99,10 +99,13 @@ impl Service<NewRelicApiRequest> for NewRelicApiService {
 
         Box::pin(async move {
             match client.call(http_request).in_current_span().await {
-                Ok(_) => Ok(NewRelicApiResponse {
-                    event_status: EventStatus::Delivered,
-                    metadata,
-                }),
+                Ok(_) => {
+                    bytes_sent.emit(ByteSize(metadata.request_encoded_size()));
+                    Ok(NewRelicApiResponse {
+                        event_status: EventStatus::Delivered,
+                        metadata,
+                    })
+                }
                 Err(_) => Err(NewRelicSinkError::new("HTTP request error")),
             }
         })

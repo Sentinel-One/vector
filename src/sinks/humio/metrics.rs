@@ -245,7 +245,7 @@ mod tests {
         sinks::util::test::{build_test_server, load_sink},
         test_util::{
             self,
-            components::{run_and_assert_sink_compliance, HTTP_SINK_TAGS},
+            components::{build_run_and_assert_sink_compliance, HTTP_SINK_TAGS},
         },
     };
 
@@ -276,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_json() {
-        let (mut config, cx) = load_sink::<HumioMetricsConfig>(indoc! {r#"
+        let (mut config, _) = load_sink::<HumioMetricsConfig>(indoc! {r#"
             token = "atoken"
             batch.max_events = 1
         "#})
@@ -287,7 +287,7 @@ mod tests {
         // to our local server
         config.endpoint = format!("http://{}", addr);
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
         let (rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);
@@ -326,7 +326,8 @@ mod tests {
         ];
 
         let len = metrics.len();
-        run_and_assert_sink_compliance(sink, stream::iter(metrics), &HTTP_SINK_TAGS).await;
+        build_run_and_assert_sink_compliance(sink_future, stream::iter(metrics), &HTTP_SINK_TAGS)
+            .await;
 
         let output = rx.take(len).collect::<Vec<_>>().await;
         assert_eq!(
@@ -341,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_value_tags() {
-        let (mut config, cx) = load_sink::<HumioMetricsConfig>(indoc! {r#"
+        let (mut config, _) = load_sink::<HumioMetricsConfig>(indoc! {r#"
             token = "atoken"
             batch.max_events = 1
             metric_tag_values = "full"
@@ -353,7 +354,7 @@ mod tests {
         // to our local server
         config.endpoint = format!("http://{}", addr);
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
         let (rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);
@@ -377,7 +378,8 @@ mod tests {
         )];
 
         let len = metrics.len();
-        run_and_assert_sink_compliance(sink, stream::iter(metrics), &HTTP_SINK_TAGS).await;
+        build_run_and_assert_sink_compliance(sink_future, stream::iter(metrics), &HTTP_SINK_TAGS)
+            .await;
 
         let output = rx.take(len).collect::<Vec<_>>().await;
         assert_eq!(

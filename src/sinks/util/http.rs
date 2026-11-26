@@ -20,19 +20,20 @@ use snafu::{ResultExt, Snafu};
 use tower::{Service, ServiceBuilder};
 use tower_http::decompression::DecompressionLayer;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use vector_lib::stream::batcher::limiter::ItemBatchSize;
 use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
 use super::{
     retries::{RetryAction, RetryLogic},
     sink::{self, Response as _},
-    uri, Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
+    Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
     TowerRequestSettings,
 };
 use crate::{
     event::Event,
     http::{HttpClient, HttpError},
-    internal_events::{EndpointBytesSent, SinkRequestBuildError},
+    internal_events::SinkRequestBuildError,
     sinks::prelude::*,
 };
 
@@ -88,6 +89,7 @@ where
         request_settings: TowerRequestSettings,
         batch_timeout: Duration,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
         Self::with_logic(
             sink,
@@ -96,6 +98,7 @@ where
             request_settings,
             batch_timeout,
             client,
+            bytes_sent,
         )
     }
 }
@@ -114,6 +117,7 @@ where
         request_settings: TowerRequestSettings,
         batch_timeout: Duration,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
         let sink = Arc::new(sink);
 
@@ -123,7 +127,7 @@ where
             Box::pin(async move { sink.build_request(b).await })
         };
 
-        let svc = HttpBatchService::new(client, request_builder);
+        let svc = HttpBatchService::new(client, request_builder, bytes_sent);
         let inner = request_settings.batch_sink(retry_logic, svc, batch, batch_timeout);
         let encoder = sink.build_encoder();
 
@@ -230,6 +234,7 @@ where
         request_settings: TowerRequestSettings,
         batch_timeout: Duration,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
         Self::with_retry_logic(
             sink,
@@ -238,6 +243,7 @@ where
             request_settings,
             batch_timeout,
             client,
+            bytes_sent,
         )
     }
 }
@@ -258,6 +264,7 @@ where
         request_settings: TowerRequestSettings,
         batch_timeout: Duration,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
         let sink = Arc::new(sink);
 
@@ -267,7 +274,7 @@ where
             Box::pin(async move { sink.build_request(b).await })
         };
 
-        let svc = HttpBatchService::new(client, request_builder);
+        let svc = HttpBatchService::new(client, request_builder, bytes_sent);
         let inner = request_settings.partition_sink(retry_logic, svc, batch, batch_timeout);
         let encoder = sink.build_encoder();
 
@@ -355,16 +362,22 @@ where
 pub struct HttpBatchService<F, B = Bytes> {
     inner: HttpClient<Body>,
     request_builder: Arc<dyn Fn(B) -> F + Send + Sync>,
+    /// Counts `component_sent_bytes_total`. The sink gets it from `SinkContext::bytes_sent()` in
+    /// `build()` and passes it in; the service holds it for its whole life, which keeps the series
+    /// present from startup and stops it expiring while the sink is idle.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl<F, B> HttpBatchService<F, B> {
     pub fn new(
         inner: HttpClient,
         request_builder: impl Fn(B) -> F + Send + Sync + 'static,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
         HttpBatchService {
             inner,
             request_builder: Arc::new(Box::new(request_builder)),
+            bytes_sent,
         }
     }
 }
@@ -385,6 +398,7 @@ where
     fn call(&mut self, body: B) -> Self::Future {
         let request_builder = Arc::clone(&self.request_builder);
         let http_client = self.inner.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let request = request_builder(body).await.inspect_err(|error| {
@@ -392,7 +406,6 @@ where
             })?;
             let byte_size = request.body().len();
             let request = request.map(Body::from);
-            let (protocol, endpoint) = uri::protocol_endpoint(request.uri().clone());
 
             let mut decompression_service = ServiceBuilder::new()
                 .layer(DecompressionLayer::new())
@@ -404,11 +417,7 @@ where
             let response = decompression_service.call(request).await?;
 
             if response.status().is_success() {
-                emit!(EndpointBytesSent {
-                    byte_size,
-                    protocol: &protocol,
-                    endpoint: &endpoint
-                });
+                bytes_sent.emit(ByteSize(byte_size));
             }
 
             let (parts, body) = response.into_parts();
@@ -426,6 +435,7 @@ impl<F, B> Clone for HttpBatchService<F, B> {
         Self {
             inner: self.inner.clone(),
             request_builder: Arc::clone(&self.request_builder),
+            bytes_sent: self.bytes_sent.clone(),
         }
     }
 }
@@ -671,10 +681,6 @@ impl DriverResponse for HttpResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.events_byte_size
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.raw_byte_size)
-    }
 }
 
 /// Creates a `RetryLogic` for use with `HttpResponse`.
@@ -712,17 +718,25 @@ impl<B, T: Send + 'static> HttpService<B, T>
 where
     B: HttpServiceRequestBuilder<T> + std::marker::Sync + std::marker::Send + 'static,
 {
-    pub fn new(http_client: HttpClient<Body>, http_request_builder: B) -> Self {
+    pub fn new(
+        http_client: HttpClient<Body>,
+        http_request_builder: B,
+        bytes_sent: Registered<BytesSent>,
+    ) -> Self {
         let http_request_builder = Arc::new(http_request_builder);
 
-        let batch_service = HttpBatchService::new(http_client, move |req: HttpRequest<T>| {
-            let request_builder = Arc::clone(&http_request_builder);
+        let batch_service = HttpBatchService::new(
+            http_client,
+            move |req: HttpRequest<T>| {
+                let request_builder = Arc::clone(&http_request_builder);
 
-            let fut: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
-                Box::pin(async move { request_builder.build(req) });
+                let fut: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
+                    Box::pin(async move { request_builder.build(req) });
 
-            fut
-        });
+                fut
+            },
+            bytes_sent,
+        );
         Self {
             batch_service,
             _phantom: PhantomData,
@@ -808,11 +822,15 @@ mod test {
         let proxy = ProxyConfig::default();
         let app_info = crate::app_info();
         let client = HttpClient::new(None, &proxy, &app_info).unwrap();
-        let mut service = HttpBatchService::new(client, move |body: Bytes| {
-            Box::pin(ready(
-                http::Request::post(&uri).body(body).map_err(Into::into),
-            ))
-        });
+        let mut service = HttpBatchService::new(
+            client,
+            move |body: Bytes| {
+                Box::pin(ready(
+                    http::Request::post(&uri).body(body).map_err(Into::into),
+                ))
+            },
+            SinkContext::default().bytes_sent(),
+        );
 
         let (tx, rx) = futures::channel::mpsc::channel(10);
 
@@ -848,5 +866,88 @@ mod test {
 
         let (body, _rest) = rx.into_future().await;
         assert_eq!(body.unwrap(), "hello");
+    }
+
+    /// Value of `component_sent_bytes_total` in this test's registry, and whether it has a
+    /// `protocol` tag. `None` if the series does not exist.
+    fn sent_bytes_total() -> Option<(f64, bool)> {
+        let controller = vector_lib::metrics::Controller::get().expect("metrics are initialized");
+        controller
+            .capture_metrics()
+            .into_iter()
+            .find(|metric| metric.name() == "component_sent_bytes_total")
+            .map(|metric| {
+                let value = match metric.value() {
+                    vector_lib::event::MetricValue::Counter { value } => *value,
+                    other => panic!("unexpected metric value {other:?}"),
+                };
+                (value, metric.tag_value("protocol").is_some())
+            })
+    }
+
+    fn test_batch_service(
+        uri: Uri,
+    ) -> HttpBatchService<futures::future::Ready<Result<http::Request<Bytes>, crate::Error>>> {
+        let client = HttpClient::new(None, &ProxyConfig::default(), &crate::app_info()).unwrap();
+        HttpBatchService::new(
+            client,
+            move |body: Bytes| ready(http::Request::post(&uri).body(body).map_err(Into::into)),
+            SinkContext::default().bytes_sent(),
+        )
+    }
+
+    /// Starts a server that answers 500 to a body starting with `fail` and 200 otherwise.
+    async fn start_status_server() -> Uri {
+        let addr = next_addr();
+        let new_service = make_service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(service_fn(|req: hyper::Request<Body>| async move {
+                let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+                let status = if body.starts_with(b"fail") { 500 } else { 200 };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from(""))
+                        .unwrap(),
+                )
+            }))
+        });
+        tokio::spawn(async move {
+            if let Err(error) = Server::bind(&addr).serve(new_service).await {
+                eprintln!("Server error: {}", error);
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        format!("http://{}:{}/", addr.ip(), addr.port())
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_before_any_request() {
+        crate::test_util::components::init_test();
+
+        let uri = "http://127.0.0.1:1/".parse::<Uri>().unwrap();
+        let _service = test_batch_service(uri);
+
+        // The series is there, at zero, as soon as the service is built.
+        assert_eq!(sent_bytes_total(), Some((0.0, false)));
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_counts_only_successful_requests() {
+        crate::test_util::components::init_test();
+
+        let mut service = test_batch_service(start_status_server().await);
+
+        service.call(Bytes::from("hello")).await.unwrap();
+        assert_eq!(sent_bytes_total(), Some((5.0, false)));
+
+        // A 500 response is returned to the caller but adds nothing to the counter.
+        let response = service.call(Bytes::from("fail!!")).await.unwrap();
+        assert_eq!(response.status(), 500);
+        assert_eq!(sent_bytes_total(), Some((5.0, false)));
+
+        service.call(Bytes::from("again")).await.unwrap();
+        assert_eq!(sent_bytes_total(), Some((10.0, false)));
     }
 }

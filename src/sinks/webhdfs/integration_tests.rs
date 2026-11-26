@@ -52,7 +52,12 @@ async fn hdfs_rotate_files_after_the_buffer_size_is_reached() {
     config.prefix = "%F-{{ .i }}-".to_string();
 
     let op = config.build_operator().unwrap();
-    let sink = config.build_processor(op.clone()).unwrap();
+    let sink = config
+        .build_processor(
+            op.clone(),
+            crate::config::SinkContext::default().bytes_sent(),
+        )
+        .unwrap();
 
     let (lines, _events) = random_lines_with_stream(100, 30, None);
 

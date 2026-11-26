@@ -16,7 +16,8 @@ use vector_lib::{
 };
 
 use super::EncodedEvent;
-use crate::internal_events::{SocketBytesSent, SocketEventsSent, SocketMode};
+use crate::internal_events::{SocketEventsSent, SocketMode};
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 const MAX_PENDING_ITEMS: usize = 1_000;
 
@@ -52,6 +53,7 @@ where
         inner: T,
         shutdown_check: impl Fn(&mut T) -> ShutdownCheck + Send + 'static,
         socket_mode: SocketMode,
+        bytes_sent: Registered<BytesSent>,
     ) -> Self {
         Self {
             inner: FramedWrite::new(inner, BytesCodec::new()),
@@ -61,6 +63,7 @@ where
                 event_bytes: JsonSize::zero(),
                 bytes_total: 0,
                 socket_mode,
+                bytes_sent,
                 finalizers: Vec::new(),
             },
         }
@@ -69,6 +72,8 @@ where
 
 struct State {
     socket_mode: SocketMode,
+    /// Counts `component_sent_bytes_total`; the sink holds it for its whole life.
+    bytes_sent: Registered<BytesSent>,
     events_total: usize,
     event_bytes: JsonSize,
     bytes_total: usize,
@@ -88,10 +93,7 @@ impl State {
                     count: self.events_total as u64,
                     byte_size: self.event_bytes,
                 });
-                emit!(SocketBytesSent {
-                    mode: self.socket_mode,
-                    byte_size: self.bytes_total,
-                });
+                self.bytes_sent.emit(ByteSize(self.bytes_total));
             }
 
             self.events_total = 0;

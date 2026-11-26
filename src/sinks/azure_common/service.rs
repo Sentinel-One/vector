@@ -8,17 +8,20 @@ use azure_storage_blobs::prelude::*;
 use futures::future::BoxFuture;
 use tower::Service;
 use tracing::Instrument;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use crate::sinks::azure_common::config::{AzureBlobRequest, AzureBlobResponse};
 
 #[derive(Clone)]
 pub struct AzureBlobService {
     client: Arc<ContainerClient>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl AzureBlobService {
-    pub const fn new(client: Arc<ContainerClient>) -> AzureBlobService {
-        AzureBlobService { client }
+    pub fn new(client: Arc<ContainerClient>, bytes_sent: Registered<BytesSent>) -> AzureBlobService {
+        AzureBlobService { client, bytes_sent }
     }
 }
 
@@ -55,12 +58,14 @@ impl Service<AzureBlobRequest> for AzureBlobService {
                 .await
                 .map_err(|err| err.into());
 
-            result.map(|inner| AzureBlobResponse {
-                inner,
-                events_byte_size: request
-                    .request_metadata
-                    .into_events_estimated_json_encoded_byte_size(),
-                byte_size,
+            result.map(|inner| {
+                this.bytes_sent.emit(ByteSize(byte_size));
+                AzureBlobResponse {
+                    inner,
+                    events_byte_size: request
+                        .request_metadata
+                        .into_events_estimated_json_encoded_byte_size(),
+                }
             })
         })
     }

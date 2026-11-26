@@ -5,10 +5,11 @@ use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkErro
 use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use crate::sinks::util::retries::RetryAction;
 use crate::{
-    aws::{create_client, is_retriable_error, ClientBuilder},
+    aws::{create_sink_client, is_retriable_error, ClientBuilder},
     config::{AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext},
     sinks::{
         util::{retries::RetryLogic, BatchConfig, SinkBatchSettings},
@@ -100,8 +101,12 @@ impl KinesisFirehoseSinkConfig {
         }
     }
 
-    pub async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<KinesisClient> {
-        create_client::<KinesisFirehoseClientBuilder>(
+    pub async fn create_client(
+        &self,
+        proxy: &ProxyConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<KinesisClient> {
+        create_sink_client::<KinesisFirehoseClientBuilder>(
             &KinesisFirehoseClientBuilder {},
             &self.base.auth,
             self.base.region.region(),
@@ -109,6 +114,7 @@ impl KinesisFirehoseSinkConfig {
             proxy,
             self.base.tls.as_ref(),
             None,
+            bytes_sent,
         )
         .await
     }
@@ -118,7 +124,7 @@ impl KinesisFirehoseSinkConfig {
 #[typetag::serde(name = "aws_kinesis_firehose")]
 impl SinkConfig for KinesisFirehoseSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let client = self.create_client(&cx.proxy).await?;
+        let client = self.create_client(&cx.proxy, cx.bytes_sent()).await?;
         let healthcheck = self.clone().healthcheck(client.clone()).boxed();
 
         let batch_settings = self
@@ -194,5 +200,26 @@ impl RetryLogic for KinesisRetryLogic {
         } else {
             RetryAction::Successful
         }
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: KinesisFirehoseSinkConfig = toml::from_str(
+            r#"
+            stream_name = "s"
+            encoding.codec = "json"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:1"
+            auth.access_key_id = "x"
+            auth.secret_access_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

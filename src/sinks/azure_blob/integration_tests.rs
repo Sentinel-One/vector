@@ -257,7 +257,8 @@ impl AzureBlobSinkConfig {
         )
         .expect("Failed to create client");
 
-        self.build_processor(client).expect("Failed to create sink")
+        self.build_processor(client, crate::config::SinkContext::default().bytes_sent())
+            .expect("Failed to create sink")
     }
 
     async fn run_assert(&self, input: impl Stream<Item = EventArray> + Send) {

@@ -2,7 +2,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use async_trait::async_trait;
 use vector_lib::configurable::{component::GenerateConfig, configurable_component};
-use vector_lib::internal_event::Protocol;
 use vector_lib::{
     config::{AcknowledgementsConfig, Input},
     sink::VectorSink,
@@ -123,23 +122,21 @@ impl GenerateConfig for StatsdSinkConfig {
 #[async_trait]
 #[typetag::serde(name = "statsd")]
 impl SinkConfig for StatsdSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let batcher_settings = self.batch.into_batcher_settings()?;
 
         let socket_mode = self.mode.as_socket_mode();
         let request_builder =
             StatsdRequestBuilder::new(self.default_namespace.clone(), socket_mode);
-        let protocol = Protocol::from(socket_mode.as_str());
 
         let connector = self.mode.as_connector();
         let service = connector.service();
         let healthcheck = connector.healthcheck();
 
         let sink = StatsdSink::new(
-            StatsdService::from_transport(service),
+            StatsdService::from_transport(service, cx.bytes_sent()),
             batcher_settings,
             request_builder,
-            protocol,
         );
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
@@ -160,5 +157,17 @@ mod test {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<StatsdSinkConfig>();
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: StatsdSinkConfig = toml::from_str(
+            r#"
+            mode = "udp"
+            address = "127.0.0.1:9"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

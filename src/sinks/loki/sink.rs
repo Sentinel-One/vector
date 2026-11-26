@@ -11,9 +11,10 @@ use super::{
     service::{LokiRequest, LokiRetryLogic, LokiService},
 };
 use crate::sinks::loki::event::LokiBatchEncoding;
+use vector_lib::internal_event::{BytesSent, Registered};
 use crate::{
     common::expansion::pair_expansion,
-    http::{get_http_scheme_from_uri, HttpClient},
+    http::HttpClient,
     internal_events::{
         LokiEventUnlabeledError, LokiOutOfOrderEventDroppedError, LokiOutOfOrderEventRewritten,
         LokiTimestampNonParsableEventsDropped, SinkRequestBuildError,
@@ -435,12 +436,15 @@ pub struct LokiSink {
     batch_settings: BatcherSettings,
     out_of_order_action: OutOfOrderAction,
     service: Svc<LokiService, LokiRetryLogic>,
-    protocol: &'static str,
 }
 
 impl LokiSink {
     #[allow(clippy::missing_const_for_fn)] // const cannot run destructor
-    pub fn new(config: LokiConfig, client: HttpClient) -> crate::Result<Self> {
+    pub fn new(
+        config: LokiConfig,
+        client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<Self> {
         let compression = config.compression;
 
         // if Vector is configured to allow events with out of order timestamps, then we can
@@ -460,7 +464,6 @@ impl LokiSink {
             }
         };
 
-        let protocol = get_http_scheme_from_uri(&config.endpoint.uri);
         let service = tower::ServiceBuilder::new()
             .settings(request_limits, LokiRetryLogic)
             .service(LokiService::new(
@@ -468,6 +471,7 @@ impl LokiSink {
                 config.endpoint,
                 config.path,
                 config.auth,
+                bytes_sent,
             )?);
 
         let transformer = config.encoding.transformer();
@@ -496,7 +500,6 @@ impl LokiSink {
             batch_settings: config.batch.into_batcher_settings()?,
             out_of_order_action: config.out_of_order_action,
             service,
-            protocol,
         })
     }
 
@@ -552,7 +555,6 @@ impl LokiSink {
                 }
             })
             .into_driver(self.service)
-            .protocol(self.protocol)
             .run()
             .await
     }

@@ -10,6 +10,7 @@ use hyper::Body;
 use openssl::{base64, hash, pkey, sign};
 use regex::Regex;
 use tracing::Instrument;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use vector_lib::lookup::lookup_v2::OwnedValuePath;
 
 use crate::{http::HttpClient, sinks::prelude::*};
@@ -63,7 +64,6 @@ impl Finalizable for AzureMonitorLogsRequest {
 pub struct AzureMonitorLogsResponse {
     pub http_status: StatusCode,
     pub events_byte_size: GroupedCountByteSize,
-    pub raw_byte_size: usize,
 }
 
 impl DriverResponse for AzureMonitorLogsResponse {
@@ -77,10 +77,6 @@ impl DriverResponse for AzureMonitorLogsResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.events_byte_size
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.raw_byte_size)
-    }
 }
 
 /// `AzureMonitorLogsService` is a `Tower` service used to send logs to Azure.
@@ -91,6 +87,8 @@ pub struct AzureMonitorLogsService {
     customer_id: String,
     shared_key: pkey::PKey<pkey::Private>,
     default_headers: HeaderMap,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl AzureMonitorLogsService {
@@ -103,6 +101,7 @@ impl AzureMonitorLogsService {
         log_type: &str,
         time_generated_key: Option<OwnedValuePath>,
         shared_key: pkey::PKey<pkey::Private>,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<Self> {
         let mut parts = endpoint.into_parts();
         parts.path_and_query = Some(
@@ -151,6 +150,7 @@ impl AzureMonitorLogsService {
             customer_id,
             shared_key,
             default_headers,
+            bytes_sent,
         })
     }
 
@@ -238,12 +238,15 @@ impl Service<AzureMonitorLogsRequest> for AzureMonitorLogsService {
     fn call(&mut self, request: AzureMonitorLogsRequest) -> Self::Future {
         let mut client = self.client.clone();
         let http_request = self.build_request(request.body);
+        let bytes_sent = self.bytes_sent.clone();
         Box::pin(async move {
             let http_request = http_request?;
             let response = client.call(http_request).in_current_span().await?;
+            if response.status().is_success() {
+                bytes_sent.emit(ByteSize(request.metadata.request_encoded_size()));
+            }
             Ok(AzureMonitorLogsResponse {
                 http_status: response.status(),
-                raw_byte_size: request.metadata.request_encoded_size(),
                 events_byte_size: request
                     .metadata
                     .into_events_estimated_json_encoded_byte_size(),

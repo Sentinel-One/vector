@@ -69,7 +69,7 @@ impl GenerateConfig for PapertrailConfig {
 impl SinkConfig for PapertrailConfig {
     async fn build(
         &self,
-        _cx: SinkContext,
+        cx: SinkContext,
     ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
         let host = self
             .endpoint
@@ -107,6 +107,7 @@ impl SinkConfig for PapertrailConfig {
                 transformer,
                 encoder,
             },
+            cx.bytes_sent(),
         )
     }
 
@@ -193,7 +194,7 @@ mod tests {
     use vector_lib::event::{Event, LogEvent};
 
     use crate::test_util::{
-        components::{run_and_assert_sink_compliance, SINK_TAGS},
+        components::{build_run_and_assert_sink_compliance, SINK_TAGS},
         http::{always_200_response, spawn_blackhole_http_server},
     };
 
@@ -214,11 +215,11 @@ mod tests {
         config.endpoint = mock_endpoint.into();
         config.tls = Some(TlsEnableableConfig::default());
 
-        let context = SinkContext::default();
-        let (sink, _healthcheck) = config.build(context).await.unwrap();
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
         let event = Event::Log(LogEvent::from("simple message"));
-        run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+        build_run_and_assert_sink_compliance(sink_future, stream::once(ready(event)), &SINK_TAGS)
+            .await;
     }
 
     #[test]
@@ -244,5 +245,17 @@ mod tests {
 
         assert!(!value.contains_key("magic"));
         assert_eq!(value.get("process").unwrap().as_str(), Some("foo"));
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: PapertrailConfig = toml::from_str(
+            r#"
+            endpoint = "tcp://127.0.0.1:1"
+            encoding.codec = "json"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

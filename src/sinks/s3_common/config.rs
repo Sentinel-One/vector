@@ -12,10 +12,11 @@ use aws_smithy_runtime_api::{
 use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use super::service::{S3Response, S3Service};
 use crate::{
-    aws::{create_client, is_retriable_error, AwsAuthentication, RegionOrEndpoint},
+    aws::{create_sink_client, is_retriable_error, AwsAuthentication, RegionOrEndpoint},
     common::s3::S3ClientBuilder,
     config::ProxyConfig,
     http::status,
@@ -368,11 +369,12 @@ pub async fn create_service(
     proxy: &ProxyConfig,
     tls_options: Option<&TlsConfig>,
     force_path_style: impl Into<bool>,
+    bytes_sent: Registered<BytesSent>,
 ) -> crate::Result<S3Service> {
     let endpoint = region.endpoint();
     let region = region.region();
     let force_path_style_value: bool = force_path_style.into();
-    let client = create_client::<S3ClientBuilder>(
+    let client = create_sink_client::<S3ClientBuilder>(
         &S3ClientBuilder {
             force_path_style: Some(force_path_style_value),
         },
@@ -382,6 +384,7 @@ pub async fn create_service(
         proxy,
         tls_options,
         None,
+        bytes_sent,
     )
     .await?;
     Ok(S3Service::new(client))

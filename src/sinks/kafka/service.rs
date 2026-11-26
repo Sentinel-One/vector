@@ -15,6 +15,7 @@ use rdkafka::{
     types::RDKafkaErrorCode,
 };
 use vector_lib::config;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use crate::{kafka::KafkaStatisticsContext, sinks::prelude::*};
 
@@ -34,7 +35,6 @@ pub struct KafkaRequestMetadata {
 
 pub struct KafkaResponse {
     event_byte_size: GroupedCountByteSize,
-    raw_byte_size: usize,
     event_status: EventStatus,
 }
 
@@ -45,10 +45,6 @@ impl DriverResponse for KafkaResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.event_byte_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.raw_byte_size)
     }
 }
 
@@ -92,13 +88,20 @@ pub struct KafkaService {
 
     /// The number of records blocked from being enqueued on the producer.
     records_blocked: Arc<AtomicUsize>,
+
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl KafkaService {
-    pub(crate) fn new(kafka_producer: FutureProducer<KafkaStatisticsContext>) -> KafkaService {
+    pub(crate) fn new(
+        kafka_producer: FutureProducer<KafkaStatisticsContext>,
+        bytes_sent: Registered<BytesSent>,
+    ) -> KafkaService {
         KafkaService {
             kafka_producer,
             records_blocked: Arc::new(AtomicUsize::new(0)),
+            bytes_sent,
         }
     }
 }
@@ -152,10 +155,12 @@ impl Service<KafkaRequest> for KafkaService {
                         return fut
                             .await
                             .expect("producer unexpectedly dropped")
-                            .map(|_| KafkaResponse {
-                                event_byte_size,
-                                raw_byte_size,
-                                event_status: EventStatus::Delivered,
+                            .map(|_| {
+                                this.bytes_sent.emit(ByteSize(raw_byte_size));
+                                KafkaResponse {
+                                    event_byte_size,
+                                    event_status: EventStatus::Delivered,
+                                }
                             })
                             .map_err(|(err, _)| err);
                     }
@@ -194,7 +199,6 @@ impl Service<KafkaRequest> for KafkaService {
                     Err(_) => {
                         return Ok(KafkaResponse {
                             event_byte_size: config::telemetry().create_request_count_byte_size(),
-                            raw_byte_size: 0,
                             event_status: EventStatus::Errored,
                         })
                     }

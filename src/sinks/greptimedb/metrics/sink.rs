@@ -45,7 +45,6 @@ impl GreptimeDBGrpcSink {
             )
             .map(|m| GreptimeDBGrpcRequest::from_metrics(m, &self.request_builder_options))
             .into_driver(self.service)
-            .protocol("grpc")
             .run()
             .await
     }

@@ -4,6 +4,7 @@ use pulsar::{Error as PulsarError, Pulsar, TokioExecutor};
 use serde::Serialize;
 use snafu::Snafu;
 use std::collections::HashMap;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vrl::value::KeyString;
 
 use super::{
@@ -79,12 +80,18 @@ impl PulsarSink {
     pub(crate) fn new(
         client: Pulsar<TokioExecutor>,
         config: PulsarSinkConfig,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<Self> {
         let producer_opts = config.build_producer_options();
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
-        let service = PulsarService::new(client, producer_opts, config.producer_name.clone());
+        let service = PulsarService::new(
+            client,
+            producer_opts,
+            config.producer_name.clone(),
+            bytes_sent,
+        );
         let topic_template = config.topic.clone();
 
         Ok(PulsarSink {
@@ -118,8 +125,7 @@ impl PulsarSink {
                     .map_err(|e| error!("Failed to build Pulsar request: {:?}.", e))
                     .ok()
             })
-            .into_driver(service)
-            .protocol("tcp");
+            .into_driver(service);
 
         sink.run().await
     }

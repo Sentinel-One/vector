@@ -138,6 +138,7 @@ impl SinkConfig for PubsubConfig {
             request_settings,
             batch_settings.timeout,
             client,
+            cx.bytes_sent(),
         )
         .sink_map_err(|error| error!(message = "Fatal gcp_pubsub sink error.", %error));
 

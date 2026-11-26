@@ -7,6 +7,7 @@ use hyper::{Body, Request};
 use indoc::indoc;
 use tower::Service;
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::sensitive_string::SensitiveString;
 use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
@@ -134,7 +135,12 @@ impl SinkConfig for SematextMetricsConfig {
         };
 
         let healthcheck = healthcheck(endpoint.clone(), client.clone()).boxed();
-        let sink = SematextMetricsService::new(self.clone(), write_uri(&endpoint)?, client)?;
+        let sink = SematextMetricsService::new(
+            self.clone(),
+            write_uri(&endpoint)?,
+            client,
+            cx.bytes_sent(),
+        )?;
 
         Ok((sink, healthcheck))
     }
@@ -165,10 +171,12 @@ impl SematextMetricsService {
         config: SematextMetricsConfig,
         endpoint: http::Uri,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> Result<VectorSink> {
         let batch = config.batch.into_batch_settings()?;
         let request = config.request.into_settings();
-        let http_service = HttpBatchService::new(client, create_build_request(endpoint));
+        let http_service =
+            HttpBatchService::new(client, create_build_request(endpoint), bytes_sent);
         let sematext_service = SematextMetricsService {
             config,
             inner: http_service,

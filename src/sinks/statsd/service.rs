@@ -2,6 +2,7 @@ use std::task::{Context, Poll};
 
 use futures_util::future::BoxFuture;
 use tower::Service;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use vector_lib::stream::DriverResponse;
 use vector_lib::{
     finalization::{EventFinalizers, EventStatus, Finalizable},
@@ -52,15 +53,13 @@ impl DriverResponse for StatsdResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         self.metadata.events_estimated_json_encoded_byte_size()
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.metadata.request_encoded_size())
-    }
 }
 
 #[derive(Clone)]
 pub struct StatsdService<T> {
     transport: T,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl<T> StatsdService<T> {
@@ -68,8 +67,11 @@ impl<T> StatsdService<T> {
     ///
     /// The `transport` service is responsible for sending the actual encoded requests to the downstream
     /// endpoint.
-    pub const fn from_transport(transport: T) -> Self {
-        Self { transport }
+    pub fn from_transport(transport: T, bytes_sent: Registered<BytesSent>) -> Self {
+        Self {
+            transport,
+            bytes_sent,
+        }
     }
 }
 
@@ -94,13 +96,80 @@ where
             metadata,
         } = request;
 
+        let byte_size = metadata.request_encoded_size();
+        let bytes_sent = self.bytes_sent.clone();
         let send_future = self.transport.call(payload);
 
         Box::pin(async move {
             send_future
                 .await
-                .map(|_| StatsdResponse { metadata })
+                .map(|_| {
+                    bytes_sent.emit(ByteSize(byte_size));
+                    StatsdResponse { metadata }
+                })
                 .map_err(Into::into)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use futures_util::future::ready;
+    use tower::service_fn;
+    use vector_lib::request_metadata::GroupedCountByteSize;
+
+    use super::*;
+    use crate::{
+        config::SinkContext,
+        test_util::components::{init_test, sent_bytes_total},
+    };
+
+    fn request(encoded_size: usize) -> StatsdRequest {
+        StatsdRequest {
+            payload: vec![0; encoded_size],
+            finalizers: EventFinalizers::default(),
+            metadata: RequestMetadata::new(
+                1,
+                encoded_size,
+                encoded_size,
+                encoded_size,
+                GroupedCountByteSize::new_untagged(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_before_any_request() {
+        init_test();
+
+        let transport = service_fn(|_payload: Vec<u8>| ready(Ok::<(), io::Error>(())));
+        let _service = StatsdService::from_transport(transport, SinkContext::default().bytes_sent());
+
+        assert_eq!(sent_bytes_total(), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_counts_only_successful_sends() {
+        init_test();
+
+        let handle = SinkContext::default().bytes_sent();
+
+        // A transport that fails adds nothing to the counter.
+        let failing = service_fn(|_payload: Vec<u8>| {
+            ready(Err::<(), io::Error>(io::Error::other("connection refused")))
+        });
+        let mut service = StatsdService::from_transport(failing, handle.clone());
+        assert!(service.call(request(7)).await.is_err());
+        assert_eq!(sent_bytes_total(), Some(0.0));
+
+        // A transport that succeeds counts exactly the request's encoded size.
+        let working = service_fn(|_payload: Vec<u8>| ready(Ok::<(), io::Error>(())));
+        let mut service = StatsdService::from_transport(working, handle);
+        service.call(request(7)).await.unwrap();
+        assert_eq!(sent_bytes_total(), Some(7.0));
+        service.call(request(5)).await.unwrap();
+        assert_eq!(sent_bytes_total(), Some(12.0));
     }
 }

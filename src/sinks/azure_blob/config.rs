@@ -6,6 +6,7 @@ use vector_lib::codecs::actions::Transformer;
 use vector_lib::codecs::JsonSerializerConfig;
 use vector_lib::codecs::encoding::{BatchEncodingConfig, BatchSerializerConfig, EventEncodingConfig, SerializerConfig};
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::sensitive_string::SensitiveString;
 
 use super::request_builder::AzureBlobRequestOptions;
@@ -206,7 +207,7 @@ impl GenerateConfig for AzureBlobSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "azure_blob")]
 impl SinkConfig for AzureBlobSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck)> {
         let client = azure_common::config::build_client(
             self.connection_string
                 .as_ref()
@@ -220,7 +221,7 @@ impl SinkConfig for AzureBlobSinkConfig {
             self.container_name.clone(),
             Arc::clone(&client),
         )?;
-        let sink = self.build_processor(client)?;
+        let sink = self.build_processor(client, cx.bytes_sent())?;
         Ok((sink, healthcheck))
     }
 
@@ -238,11 +239,15 @@ const DEFAULT_FILENAME_TIME_FORMAT: &str = "%s";
 const DEFAULT_FILENAME_APPEND_UUID: bool = true;
 
 impl AzureBlobSinkConfig {
-    pub fn build_processor(&self, client: Arc<ContainerClient>) -> crate::Result<VectorSink> {
+    pub fn build_processor(
+        &self,
+        client: Arc<ContainerClient>,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<VectorSink> {
         let request_limits = self.request.into_settings();
         let service = ServiceBuilder::new()
             .settings(request_limits, AzureBlobRetryLogic)
-            .service(AzureBlobService::new(client));
+            .service(AzureBlobService::new(client, bytes_sent));
 
         // Configure our partitioning/batching.
         let batcher_settings = self.batch.into_batcher_settings()?;
@@ -285,5 +290,23 @@ impl AzureBlobSinkConfig {
 
     pub fn key_partitioner(&self) -> crate::Result<KeyPartitioner> {
         Ok(KeyPartitioner::new(self.blob_prefix.clone(), None))
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: AzureBlobSinkConfig = toml::from_str(
+            r#"
+            connection_string = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:1/devstoreaccount1;"
+            container_name = "c"
+            encoding = {codec = "stack", serializer = {codec = "json"}}
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

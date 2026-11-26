@@ -186,6 +186,7 @@ impl SinkConfig for RemoteWriteConfig {
             client,
             auth,
             compression: self.compression,
+            bytes_sent: cx.bytes_sent(),
         };
         let service = ServiceBuilder::new()
             .settings(request_settings, http_response_retry_logic())

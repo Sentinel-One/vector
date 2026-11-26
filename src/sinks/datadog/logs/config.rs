@@ -2,6 +2,7 @@ use std::{convert::TryFrom, sync::Arc};
 
 use indoc::indoc;
 use tower::ServiceBuilder;
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use vector_lib::{
     config::proxy::ProxyConfig, configurable::configurable_component, schema::meaning,
@@ -89,18 +90,12 @@ impl DatadogLogsConfig {
         http::Uri::try_from(format!("{}/api/v2/logs", base_url)).expect("URI not valid")
     }
 
-    pub fn get_protocol(&self, dd_common: &DatadogCommonConfig) -> String {
-        self.get_uri(dd_common)
-            .scheme_str()
-            .unwrap_or("http")
-            .to_string()
-    }
-
     pub fn build_processor(
         &self,
         dd_common: &DatadogCommonConfig,
         client: HttpClient,
         dd_evp_origin: String,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<VectorSink> {
         let default_api_key: Arc<str> = Arc::from(dd_common.default_api_key.inner());
         let request_limits = self.request.tower.into_settings();
@@ -121,12 +116,11 @@ impl DatadogLogsConfig {
                 self.get_uri(dd_common),
                 self.request.headers.clone(),
                 dd_evp_origin,
+                bytes_sent,
             )?);
 
         let encoding = self.encoding.clone();
-        let protocol = self.get_protocol(dd_common);
-
-        let sink = LogSinkBuilder::new(encoding, service, default_api_key, batch, protocol)
+        let sink = LogSinkBuilder::new(encoding, service, default_api_key, batch)
             .compression(self.compression.unwrap_or_default())
             .build();
 
@@ -161,7 +155,8 @@ impl SinkConfig for DatadogLogsConfig {
 
         let healthcheck = dd_common.build_healthcheck(client.clone())?;
 
-        let sink = self.build_processor(&dd_common, client, cx.app_name_slug)?;
+        let bytes_sent = cx.bytes_sent();
+        let sink = self.build_processor(&dd_common, client, cx.app_name_slug, bytes_sent)?;
 
         Ok((sink, healthcheck))
     }
@@ -242,4 +237,16 @@ mod test {
     }
 
     register_validatable_component!(DatadogLogsConfig);
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: DatadogLogsConfig = toml::from_str(
+            r#"
+            default_api_key = "x"
+            endpoint = "http://127.0.0.1:1"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
+    }
 }

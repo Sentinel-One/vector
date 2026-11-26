@@ -1,4 +1,5 @@
 use aws_sdk_s3::Client as S3Client;
+use vector_lib::internal_event::{BytesSent, Registered};
 use tower::ServiceBuilder;
 use vector_lib::codecs::TextSerializerConfig;
 use vector_lib::codecs::actions::Transformer;
@@ -189,7 +190,7 @@ impl GenerateConfig for S3SinkConfig {
 #[typetag::serde(name = "aws_s3")]
 impl SinkConfig for S3SinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let service = self.create_service(&cx.proxy).await?;
+        let service = self.create_service(&cx.proxy, cx.bytes_sent()).await?;
         let healthcheck = self.build_healthcheck(service.client())?;
         let sink = self.build_processor(service, cx)?;
         Ok((sink, healthcheck))
@@ -261,13 +262,18 @@ impl S3SinkConfig {
         s3_common::config::build_healthcheck(self.bucket.clone(), client)
     }
 
-    pub async fn create_service(&self, proxy: &ProxyConfig) -> crate::Result<S3Service> {
+    pub async fn create_service(
+        &self,
+        proxy: &ProxyConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<S3Service> {
         s3_common::config::create_service(
             &self.region,
             &self.auth,
             proxy,
             self.tls.as_ref(),
             self.force_path_style,
+            bytes_sent,
         )
         .await
     }
@@ -280,5 +286,26 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<S3SinkConfig>();
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: S3SinkConfig = toml::from_str(
+            r#"
+            bucket = "b"
+            encoding = {codec = "stack", serializer = {codec = "json"}}
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:1"
+            auth.access_key_id = "x"
+            auth.secret_access_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

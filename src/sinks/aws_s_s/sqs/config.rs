@@ -1,6 +1,7 @@
 use aws_sdk_sqs::Client as SqsClient;
 
 use crate::aws::RegionOrEndpoint;
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use crate::config::{
     AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext,
@@ -11,7 +12,7 @@ use super::{
     client::SqsMessagePublisher, message_deduplication_id, message_group_id, BaseSSSinkConfig,
     SSRequestBuilder, SSSink,
 };
-use crate::{aws::create_client, common::sqs::SqsClientBuilder};
+use crate::{aws::create_sink_client, common::sqs::SqsClientBuilder};
 
 /// Configuration for the `aws_sqs` sink.
 #[configurable_component(sink(
@@ -47,8 +48,12 @@ impl GenerateConfig for SqsSinkConfig {
 }
 
 impl SqsSinkConfig {
-    pub(super) async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<SqsClient> {
-        create_client::<SqsClientBuilder>(
+    pub(super) async fn create_client(
+        &self,
+        proxy: &ProxyConfig,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<SqsClient> {
+        create_sink_client::<SqsClientBuilder>(
             &SqsClientBuilder {},
             &self.base_config.auth,
             self.region.region(),
@@ -56,6 +61,7 @@ impl SqsSinkConfig {
             proxy,
             self.base_config.tls.as_ref(),
             None,
+            bytes_sent,
         )
         .await
     }
@@ -68,7 +74,7 @@ impl SinkConfig for SqsSinkConfig {
         &self,
         cx: SinkContext,
     ) -> crate::Result<(crate::sinks::VectorSink, crate::sinks::Healthcheck)> {
-        let client = self.create_client(&cx.proxy).await?;
+        let client = self.create_client(&cx.proxy, cx.bytes_sent()).await?;
 
         let publisher = SqsMessagePublisher::new(client.clone(), self.queue_url.clone());
 
@@ -112,4 +118,25 @@ pub(super) async fn healthcheck(client: SqsClient, queue_url: String) -> crate::
         .await
         .map(|_| ())
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: SqsSinkConfig = toml::from_str(
+            r#"
+            queue_url = "http://127.0.0.1:1/000000000000/q"
+            encoding.codec = "json"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:1"
+            auth.access_key_id = "x"
+            auth.secret_access_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
+    }
 }

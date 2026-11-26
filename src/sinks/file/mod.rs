@@ -22,7 +22,10 @@ use vector_lib::codecs::{
 };
 use vector_lib::configurable::configurable_component;
 use vector_lib::{
-    internal_event::{CountByteSize, EventsSent, InternalEventHandle as _, Output, Registered},
+    internal_event::{
+        ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output,
+        Registered,
+    },
     EstimatedJsonEncodedSizeOf, TimeZone,
 };
 
@@ -31,9 +34,7 @@ use crate::{
     config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext},
     event::{Event, EventStatus, Finalizable},
     expiring_hash_map::ExpiringHashMap,
-    internal_events::{
-        FileBytesSent, FileInternalMetricsConfig, FileIoError, FileOpen, TemplateRenderingError,
-    },
+    internal_events::{FileInternalMetricsConfig, FileIoError, FileOpen, TemplateRenderingError},
     sinks::util::{
         path_confinement::{ConfineError, PathConfinement},
         timezone_to_offset, StreamSink,
@@ -240,7 +241,8 @@ pub struct FileSink {
     files: ExpiringHashMap<PathBuf, OutFile>,
     compression: Compression,
     events_sent: Registered<EventsSent>,
-    include_file_metric_tag: bool,
+    /// Counts `component_sent_bytes_total`; held for the life of the sink.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl FileSink {
@@ -274,7 +276,7 @@ impl FileSink {
             files: ExpiringHashMap::default(),
             compression: config.compression,
             events_sent: register!(EventsSent::from(Output(None))),
-            include_file_metric_tag: config.internal_metrics.include_file_tag,
+            bytes_sent: cx.bytes_sent(),
         })
     }
 
@@ -457,11 +459,7 @@ impl FileSink {
             Ok(byte_size) => {
                 finalizers.update_status(EventStatus::Delivered);
                 self.events_sent.emit(CountByteSize(1, event_size));
-                emit!(FileBytesSent {
-                    byte_size,
-                    file: confined_path.to_string_lossy(),
-                    include_file_metric_tag: self.include_file_metric_tag,
-                });
+                self.bytes_sent.emit(ByteSize(byte_size));
             }
             Err(error) => {
                 finalizers.update_status(EventStatus::Errored);
@@ -579,6 +577,43 @@ mod tests {
         for (input, output) in input.into_iter().zip(output) {
             assert_eq!(input, output);
         }
+    }
+
+    fn plain_text_config(template: &std::path::Path) -> FileSinkConfig {
+        FileSinkConfig {
+            path: template.to_path_buf().try_into().unwrap(),
+            base_dir: Default::default(),
+            dangerously_allow_unconfined_template_resolution: Default::default(),
+            idle_timeout: default_idle_timeout(),
+            encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+            compression: Compression::None,
+            acknowledgements: Default::default(),
+            timezone: Default::default(),
+            internal_metrics: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config = plain_text_config(&temp_file());
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_match_the_bytes_written() {
+        let template = temp_file();
+        let config = plain_text_config(&template);
+        let (input, _events) = random_lines_with_stream(100, 64, None);
+
+        run_assert_log_sink(&config, input).await;
+
+        // The counter carries no `protocol` or `file` tag and equals the size of the file.
+        let written = std::fs::metadata(&template).unwrap().len();
+        assert!(written > 0);
+        assert_eq!(
+            crate::test_util::components::sent_bytes_total(),
+            Some(written as f64)
+        );
     }
 
     #[tokio::test]

@@ -184,20 +184,21 @@ mod tests {
         .unwrap();
 
         // Make sure we can build the config
-        _ = config.build(cx.clone()).await.unwrap();
+        _ = config.build(cx).await.unwrap();
 
         let addr = next_addr();
         // Swap out the host so we can force send it
         // to our local server
         config.endpoint = Some(format!("http://{}", addr));
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let sink_future = async { config.build(SinkContext::default()).await.unwrap().0 };
 
         let (mut rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);
 
         let (expected, events) = random_lines_with_stream(100, 10, None);
-        components::run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+        components::build_run_and_assert_sink_compliance(sink_future, events, &HTTP_SINK_TAGS)
+            .await;
 
         let output = rx.next().await.unwrap();
 

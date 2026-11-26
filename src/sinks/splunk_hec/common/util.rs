@@ -5,6 +5,7 @@ use futures_util::future::BoxFuture;
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
 use snafu::{ResultExt, Snafu};
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::lookup::lookup_v2::{OptionalTargetPath, OptionalValuePath};
 use vector_lib::{config::proxy::ProxyConfig, event::EventRef};
 
@@ -60,28 +61,33 @@ pub fn build_http_batch_service(
     endpoint_target: EndpointTarget,
     auto_extract_timestamp: bool,
     path: Option<String>,
+    bytes_sent: Registered<BytesSent>,
 ) -> HttpBatchService<BoxFuture<'static, Result<Request<Bytes>, crate::Error>>, HecRequest> {
-    HttpBatchService::new(client, move |req: HecRequest| {
-        let request_builder = Arc::clone(&http_request_builder);
-        let path = resolve_path(endpoint_target, path.clone());
-        let future: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
-            Box::pin(async move {
-                request_builder.build_request(
-                    req.body,
-                    &path,
-                    req.passthrough_token,
-                    MetadataFields {
-                        source: req.source,
-                        sourcetype: req.sourcetype,
-                        index: req.index,
-                        host: req.host,
-                    },
-                    auto_extract_timestamp,
-                    req.headers,
-                )
-            });
-        future
-    })
+    HttpBatchService::new(
+        client,
+        move |req: HecRequest| {
+            let request_builder = Arc::clone(&http_request_builder);
+            let path = resolve_path(endpoint_target, path.clone());
+            let future: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
+                Box::pin(async move {
+                    request_builder.build_request(
+                        req.body,
+                        &path,
+                        req.passthrough_token,
+                        MetadataFields {
+                            source: req.source,
+                            sourcetype: req.sourcetype,
+                            index: req.index,
+                            host: req.host,
+                        },
+                        auto_extract_timestamp,
+                        req.headers,
+                    )
+                });
+            future
+        },
+        bytes_sent,
+    )
 }
 
 fn resolve_path(

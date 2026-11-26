@@ -26,7 +26,7 @@ use tracing::{Instrument, Span};
 use vector_lib::configurable::configurable_component;
 use vector_lib::{
     internal_event::{
-        ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output, Protocol,
+        ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output,
         Registered,
     },
     ByteSizeOf, EstimatedJsonEncodedSizeOf,
@@ -425,7 +425,7 @@ impl PrometheusExporter {
         }
 
         let handler = Handler {
-            bytes_sent: register!(BytesSent::from(Protocol::HTTP)),
+            bytes_sent: register!(BytesSent),
             events_sent: register!(EventsSent::from(Output(None))),
             default_namespace: self.config.default_namespace.clone(),
             buckets: self.config.buckets.clone().into(),

@@ -2,6 +2,7 @@ use opendal::{layers::LoggingLayer, services::Webhdfs, Operator};
 use tower::ServiceBuilder;
 use vector_lib::codecs::{encoding::Framer, JsonSerializerConfig, NewlineDelimitedEncoderConfig};
 use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::{
     config::{AcknowledgementsConfig, DataType, Input},
     sink::VectorSink,
@@ -99,13 +100,13 @@ impl GenerateConfig for WebHdfsConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "webhdfs")]
 impl SinkConfig for WebHdfsConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let op = self.build_operator()?;
 
         let check_op = op.clone();
         let healthcheck = Box::pin(async move { Ok(check_op.check().await?) });
 
-        let sink = self.build_processor(op)?;
+        let sink = self.build_processor(op, cx.bytes_sent())?;
         Ok((sink, healthcheck))
     }
 
@@ -132,7 +133,11 @@ impl WebHdfsConfig {
         Ok(op)
     }
 
-    pub fn build_processor(&self, op: Operator) -> crate::Result<VectorSink> {
+    pub fn build_processor(
+        &self,
+        op: Operator,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<VectorSink> {
         // Configure our partitioning/batching.
         let batcher_settings = self.batch.into_batcher_settings()?;
 
@@ -146,7 +151,7 @@ impl WebHdfsConfig {
         };
 
         // TODO: we can add tower middleware here.
-        let svc = ServiceBuilder::new().service(OpenDalService::new(op));
+        let svc = ServiceBuilder::new().service(OpenDalService::new(op, bytes_sent));
 
         let sink = OpenDalSink::new(
             svc,
@@ -161,5 +166,22 @@ impl WebHdfsConfig {
     pub fn key_partitioner(&self) -> crate::Result<KeyPartitioner> {
         let prefix = self.prefix.clone().try_into()?;
         Ok(KeyPartitioner::new(prefix, None))
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: WebHdfsConfig = toml::from_str(
+            r#"
+            endpoint = "http://127.0.0.1:1"
+            encoding.codec = "json"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

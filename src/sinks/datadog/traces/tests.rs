@@ -20,7 +20,7 @@ use crate::{
     extra_context::ExtraContext,
     sinks::util::test::{build_test_server_status, load_sink, load_sink_with_context},
     test_util::{
-        components::{assert_sink_compliance, run_and_assert_sink_compliance, SINK_TAGS},
+        components::{assert_sink_compliance, build_run_and_assert_sink_compliance, SINK_TAGS},
         map_event_batch_stream, next_addr,
     },
 };
@@ -324,6 +324,7 @@ async fn global_options() {
         ..SinkContext::default()
     };
     let (mut config, cx) = load_sink_with_context::<DatadogTracesConfig>(config, cx).unwrap();
+    let extra_context = cx.extra_context.clone();
 
     let addr = next_addr();
     // Swap out the endpoint so we can force send it
@@ -331,7 +332,13 @@ async fn global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async move {
+        let cx = SinkContext {
+            extra_context,
+            ..SinkContext::default()
+        };
+        config.build(cx).await.unwrap().0
+    };
 
     let (rx, _trigger, server) = build_test_server_status(addr, StatusCode::OK);
     tokio::spawn(server);
@@ -339,7 +346,7 @@ async fn global_options() {
     let t = simple_trace_event("a_resource".to_string());
     let events = stream::iter(vec![Event::Trace(t)]);
 
-    run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, events, &SINK_TAGS).await;
 
     let keys = rx
         .take(1)
@@ -368,6 +375,7 @@ async fn override_global_options() {
         ..SinkContext::default()
     };
     let (mut config, cx) = load_sink_with_context::<DatadogTracesConfig>(config, cx).unwrap();
+    let extra_context = cx.extra_context.clone();
 
     let addr = next_addr();
     // Swap out the endpoint so we can force send it
@@ -375,7 +383,13 @@ async fn override_global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async move {
+        let cx = SinkContext {
+            extra_context,
+            ..SinkContext::default()
+        };
+        config.build(cx).await.unwrap().0
+    };
 
     let (rx, _trigger, server) = build_test_server_status(addr, StatusCode::OK);
     tokio::spawn(server);
@@ -383,7 +397,7 @@ async fn override_global_options() {
     let t = simple_trace_event("a_resource".to_string());
     let events = stream::iter(vec![Event::Trace(t)]);
 
-    run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, events, &SINK_TAGS).await;
 
     let keys = rx
         .take(1)

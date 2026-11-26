@@ -12,7 +12,7 @@ use tokio_util::codec::Encoder as _;
 use vector_lib::{
     emit,
     internal_event::{
-        ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output, Protocol,
+        ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle as _, Output,
     },
     EstimatedJsonEncodedSizeOf,
 };
@@ -115,7 +115,7 @@ impl WebSocketSink {
         }
         let mut last_pong = Instant::now();
 
-        let bytes_sent = register!(BytesSent::from(Protocol("websocket".into())));
+        let bytes_sent = register!(BytesSent);
         let events_sent = register!(EventsSent::from(Output(None)));
         let encode_as_binary = self.should_encode_as_binary();
 

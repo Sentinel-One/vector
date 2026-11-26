@@ -359,7 +359,8 @@ impl HecLogsSinkConfig {
                 Arc::clone(&http_request_builder),
                 self.endpoint_target,
                 self.auto_extract_timestamp.unwrap_or_default(),
-                self.path.clone()
+                self.path.clone(),
+                cx.bytes_sent(),
             ));
 
         let rej_ctx = Arc::new(HecRejectionContext {

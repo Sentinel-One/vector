@@ -9,8 +9,6 @@ mod amqp;
 mod apache_metrics;
 #[cfg(feature = "api")]
 mod api;
-#[cfg(feature = "aws-core")]
-mod aws;
 #[cfg(feature = "sinks-aws_cloudwatch_logs")]
 mod aws_cloudwatch_logs;
 #[cfg(feature = "transforms-aws_ec2_metadata")]
@@ -157,8 +155,6 @@ pub(crate) use self::amqp::*;
 pub(crate) use self::apache_metrics::*;
 #[cfg(feature = "api")]
 pub(crate) use self::api::*;
-#[cfg(feature = "aws-core")]
-pub(crate) use self::aws::*;
 #[cfg(feature = "sinks-aws_cloudwatch_logs")]
 pub(crate) use self::aws_cloudwatch_logs::*;
 #[cfg(feature = "transforms-aws_ec2_metadata")]

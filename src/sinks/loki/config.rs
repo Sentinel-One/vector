@@ -227,6 +227,7 @@ impl SinkConfig for LokiConfig {
             }
         }
 
+        let bytes_sent = cx.bytes_sent();
         let client = self.build_client(cx)?;
 
         let config = LokiConfig {
@@ -234,7 +235,7 @@ impl SinkConfig for LokiConfig {
             ..self.clone()
         };
 
-        let sink = LokiSink::new(config.clone(), client.clone())?;
+        let sink = LokiSink::new(config.clone(), client.clone(), bytes_sent)?;
 
         let healthcheck = healthcheck(config, client).boxed();
 

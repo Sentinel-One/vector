@@ -79,10 +79,6 @@ impl DriverResponse for GreptimeDBGrpcBatchOutput {
     fn events_sent(&self) -> &GroupedCountByteSize {
         self.metadata.events_estimated_json_encoded_byte_size()
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.metadata.request_encoded_size())
-    }
 }
 
 /// GreptimeDBGrpcRetryLogic is the retry logic for the [`GreptimeDBGrpcSink`]

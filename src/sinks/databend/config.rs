@@ -101,7 +101,7 @@ impl GenerateConfig for DatabendConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "databend")]
 impl SinkConfig for DatabendConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let ua = format!("vector/{}", vector_version());
         let auth = self.auth.choose_one(&self.endpoint.auth)?;
         let authority = self
@@ -180,6 +180,7 @@ impl SinkConfig for DatabendConfig {
             self.table.clone(),
             file_format_options,
             copy_options,
+            cx.bytes_sent(),
         )?;
         let service = ServiceBuilder::new()
             .settings(request_settings, DatabendRetryLogic)

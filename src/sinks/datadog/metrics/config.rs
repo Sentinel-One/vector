@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use http::Uri;
 use snafu::ResultExt;
 use tower::ServiceBuilder;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::config::proxy::ProxyConfig;
 use vector_lib::configurable::configurable_component;
 
@@ -182,7 +183,7 @@ impl SinkConfig for DatadogMetricsConfig {
         let global = cx.extra_context.get_or_default::<datadog::Options>();
         let dd_common = self.local_dd_common.with_globals(global)?;
         let healthcheck = dd_common.build_healthcheck(client.clone())?;
-        let sink = self.build_sink(&dd_common, client)?;
+        let sink = self.build_sink(&dd_common, client, cx.bytes_sent())?;
 
         Ok((sink, healthcheck))
     }
@@ -254,6 +255,7 @@ impl DatadogMetricsConfig {
         &self,
         dd_common: &DatadogCommonConfig,
         client: HttpClient,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<VectorSink> {
         let batcher_settings = self.batch.into_batcher_settings()?;
 
@@ -266,6 +268,7 @@ impl DatadogMetricsConfig {
             .service(DatadogMetricsService::new(
                 client,
                 dd_common.default_api_key.inner(),
+                bytes_sent,
             ));
 
         let request_builder = DatadogMetricsRequestBuilder::new(
@@ -273,19 +276,9 @@ impl DatadogMetricsConfig {
             self.default_namespace.clone(),
         )?;
 
-        let protocol = self.get_protocol(dd_common);
-        let sink = DatadogMetricsSink::new(service, request_builder, batcher_settings, protocol);
+        let sink = DatadogMetricsSink::new(service, request_builder, batcher_settings);
 
         Ok(VectorSink::from_event_streamsink(sink))
-    }
-
-    fn get_protocol(&self, dd_common: &DatadogCommonConfig) -> String {
-        self.get_base_agent_endpoint(dd_common)
-            .parse::<Uri>()
-            .unwrap()
-            .scheme_str()
-            .unwrap_or("http")
-            .to_string()
     }
 }
 
@@ -303,5 +296,16 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<DatadogMetricsConfig>();
+    }
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: DatadogMetricsConfig = toml::from_str(
+            r#"
+            default_api_key = "x"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

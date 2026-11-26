@@ -20,7 +20,6 @@ impl Client<PublishError> for SnsMessagePublisher {
     async fn send_message(
         &self,
         entry: SendMessageEntry,
-        byte_size: usize,
     ) -> Result<SendMessageResponse, SdkError<PublishError, HttpResponse>> {
         self.client
             .publish()
@@ -30,7 +29,6 @@ impl Client<PublishError> for SnsMessagePublisher {
             .topic_arn(self.topic_arn.clone())
             .send()
             .map_ok(|_| SendMessageResponse {
-                byte_size,
                 json_byte_size: entry
                     .metadata
                     .events_estimated_json_encoded_byte_size()

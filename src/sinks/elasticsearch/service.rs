@@ -9,6 +9,7 @@ use futures::future::BoxFuture;
 use http::{Response, Uri};
 use hyper::{service::Service, Body, Request};
 use tower::ServiceExt;
+use vector_lib::internal_event::{BytesSent, Registered};
 use vector_lib::stream::DriverResponse;
 use vector_lib::ByteSizeOf;
 use metrics::Counter;
@@ -122,14 +123,19 @@ impl ElasticsearchService {
         compression: Compression,
         rej_ctx: Arc<ElasticsearchRejectionContext>,
         compression_limits: CompressionLimits,
+        bytes_sent: Registered<BytesSent>,
     ) -> ElasticsearchService {
         let http_request_builder = Arc::new(http_request_builder);
-        let batch_service = HttpBatchService::new(http_client, move |req| {
-            let request_builder = Arc::clone(&http_request_builder);
-            let future: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
-                Box::pin(async move { request_builder.build_request(req).await });
-            future
-        });
+        let batch_service = HttpBatchService::new(
+            http_client,
+            move |req| {
+                let request_builder = Arc::clone(&http_request_builder);
+                let future: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
+                    Box::pin(async move { request_builder.build_request(req).await });
+                future
+            },
+            bytes_sent,
+        );
         ElasticsearchService {
             batch_service,
             rej_rpt,

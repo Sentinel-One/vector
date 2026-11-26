@@ -1,6 +1,7 @@
 use std::task::{Context, Poll};
 
 use redis::aio::ConnectionManager;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use crate::sinks::prelude::*;
 
@@ -10,6 +11,8 @@ use super::{config::Method, RedisRequest, RedisSinkError};
 pub struct RedisService {
     pub(super) conn: ConnectionManager,
     pub(super) data_type: super::DataType,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    pub(super) bytes_sent: Registered<BytesSent>,
 }
 
 impl Service<RedisRequest> for RedisService {
@@ -58,14 +61,23 @@ impl Service<RedisRequest> for RedisService {
         }
 
         let byte_size = kvs.metadata.events_byte_size();
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             match pipe.query_async(&mut conn).await {
-                Ok(event_status) => Ok(RedisResponse {
-                    event_status,
-                    events_byte_size: kvs.metadata.into_events_estimated_json_encoded_byte_size(),
-                    byte_size,
-                }),
+                Ok(event_status) => {
+                    let response = RedisResponse {
+                        event_status,
+                        events_byte_size: kvs
+                            .metadata
+                            .into_events_estimated_json_encoded_byte_size(),
+                    };
+                    // Only a fully delivered request counts, like the response's event status.
+                    if response.is_successful() {
+                        bytes_sent.emit(ByteSize(byte_size));
+                    }
+                    Ok(response)
+                }
                 Err(error) => Err(RedisSinkError::SendError { source: error }),
             }
         })
@@ -75,7 +87,6 @@ impl Service<RedisRequest> for RedisService {
 pub struct RedisResponse {
     pub event_status: Vec<bool>,
     pub events_byte_size: GroupedCountByteSize,
-    pub byte_size: usize,
 }
 
 impl RedisResponse {
@@ -95,9 +106,5 @@ impl DriverResponse for RedisResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.events_byte_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.byte_size)
     }
 }

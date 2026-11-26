@@ -60,7 +60,6 @@ where
                 }
             })
             .into_driver(self.service)
-            .protocol("https")
             .run()
             .await
     }

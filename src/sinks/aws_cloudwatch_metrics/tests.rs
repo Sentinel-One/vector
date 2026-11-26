@@ -30,7 +30,10 @@ fn config() -> CloudWatchMetricsSinkConfig {
 async fn svc() -> CloudWatchMetricsSvc {
     let config = config();
     let client = config
-        .create_client(&ProxyConfig::from_env())
+        .create_client(
+            &ProxyConfig::from_env(),
+            crate::config::SinkContext::default().bytes_sent(),
+        )
         .await
         .unwrap();
     CloudWatchMetricsSvc { client }

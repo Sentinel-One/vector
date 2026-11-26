@@ -135,13 +135,13 @@ impl GenerateConfig for RedisSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "redis")]
 impl SinkConfig for RedisSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         if self.key.is_empty() {
             return Err("`key` cannot be empty.".into());
         }
         let conn = self.build_client().await.context(RedisCreateFailedSnafu)?;
         let healthcheck = RedisSinkConfig::healthcheck(conn.clone()).boxed();
-        let sink = RedisSink::new(self, conn)?;
+        let sink = RedisSink::new(self, conn, cx.bytes_sent())?;
         Ok((super::VectorSink::from_event_streamsink(sink), healthcheck))
     }
 

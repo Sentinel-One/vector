@@ -5,6 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use headers::HeaderName;
 use http::{
     header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
@@ -66,7 +67,6 @@ impl MetaDescriptive for LogApiRequest {
 pub struct LogApiResponse {
     event_status: EventStatus,
     events_byte_size: GroupedCountByteSize,
-    raw_byte_size: usize,
 }
 
 impl DriverResponse for LogApiResponse {
@@ -76,10 +76,6 @@ impl DriverResponse for LogApiResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.events_byte_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.raw_byte_size)
     }
 }
 
@@ -94,6 +90,8 @@ pub struct LogApiService {
     uri: Uri,
     user_provided_headers: IndexMap<HeaderName, HeaderValue>,
     dd_evp_headers: IndexMap<HeaderName, HeaderValue>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl LogApiService {
@@ -102,6 +100,7 @@ impl LogApiService {
         uri: Uri,
         headers: IndexMap<String, String>,
         dd_evp_origin: String,
+        bytes_sent: Registered<BytesSent>,
     ) -> crate::Result<Self> {
         let user_provided_headers = validate_headers(&headers)?;
 
@@ -118,6 +117,7 @@ impl LogApiService {
             uri,
             user_provided_headers,
             dd_evp_headers,
+            bytes_sent,
         })
     }
 }
@@ -148,6 +148,7 @@ impl Service<LogApiRequest> for LogApiService {
         let metadata = std::mem::take(request.metadata_mut());
         let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
         let raw_byte_size = request.uncompressed_size;
+        let bytes_sent = self.bytes_sent.clone();
 
         let mut http_request = http_request.header(CONTENT_LENGTH, request.body.len());
 
@@ -168,10 +169,12 @@ impl Service<LogApiRequest> for LogApiService {
 
         Box::pin(async move {
             DatadogApiError::from_result(client.call(http_request).in_current_span().await).map(
-                |_| LogApiResponse {
-                    event_status: EventStatus::Delivered,
-                    events_byte_size,
-                    raw_byte_size,
+                |_| {
+                    bytes_sent.emit(ByteSize(raw_byte_size));
+                    LogApiResponse {
+                        event_status: EventStatus::Delivered,
+                        events_byte_size,
+                    }
                 },
             )
         })

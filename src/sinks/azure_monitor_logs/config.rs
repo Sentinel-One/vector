@@ -7,7 +7,7 @@ use vector_lib::{config::log_schema, schema};
 use vrl::value::Kind;
 
 use crate::{
-    http::{get_http_scheme_from_uri, HttpClient},
+    http::HttpClient,
     sinks::{
         prelude::*,
         util::{http::HttpStatusRetryLogic, RealtimeSizeBasedDefaultBatchSettings, UriSerde},
@@ -155,7 +155,6 @@ impl AzureMonitorLogsConfig {
         endpoint: UriSerde,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let endpoint = endpoint.with_default_parts().uri;
-        let protocol = get_http_scheme_from_uri(&endpoint).to_string();
 
         let batch_settings = self
             .batch
@@ -178,6 +177,7 @@ impl AzureMonitorLogsConfig {
             &self.log_type,
             time_generated_key.clone(),
             shared_key,
+            cx.bytes_sent(),
         )?;
         let healthcheck = service.healthcheck();
 
@@ -193,7 +193,6 @@ impl AzureMonitorLogsConfig {
             self.encoding.clone(),
             service,
             time_generated_key,
-            protocol,
         );
 
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
@@ -219,5 +218,23 @@ impl SinkConfig for AzureMonitorLogsConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
+    }
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sent_bytes_series_exists_after_build() {
+        let config: AzureMonitorLogsConfig = toml::from_str(
+            r#"
+            customer_id = "x"
+            shared_key = "dGVzdA=="
+            log_type = "t"
+        "#,
+        )
+        .unwrap();
+        crate::test_util::components::assert_sent_bytes_series_after_build(config).await;
     }
 }

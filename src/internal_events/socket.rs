@@ -69,28 +69,6 @@ impl InternalEvent for SocketEventsReceived {
 }
 
 #[derive(Debug)]
-pub struct SocketBytesSent {
-    pub mode: SocketMode,
-    pub byte_size: usize,
-}
-
-impl InternalEvent for SocketBytesSent {
-    fn emit(self) {
-        let protocol = self.mode.as_str();
-        trace!(
-            message = "Bytes sent.",
-            byte_size = %self.byte_size,
-            %protocol,
-        );
-        counter!(
-            "component_sent_bytes_total",
-            "protocol" => protocol,
-        )
-        .increment(self.byte_size as u64);
-    }
-}
-
-#[derive(Debug)]
 pub struct SocketEventsSent {
     pub mode: SocketMode,
     pub count: u64,

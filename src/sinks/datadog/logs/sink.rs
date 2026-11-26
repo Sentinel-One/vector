@@ -35,7 +35,6 @@ pub struct LogSinkBuilder<S> {
     batch_settings: BatcherSettings,
     compression: Option<Compression>,
     default_api_key: Arc<str>,
-    protocol: String,
 }
 
 impl<S> LogSinkBuilder<S> {
@@ -44,7 +43,6 @@ impl<S> LogSinkBuilder<S> {
         service: S,
         default_api_key: Arc<str>,
         batch_settings: BatcherSettings,
-        protocol: String,
     ) -> Self {
         Self {
             transformer,
@@ -52,7 +50,6 @@ impl<S> LogSinkBuilder<S> {
             default_api_key,
             batch_settings,
             compression: None,
-            protocol,
         }
     }
 
@@ -68,7 +65,6 @@ impl<S> LogSinkBuilder<S> {
             service: self.service,
             batch_settings: self.batch_settings,
             compression: self.compression.unwrap_or_default(),
-            protocol: self.protocol,
         }
     }
 }
@@ -89,8 +85,6 @@ pub struct LogSink<S> {
     compression: Compression,
     /// Batch settings: timeout, max events, max bytes, etc.
     batch_settings: BatcherSettings,
-    /// The protocol name
-    protocol: String,
 }
 
 // The Datadog logs intake does not require the fields that are set in this
@@ -367,7 +361,6 @@ where
             })
             .flatten()
             .into_driver(self.service)
-            .protocol(self.protocol)
             .run()
             .await
     }

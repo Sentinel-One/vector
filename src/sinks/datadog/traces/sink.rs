@@ -75,7 +75,6 @@ pub struct TracesSink<S> {
     request_builder: DatadogTracesRequestBuilder,
     batch_settings: BatcherSettings,
     shutdown: Sender<Sender<()>>,
-    protocol: String,
 }
 
 impl<S> TracesSink<S>
@@ -90,14 +89,12 @@ where
         request_builder: DatadogTracesRequestBuilder,
         batch_settings: BatcherSettings,
         shutdown: Sender<Sender<()>>,
-        protocol: String,
     ) -> Self {
         TracesSink {
             service,
             request_builder,
             batch_settings,
             shutdown,
-            protocol,
         }
     }
 
@@ -123,7 +120,6 @@ where
                 }
             })
             .into_driver(self.service)
-            .protocol(self.protocol)
             .run()
             .await?;
 

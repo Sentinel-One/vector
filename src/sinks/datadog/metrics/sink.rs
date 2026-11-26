@@ -58,7 +58,6 @@ pub(crate) struct DatadogMetricsSink<S> {
     service: S,
     request_builder: DatadogMetricsRequestBuilder,
     batch_settings: BatcherSettings,
-    protocol: String,
 }
 
 impl<S> DatadogMetricsSink<S>
@@ -73,13 +72,11 @@ where
         service: S,
         request_builder: DatadogMetricsRequestBuilder,
         batch_settings: BatcherSettings,
-        protocol: String,
     ) -> Self {
         DatadogMetricsSink {
             service,
             request_builder,
             batch_settings,
-            protocol,
         }
     }
 
@@ -143,7 +140,6 @@ where
             // Finally, we generate the driver which will take our requests, send them off, and appropriately handle
             // finalization of the events, and logging/metrics, as the requests are responded to.
             .into_driver(self.service)
-            .protocol(self.protocol)
             .run()
             .await
     }

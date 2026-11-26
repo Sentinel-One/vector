@@ -4,6 +4,7 @@ use std::{
 };
 
 use futures_util::TryFutureExt;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use crate::sinks::prelude::*;
 
@@ -12,6 +13,8 @@ use super::{config::NatsPublisher, request_builder::NatsRequest, NatsError};
 #[derive(Clone)]
 pub(super) struct NatsService {
     pub(super) publisher: Arc<NatsPublisher>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    pub(super) bytes_sent: Registered<BytesSent>,
 }
 
 pub(super) struct NatsResponse {
@@ -25,10 +28,6 @@ impl DriverResponse for NatsResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         self.metadata.events_estimated_json_encoded_byte_size()
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.metadata.request_encoded_size())
     }
 }
 
@@ -45,6 +44,8 @@ impl Service<NatsRequest> for NatsService {
 
     fn call(&mut self, req: NatsRequest) -> Self::Future {
         let publisher = Arc::clone(&self.publisher);
+        let bytes_sent = self.bytes_sent.clone();
+        let byte_size = req.metadata.request_encoded_size();
 
         Box::pin(async move {
             match publisher
@@ -53,9 +54,12 @@ impl Service<NatsRequest> for NatsService {
                 .await
             {
                 Err(error) => Err(NatsError::ServerError { source: error }),
-                Ok(_) => Ok(NatsResponse {
-                    metadata: req.metadata,
-                }),
+                Ok(_) => {
+                    bytes_sent.emit(ByteSize(byte_size));
+                    Ok(NatsResponse {
+                        metadata: req.metadata,
+                    })
+                }
             }
         })
     }

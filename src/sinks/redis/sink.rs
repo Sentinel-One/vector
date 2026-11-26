@@ -1,6 +1,7 @@
 use std::future;
 
 use redis::{aio::ConnectionManager, RedisError};
+use vector_lib::internal_event::{BytesSent, Registered};
 
 use crate::sinks::{prelude::*, util::retries::RetryAction};
 
@@ -19,10 +20,15 @@ pub(super) struct RedisSink {
     data_type: super::DataType,
     key: Template,
     batcher_settings: BatcherSettings,
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl RedisSink {
-    pub(super) fn new(config: &RedisSinkConfig, conn: ConnectionManager) -> crate::Result<Self> {
+    pub(super) fn new(
+        config: &RedisSinkConfig,
+        conn: ConnectionManager,
+        bytes_sent: Registered<BytesSent>,
+    ) -> crate::Result<Self> {
         let method = config.list_option.map(|option| option.method);
         let data_type = match config.data_type {
             DataTypeConfig::Channel => super::DataType::Channel,
@@ -44,6 +50,7 @@ impl RedisSink {
             conn,
             data_type,
             key,
+            bytes_sent,
         })
     }
 
@@ -72,6 +79,7 @@ impl RedisSink {
         let service = RedisService {
             conn: self.conn.clone(),
             data_type: self.data_type,
+            bytes_sent: self.bytes_sent.clone(),
         };
 
         let service = ServiceBuilder::new()
@@ -87,7 +95,6 @@ impl RedisSink {
             .batched(batcher_settings)
             .map(|events| request_builder(events, &transformer, &mut encoder))
             .into_driver(service)
-            .protocol("redis")
             .run()
             .await
     }

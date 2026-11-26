@@ -125,7 +125,11 @@ impl SinkConfig for StackdriverConfig {
         let stackdriver_metrics_service_request_builder =
             StackdriverMetricsServiceRequestBuilder { uri, auth };
 
-        let service = HttpService::new(client, stackdriver_metrics_service_request_builder);
+        let service = HttpService::new(
+            client,
+            stackdriver_metrics_service_request_builder,
+            cx.bytes_sent(),
+        );
 
         let service = ServiceBuilder::new()
             .settings(request_limits, http_response_retry_logic())

@@ -9,7 +9,7 @@ use crate::{
     extra_context::ExtraContext,
     sinks::util::test::load_sink_with_context,
     test_util::{
-        components::{run_and_assert_sink_compliance, SINK_TAGS},
+        components::{build_run_and_assert_sink_compliance, SINK_TAGS},
         next_addr, random_metrics_with_stream,
     },
 };
@@ -27,6 +27,7 @@ async fn global_options() {
         ..SinkContext::default()
     };
     let (mut config, cx) = load_sink_with_context::<DatadogMetricsConfig>(config, cx).unwrap();
+    let extra_context = cx.extra_context.clone();
 
     let addr = next_addr();
     // Swap out the endpoint so we can force send it
@@ -34,7 +35,13 @@ async fn global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async move {
+        let cx = SinkContext {
+            extra_context,
+            ..SinkContext::default()
+        };
+        config.build(cx).await.unwrap().0
+    };
 
     let (rx, _trigger, server) = test_server(addr, ApiStatus::OKv1);
     tokio::spawn(server);
@@ -42,7 +49,7 @@ async fn global_options() {
     let (batch, receiver) = BatchNotifier::new_with_receiver();
     let (_expected, events) = random_metrics_with_stream(10, Some(batch), None);
 
-    run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, events, &SINK_TAGS).await;
 
     assert_eq!(receiver.await, BatchStatus::Delivered);
 
@@ -72,6 +79,7 @@ async fn override_global_options() {
         ..SinkContext::default()
     };
     let (mut config, cx) = load_sink_with_context::<DatadogMetricsConfig>(config, cx).unwrap();
+    let extra_context = cx.extra_context.clone();
 
     let addr = next_addr();
     // Swap out the endpoint so we can force send it
@@ -79,7 +87,13 @@ async fn override_global_options() {
     let endpoint = format!("http://{}", addr);
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
-    let (sink, _) = config.build(cx).await.unwrap();
+    let sink_future = async move {
+        let cx = SinkContext {
+            extra_context,
+            ..SinkContext::default()
+        };
+        config.build(cx).await.unwrap().0
+    };
 
     let (rx, _trigger, server) = test_server(addr, ApiStatus::OKv1);
     tokio::spawn(server);
@@ -87,7 +101,7 @@ async fn override_global_options() {
     let (batch, receiver) = BatchNotifier::new_with_receiver();
     let (_expected, events) = random_metrics_with_stream(10, Some(batch), None);
 
-    run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await;
+    build_run_and_assert_sink_compliance(sink_future, events, &SINK_TAGS).await;
 
     assert_eq!(receiver.await, BatchStatus::Delivered);
 

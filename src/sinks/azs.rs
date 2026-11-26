@@ -94,6 +94,7 @@ impl SinkConfig for AzureSentinelLogsConfig {
             request_settings,
             batch_settings.timeout,
             client,
+            cx.bytes_sent(),
         )
         .sink_map_err(|error| error!(message = "Fatal azure_sentinel_logs sink error.", %error));
 

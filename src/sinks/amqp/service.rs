@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use lapin::{options::BasicPublishOptions, BasicProperties};
 use snafu::Snafu;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 use std::{
     sync::Arc,
     task::{Context, Poll},
@@ -59,7 +60,6 @@ impl MetaDescriptive for AmqpRequest {
 
 /// A successful response from `AMQP`.
 pub(super) struct AmqpResponse {
-    byte_size: usize,
     json_size: GroupedCountByteSize,
 }
 
@@ -71,15 +71,13 @@ impl DriverResponse for AmqpResponse {
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.json_size
     }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.byte_size)
-    }
 }
 
 /// The tower service that handles the actual sending of data to `AMQP`.
 pub(super) struct AmqpService {
     pub(super) channel: Arc<lapin::Channel>,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    pub(super) bytes_sent: Registered<BytesSent>,
 }
 
 #[derive(Debug, Snafu)]
@@ -107,6 +105,7 @@ impl Service<AmqpRequest> for AmqpService {
 
     fn call(&mut self, req: AmqpRequest) -> Self::Future {
         let channel = Arc::clone(&self.channel);
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let byte_size = req.body.len();
@@ -124,10 +123,12 @@ impl Service<AmqpRequest> for AmqpService {
                 Ok(result) => match result.await {
                     Ok(lapin::publisher_confirm::Confirmation::Nack(_)) => Err(AmqpError::Nack),
                     Err(error) => Err(AmqpError::AcknowledgementFailed { error }),
-                    Ok(_) => Ok(AmqpResponse {
-                        json_size: req.metadata.into_events_estimated_json_encoded_byte_size(),
-                        byte_size,
-                    }),
+                    Ok(_) => {
+                        bytes_sent.emit(ByteSize(byte_size));
+                        Ok(AmqpResponse {
+                            json_size: req.metadata.into_events_estimated_json_encoded_byte_size(),
+                        })
+                    }
                 },
                 Err(error) => Err(AmqpError::DeliveryFailed { error }),
             }

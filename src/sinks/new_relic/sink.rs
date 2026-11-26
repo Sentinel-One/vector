@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 use super::{NewRelicApiRequest, NewRelicCredentials, NewRelicEncoder};
 use crate::{
-    http::get_http_scheme_from_uri, internal_events::SinkRequestBuildError, sinks::prelude::*,
+    internal_events::SinkRequestBuildError, sinks::prelude::*,
 };
 
 #[derive(Debug)]
@@ -120,8 +120,6 @@ where
             compression: self.compression,
             credentials: Arc::clone(&self.credentials),
         };
-        let protocol = get_http_scheme_from_uri(&self.credentials.get_uri());
-
         input
             .batched(self.batcher_settings.as_byte_size_config())
             .request_builder(default_request_builder_concurrency_limit(), request_builder)
@@ -137,7 +135,6 @@ where
                 },
             )
             .into_driver(self.service)
-            .protocol(protocol)
             .run()
             .await
     }

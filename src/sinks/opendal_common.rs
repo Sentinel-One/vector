@@ -15,6 +15,7 @@ use opendal::Operator;
 use snafu::Snafu;
 use tracing::Instrument;
 use vector_lib::codecs::encoding::Framer;
+use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle as _, Registered};
 
 use crate::sinks::{prelude::*, util::partitioner::KeyPartitioner};
 
@@ -96,8 +97,6 @@ where
                 }
             })
             .into_driver(self.service)
-            // TODO: set protocol with services scheme instead hardcoded file
-            .protocol("file")
             .run()
             .await
     }
@@ -108,11 +107,13 @@ where
 #[derive(Debug, Clone)]
 pub struct OpenDalService {
     op: Operator,
+    /// Counts `component_sent_bytes_total`; held for the life of the service.
+    bytes_sent: Registered<BytesSent>,
 }
 
 impl OpenDalService {
-    pub const fn new(op: Operator) -> OpenDalService {
-        OpenDalService { op }
+    pub fn new(op: Operator, bytes_sent: Registered<BytesSent>) -> OpenDalService {
+        OpenDalService { op, bytes_sent }
     }
 }
 
@@ -217,7 +218,6 @@ impl RequestBuilder<(String, Vec<Event>)> for OpenDalRequestBuilder {
 #[derive(Debug)]
 pub struct OpenDalResponse {
     pub events_byte_size: GroupedCountByteSize,
-    pub byte_size: usize,
 }
 
 impl DriverResponse for OpenDalResponse {
@@ -227,10 +227,6 @@ impl DriverResponse for OpenDalResponse {
 
     fn events_sent(&self) -> &GroupedCountByteSize {
         &self.events_byte_size
-    }
-
-    fn bytes_sent(&self) -> Option<usize> {
-        Some(self.byte_size)
     }
 }
 
@@ -248,17 +244,20 @@ impl Service<OpenDalRequest> for OpenDalService {
     fn call(&mut self, request: OpenDalRequest) -> Self::Future {
         let byte_size = request.payload.len();
         let op = self.op.clone();
+        let bytes_sent = self.bytes_sent.clone();
 
         Box::pin(async move {
             let result = op
                 .write(&request.metadata.partition_key, request.payload)
                 .in_current_span()
                 .await;
-            result.map(|_| OpenDalResponse {
-                events_byte_size: request
-                    .request_metadata
-                    .into_events_estimated_json_encoded_byte_size(),
-                byte_size,
+            result.map(|_| {
+                bytes_sent.emit(ByteSize(byte_size));
+                OpenDalResponse {
+                    events_byte_size: request
+                        .request_metadata
+                        .into_events_estimated_json_encoded_byte_size(),
+                }
             })
         })
     }
