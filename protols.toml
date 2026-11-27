@@ -1,0 +1,11 @@
+[config]
+include_paths = [
+  "proto",
+  "proto/third-party",
+  "proto/vector",
+  "lib/vector-core/proto",
+  "lib/loki-logproto/proto",
+  "lib/prometheus-parser/proto",
+  "lib/opentelemetry-proto/src/proto/opentelemetry-proto",
+  "lib/observo/private/chkpts/proto",
+]

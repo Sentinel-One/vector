@@ -77,4 +77,21 @@ mod test {
             Value::Bytes("another value".into())
         );
     }
+
+    #[test]
+    fn from_lua_json_null_becomes_null_field_and_null_array_element() {
+        let lua = Lua::new();
+        lua.globals().set("null", LuaValue::NULL).unwrap();
+        let event: LogEvent = lua
+            .load("{ a = null, b = 1, arr = {1, null, 3} }")
+            .eval()
+            .unwrap();
+
+        assert_eq!(event["a"], Value::Null);
+        assert_eq!(event["b"], Value::Integer(1));
+        assert_eq!(
+            event["arr"],
+            Value::Array(vec![Value::Integer(1), Value::Null, Value::Integer(3)])
+        );
+    }
 }

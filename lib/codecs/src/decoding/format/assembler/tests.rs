@@ -1557,3 +1557,37 @@ fn bytes_codec_under_one_byte_frames_sees_no_empty_frame_at_the_end_of_the_unit(
         vec![json!({"parts": ["a", "b", "c"]})]
     );
 }
+
+#[test]
+fn json_paths_escaped_dot_key_routes_a_flat_dotted_key_into_a_flush_record() {
+    let mut decoder = decoder(indoc! {r#"
+        framing: { method: bytes }
+        decoding:
+          codec: assembled
+          deserializer:
+            codec: json_paths
+            config:
+              paths:
+                value: { op: explode }
+                '@odata\u002enextLink': { op: identity }
+          assembler:
+            process:
+              - if:
+                  when: { eq: { path: .expr, value: '@odata\u002enextLink' } }
+                  then:
+                    - merge: { from: .data, to: "%page.next", move: true }
+                    - stop
+              - merge: { from: .data, to: ., move: true }
+              - reset: { to: .expr }
+            flush:
+              actions:
+                - merge: { from: "%page", to: ._page, move: true }
+    "#});
+    let body = r#"{"@odata.context": "c", "@odata.nextLink": "u", "value": [{"id": "a"}]}"#;
+    let steps = run(&mut decoder, &[body]);
+    assert_eq!(errors(&steps), Vec::<bool>::new());
+    assert_eq!(
+        values(&steps),
+        vec![json!({"id": "a"}), json!({"_page": {"next": "u"}})]
+    );
+}
