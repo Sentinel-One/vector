@@ -5,6 +5,7 @@ use bytes::Bytes;
 use derivative::Derivative;
 use lookup::OwnedValuePath;
 use smallvec::{smallvec, SmallVec};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use vector_config::configurable_component;
@@ -75,6 +76,14 @@ pub struct PathOperationConfig {
     /// `.meta` ≡ `meta`, `.a.b` ≡ `a.b`. Two keys that normalize to the
     /// same value (e.g. `.meta` and `meta`) are rejected at load time.
     ///
+    /// Segments are separated by `.`. Inside a segment, `\uXXXX` (four hex
+    /// digits) is the character with that code point, so
+    /// `@odata\u002enextLink` matches the single key `@odata.nextLink` and
+    /// `\u002a` is a literal `*` rather than the wildcard. Any other `\` is
+    /// literal. Config languages that process escapes themselves (JSON,
+    /// jsonnet, Lua, TOML and YAML double-quoted strings) need the backslash
+    /// doubled: `"@odata\\u002enextLink"`.
+    ///
     /// A key segment equal to the rule's wildcard (default `*`) matches any
     /// single key. Rules are resolved specific-first: at each segment a
     /// concrete key is tried before the wildcard, and a path that the
@@ -83,13 +92,18 @@ pub struct PathOperationConfig {
     /// leftmost wins. Less specific rules don't apply beneath a written rule.
     ///
     /// Each match emits an event `{expr, data}`: the matched path and its
-    /// value. Array elements add no path segment, so they're matched at the
-    /// array's path, and `a.b` also reaches `b` in objects inside the array
-    /// `a`, at any nesting. A wildcard rule with deeper rules below it never
-    /// emits objects or arrays: it descends into them for the deeper rules,
-    /// and emits the scalars it reaches directly, one event per element for
-    /// scalars in arrays. Deeper rules still match inside a value that is
-    /// emitted or exploded whole, so its contents can be emitted again.
+    /// value. In `expr` a `.` inside a key is written `\u002e`, and a `\`
+    /// that starts a `\uXXXX` sequence is written `\u005c`, always with
+    /// lowercase hex. A rule key spelled differently (uppercase hex, an
+    /// escaped ordinary character, `\u002a`) still matches, but compare `expr`
+    /// against this spelling; such keys are logged at load. Array elements add
+    /// no path segment, so they're matched at the array's path, and `a.b`
+    /// also reaches `b` in objects inside the array `a`, at any nesting. A
+    /// wildcard rule with deeper rules below it never emits objects or
+    /// arrays: it descends into them for the deeper rules, and emits the
+    /// scalars it reaches directly, one event per element for scalars in
+    /// arrays. Deeper rules still match inside a value that is emitted or
+    /// exploded whole, so its contents can be emitted again.
     #[serde(deserialize_with = "deserialize_paths")]
     pub paths: BTreeMap<String, PathRule>,
 }
@@ -134,12 +148,76 @@ fn normalize_config_key(k: &str) -> &str {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum Segment<'a> {
-    Concrete(&'a str),
+enum Segment {
+    Concrete(String),
     Wildcard,
 }
 
-fn canonical_segments<'a>(key: &'a str, wildcard: &str) -> Vec<Segment<'a>> {
+impl Segment {
+    fn unescape(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(at) = rest.find("\\u") {
+            out.push_str(&rest[..at]);
+            let tail = &rest[at..];
+            match Self::escaped_char(tail) {
+                Some(c) => {
+                    out.push(c);
+                    rest = &tail[6..];
+                }
+                None => {
+                    out.push('\\');
+                    rest = &tail[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn escaped_char(s: &str) -> Option<char> {
+        s.strip_prefix("\\u")
+            .and_then(|rest| rest.get(..4))
+            .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(char::from_u32)
+    }
+
+    fn expr_spelling(segments: &[Segment], wildcard: &str) -> String {
+        segments
+            .iter()
+            .map(|segment| match segment {
+                Segment::Concrete(name) => Segment::escape(name),
+                Segment::Wildcard => Cow::Borrowed(wildcard),
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn escape(segment: &str) -> Cow<'_, str> {
+        let needs = |(at, c): (usize, char)| match c {
+            '.' => Some("\\u002e"),
+            '\\' if Self::escaped_char(&segment[at..]).is_some() => Some("\\u005c"),
+            _ => None,
+        };
+        if segment.char_indices().any(|ic| needs(ic).is_some()) {
+            Cow::Owned(segment.char_indices().fold(
+                String::with_capacity(segment.len() + 6),
+                |mut out, (at, c)| {
+                    match needs((at, c)) {
+                        Some(escaped) => out.push_str(escaped),
+                        None => out.push(c),
+                    }
+                    out
+                },
+            ))
+        } else {
+            Cow::Borrowed(segment)
+        }
+    }
+}
+
+fn canonical_segments(key: &str, wildcard: &str) -> Vec<Segment> {
     if key.is_empty() {
         Vec::new()
     } else {
@@ -148,7 +226,7 @@ fn canonical_segments<'a>(key: &'a str, wildcard: &str) -> Vec<Segment<'a>> {
                 if segment == wildcard {
                     Segment::Wildcard
                 } else {
-                    Segment::Concrete(segment)
+                    Segment::Concrete(Segment::unescape(segment))
                 }
             })
             .collect()
@@ -165,9 +243,17 @@ where
     let raw: BTreeMap<String, PathRule> = BTreeMap::deserialize(de)?;
 
     {
-        let mut seen: BTreeMap<Vec<Segment<'_>>, &str> = BTreeMap::new();
+        let mut seen: BTreeMap<Vec<Segment>, &str> = BTreeMap::new();
         for (k, rule) in &raw {
             let canonical = canonical_segments(normalize_config_key(k), &rule.wildcard);
+            let spelling = Segment::expr_spelling(&canonical, &rule.wildcard);
+            if spelling != normalize_config_key(k) {
+                tracing::info!(
+                    message = "A json_paths rule key is spelled differently from the `expr` of its matches; compare `expr` against the latter.",
+                    key = %k,
+                    expr = %spelling,
+                );
+            }
             if let Some(prev) = seen.get(&canonical) {
                 return Err(D::Error::custom(format!(
                     "duplicate path key after normalization: {:?} and {:?} resolve to the same path",
@@ -203,7 +289,7 @@ impl RuleTrie {
         }
     }
 
-    fn insert(self, segments: &[Segment<'_>], op: PathOperation) -> RuleTrie {
+    fn insert(self, segments: &[Segment], op: PathOperation) -> RuleTrie {
         let RuleTrie {
             mut concrete,
             default,
@@ -230,9 +316,9 @@ impl RuleTrie {
             }
             Some((Segment::Concrete(name), rest)) => {
                 let child = concrete
-                    .remove(*name)
+                    .remove(name)
                     .unwrap_or_else(|| RuleTrie::node(false));
-                concrete.insert((*name).to_string(), child.insert(rest, op));
+                concrete.insert(name.clone(), child.insert(rest, op));
                 RuleTrie {
                     concrete,
                     default,
@@ -747,7 +833,14 @@ impl ParserState {
     /// Build current path string from segments. Only called when emitting an
     /// event, so the trie lookups on the hot path stay allocation-free.
     fn current_path(&self) -> String {
-        self.path.join(".")
+        let mut out = String::with_capacity(self.path.iter().map(|s| s.len() + 1).sum());
+        self.path.iter().enumerate().for_each(|(i, segment)| {
+            if i > 0 {
+                out.push('.');
+            }
+            out.push_str(&Segment::escape(segment));
+        });
+        out
     }
 
     fn push_path(&mut self, segment: String) {
@@ -3311,5 +3404,183 @@ op = "explode"
                 "split at byte {at}"
             );
         });
+    }
+
+    fn load_paths(keys: &[&str]) -> Result<crate::decoding::DeserializerConfig, toml::de::Error> {
+        let paths: String = keys
+            .iter()
+            .map(|key| format!("[config.paths.'{key}']\nop = \"identity\"\n"))
+            .collect();
+        toml::from_str(&format!("codec = \"json_paths\"\n{paths}"))
+    }
+
+    #[test]
+    fn escaped_dot_rule_matches_only_the_flat_key_containing_the_dot() {
+        let config = wildcard_config(&[(r"@odata\u002enextLink", PathOperation::Identity, "*")]);
+        let events = parse_all(
+            &config,
+            r#"{"@odata": {"nextLink": "nested"}, "@odata.nextLink": "flat"}"#,
+        );
+        assert_eq!(
+            events,
+            vec![ev(r"@odata\u002enextLink", Value::from("flat"))]
+        );
+    }
+
+    #[test]
+    fn escaped_dot_with_uppercase_hex_matches_the_flat_key() {
+        let config = wildcard_config(&[(r"a\u002Eb", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"a.b": 1, "a": {"b": 2}}"#);
+        assert_eq!(events, vec![ev(r"a\u002eb", Value::from(1))]);
+    }
+
+    #[test]
+    fn unescaped_dot_rule_matches_only_nested_keys() {
+        let config = wildcard_config(&[("a.b", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"a.b": 1, "a": {"b": 2}}"#);
+        assert_eq!(events, vec![ev("a.b", Value::from(2))]);
+    }
+
+    #[test]
+    fn escaped_wildcard_char_is_a_literal_key_not_the_wildcard() {
+        let config = wildcard_config(&[(r"\u002a", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"*": 1, "x": 2}"#);
+        assert_eq!(events, vec![ev("*", Value::from(1))]);
+    }
+
+    #[test]
+    fn backslash_not_starting_a_valid_escape_stays_literal() {
+        let config = wildcard_config(&[
+            (r"a\b", PathOperation::Identity, "*"),
+            (r"c\u12", PathOperation::Identity, "*"),
+            (r"d\ud800", PathOperation::Identity, "*"),
+            (r"e\u00é9", PathOperation::Identity, "*"),
+            (r"f\u00pq", PathOperation::Identity, "*"),
+        ]);
+        let events = parse_all(
+            &config,
+            r#"{"a\\b": 1, "c\\u12": 2, "d\\ud800": 3, "e\\u00é9": 4, "f\\u00pq": 6, "ab": 5}"#,
+        );
+        assert_eq!(
+            events,
+            vec![
+                ev(r"a\b", Value::from(1)),
+                ev(r"c\u12", Value::from(2)),
+                ev(r"d\ud800", Value::from(3)),
+                ev(r"e\u00é9", Value::from(4)),
+                ev(r"f\u00pq", Value::from(6)),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_escape_text_in_a_key_is_expressible_and_renders_back_escaped() {
+        let config = wildcard_config(&[(r"r\u005cu0041", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"r\\u0041": 1, "rA": 2}"#);
+        assert_eq!(events, vec![ev(r"r\u005cu0041", Value::from(1))]);
+    }
+
+    #[test]
+    fn wildcard_match_renders_dots_and_escape_like_backslashes_in_expr() {
+        let config = wildcard_config(&[("*", PathOperation::Identity, "*")]);
+        let events = parse_all(
+            &config,
+            r#"{"x.y": 1, "p\\q": 2, "r\\u0041": 3, "plain": 4}"#,
+        );
+        assert_eq!(
+            events,
+            vec![
+                ev(r"x\u002ey", Value::from(1)),
+                ev(r"p\q", Value::from(2)),
+                ev(r"r\u005cu0041", Value::from(3)),
+                ev("plain", Value::from(4)),
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_keys_with_backslashes_load_without_error() {
+        assert!(load_paths(&[r"a\xb", r"a\", r"\u"]).is_ok());
+    }
+
+    #[test]
+    fn escaped_and_unescaped_dot_keys_load_as_distinct_rules() {
+        assert!(load_paths(&[r"a\u002eb", "a.b"]).is_ok());
+    }
+
+    #[test]
+    fn keys_equal_after_unescaping_are_rejected_as_duplicates() {
+        [[r".a\u002eb", r"a\u002eb"], [r"a\u002eb", r"a\u002Eb"]]
+            .into_iter()
+            .for_each(|keys| {
+                let error = load_paths(&keys).unwrap_err().to_string();
+                assert!(error.contains("duplicate path key"), "{keys:?}: {error}");
+            });
+    }
+
+    #[test]
+    fn expr_spelling_of_rule_keys_is_canonical() {
+        [
+            (r"@odata\u002enextLink", r"@odata\u002enextLink"),
+            (r"@odata\u002EnextLink", r"@odata\u002enextLink"),
+            (r"\u0061b", "ab"),
+            (r"\u002a", "*"),
+            ("*.x", "*.x"),
+            (r"r\u005cu0041", r"r\u005cu0041"),
+            (r"f\u00pq", r"f\u00pq"),
+            (r"\u0061\u0062", "ab"),
+            (r"x\\u002e", r"x\\u002e"),
+        ]
+        .into_iter()
+        .for_each(|(key, want)| {
+            assert_eq!(
+                Segment::expr_spelling(&canonical_segments(key, "*"), "*"),
+                want,
+                "key {key:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn rule_key_spelled_unlike_its_expr_is_logged_at_load() {
+        load_paths(&[r"@odata\u002EnextLink"]).unwrap();
+        assert!(logs_contain("spelled differently from the `expr`"));
+        assert!(logs_contain(r"expr=@odata\u002enextLink"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn canonical_rule_keys_are_not_logged_at_load() {
+        load_paths(&[r"@odata\u002enextLink", ".a.b", "*.c"]).unwrap();
+        assert!(!logs_contain("spelled differently from the `expr`"));
+    }
+
+    #[test]
+    fn several_escapes_in_one_segment_decode_including_at_its_edges() {
+        let config = wildcard_config(&[(r"\u0061\u0062", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"ab": 1, "a": {"b": 2}}"#);
+        assert_eq!(events, vec![ev("ab", Value::from(1))]);
+    }
+
+    #[test]
+    fn several_escaped_dots_make_one_flat_key() {
+        let config = wildcard_config(&[(r"a\u002eb\u002ec", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"a.b.c": 1, "a": {"b": {"c": 2}}}"#);
+        assert_eq!(events, vec![ev(r"a\u002eb\u002ec", Value::from(1))]);
+    }
+
+    #[test]
+    fn escaped_dot_key_below_a_nested_segment() {
+        let config = wildcard_config(&[(r"p.q\u002er", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"p": {"q.r": 1, "q": {"r": 2}}}"#);
+        assert_eq!(events, vec![ev(r"p.q\u002er", Value::from(1))]);
+    }
+
+    #[test]
+    fn literal_backslash_before_a_valid_escape_stays_and_the_escape_decodes() {
+        let config = wildcard_config(&[(r"x\\u002e", PathOperation::Identity, "*")]);
+        let events = parse_all(&config, r#"{"x\\.": 1, "x\\": {"": 2}}"#);
+        assert_eq!(events, vec![ev(r"x\\u002e", Value::from(1))]);
     }
 }
